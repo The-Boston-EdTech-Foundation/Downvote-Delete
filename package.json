@@ -18,21 +18,22 @@
     "dev": "devvit playtest",
     "launch": "npm run deploy && devvit publish",
     "login": "devvit login",
-    "prettier": "prettier --write ."
+    "prettier": "prettier --write .",
+    "audit:prod": "npm audit --omit=dev"
   },
   "engines": {
     "node": ">=22.2.0"
   },
   "dependencies": {
-    "@devvit/start": "0.12.22",
-    "@devvit/web": "0.12.22",
+    "@devvit/start": "0.12.24",
+    "@devvit/web": "0.12.24",
     "@hono/node-server": "^1.19.9",
-    "devvit": "0.12.22",
     "hono": "^4.12.18"
   },
   "devDependencies": {
     "@eslint/js": "9.39.2",
     "@types/node": "^22.19.7",
+    "devvit": "0.12.24",
     "eslint": "9.39.2",
     "globals": "17.2.0",
     "prettier": "3.8.1",
@@ -43,6 +44,6 @@
     "vitest": "^3.2.4"
   },
   "overrides": {
-    "protobufjs": "7.5.5"
+    "protobufjs": "7.5.6"
   }
 }
