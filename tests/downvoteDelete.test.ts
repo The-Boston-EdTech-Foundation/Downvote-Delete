@@ -5,6 +5,7 @@ import {
   shouldTrackNewPost,
   type PostSnapshot,
 } from '../src/core/decision';
+import { formatLogContext } from '../src/core/logging';
 import {
   ACTION_REMOVE,
   MODERATOR_ACTION_ALL,
@@ -205,5 +206,18 @@ describe('moderator handling', () => {
         isModeratorPost: true,
       })
     ).toBe(true);
+  });
+});
+
+describe('logging helpers', () => {
+  test('formats defined context fields for command-line output', () => {
+    expect(
+      formatLogContext({
+        postId: 't3_post',
+        score: -3,
+        ignored: undefined,
+        isActive: true,
+      })
+    ).toBe(' postId=t3_post score=-3 isActive=true');
   });
 });
