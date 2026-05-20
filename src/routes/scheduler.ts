@@ -9,7 +9,12 @@ import {
 import type { T3 } from '@devvit/shared-types/tid.js';
 import { applyModerationAction, buildActionReason } from '../core/actions';
 import { getNextCheckDelayMinutes, getNextCheckRunAt } from '../core/backoff';
-import { decideTrackedPostCheck, type PostSnapshot } from '../core/decision';
+import {
+  decideTrackedPostCheck,
+  getNegativeDecisionScore,
+  type NegativeDecisionScore,
+  type PostSnapshot,
+} from '../core/decision';
 import { logError, logInfo, logWarn } from '../core/logging';
 import { postToSnapshot } from '../core/postStatus';
 import { normalizeSettings } from '../core/settings';
@@ -61,6 +66,11 @@ async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
     status: parsedRecord.status,
     checkCount: parsedRecord.checkCount,
     lastKnownScore: parsedRecord.lastKnownScore,
+    lastKnownUpvotes: parsedRecord.lastKnownUpvotes,
+    lastKnownDownvotes: parsedRecord.lastKnownDownvotes,
+    lastCalculatedVoteScore: parsedRecord.lastCalculatedVoteScore,
+    negativeDecisionScore: parsedRecord.negativeDecisionScore,
+    negativeDecisionSource: parsedRecord.negativeDecisionSource,
     negativeScoreThreshold: parsedRecord.negativeScoreThreshold,
     positiveScoreStopThreshold: parsedRecord.positiveScoreStopThreshold,
     actionToTake: parsedRecord.actionToTake,
@@ -77,6 +87,11 @@ async function writeTrackedPost(record: TrackedPost): Promise<void> {
     status: record.status,
     checkCount: record.checkCount,
     lastKnownScore: record.lastKnownScore,
+    lastKnownUpvotes: record.lastKnownUpvotes,
+    lastKnownDownvotes: record.lastKnownDownvotes,
+    lastCalculatedVoteScore: record.lastCalculatedVoteScore,
+    negativeDecisionScore: record.negativeDecisionScore,
+    negativeDecisionSource: record.negativeDecisionSource,
     lastJobId: record.lastJobId,
   });
   await redis.set(redisKey, serializeTrackedPost(record));
@@ -105,6 +120,11 @@ async function stopTracking(
     reason: stopReason ?? status,
     checkCount: record.checkCount,
     lastKnownScore: record.lastKnownScore,
+    lastKnownUpvotes: record.lastKnownUpvotes,
+    lastKnownDownvotes: record.lastKnownDownvotes,
+    lastCalculatedVoteScore: record.lastCalculatedVoteScore,
+    negativeDecisionScore: record.negativeDecisionScore,
+    negativeDecisionSource: record.negativeDecisionSource,
     auditKey: auditKey(record.postId),
     redisKey: watchKey(record.postId),
   });
@@ -146,6 +166,61 @@ async function fetchPostSnapshot(
     logError('Could not fetch post from Reddit.', { postId }, err);
     return null;
   }
+}
+
+function enrichSnapshotWithStoredVotes(
+  snapshot: PostSnapshot,
+  record: TrackedPost
+): PostSnapshot {
+  const enrichedSnapshot: PostSnapshot = {
+    ...snapshot,
+  };
+
+  if (typeof record.lastKnownUpvotes === 'number') {
+    enrichedSnapshot.upvotes = record.lastKnownUpvotes;
+  }
+
+  if (typeof record.lastKnownDownvotes === 'number') {
+    enrichedSnapshot.downvotes = record.lastKnownDownvotes;
+  }
+
+  if (typeof record.lastCalculatedVoteScore === 'number') {
+    enrichedSnapshot.calculatedVoteScore = record.lastCalculatedVoteScore;
+  }
+
+  return enrichedSnapshot;
+}
+
+function applyScoreSignals(
+  record: TrackedPost,
+  snapshot: PostSnapshot | null | undefined,
+  negativeDecision: NegativeDecisionScore | undefined
+): TrackedPost {
+  const updatedRecord: TrackedPost = { ...record };
+
+  if (snapshot) {
+    updatedRecord.lastKnownScore = snapshot.score;
+
+    if (typeof snapshot.upvotes === 'number') {
+      updatedRecord.lastKnownUpvotes = snapshot.upvotes;
+    }
+
+    if (typeof snapshot.downvotes === 'number') {
+      updatedRecord.lastKnownDownvotes = snapshot.downvotes;
+    }
+  }
+
+  if (typeof negativeDecision?.calculatedVoteScore === 'number') {
+    updatedRecord.lastCalculatedVoteScore =
+      negativeDecision.calculatedVoteScore;
+  }
+
+  if (typeof negativeDecision?.score === 'number') {
+    updatedRecord.negativeDecisionScore = negativeDecision.score;
+    updatedRecord.negativeDecisionSource = negativeDecision.source;
+  }
+
+  return updatedRecord;
 }
 
 async function markErrorAndReschedule(
@@ -240,10 +315,29 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     });
 
     const fetched = await fetchPostSnapshot(postId);
+    const currentSnapshot = fetched
+      ? enrichSnapshotWithStoredVotes(fetched.snapshot, initialRecord)
+      : null;
+    const negativeDecision = currentSnapshot
+      ? getNegativeDecisionScore(currentSnapshot)
+      : undefined;
+
+    if (currentSnapshot && negativeDecision) {
+      logInfo('Computed negative decision score for scheduled check.', {
+        postId,
+        fetchedScore: currentSnapshot.score,
+        storedUpvotes: currentSnapshot.upvotes,
+        storedDownvotes: currentSnapshot.downvotes,
+        calculatedVoteScore: negativeDecision.calculatedVoteScore,
+        negativeDecisionScore: negativeDecision.score,
+        negativeDecisionSource: negativeDecision.source,
+      });
+    }
+
     const decision = decideTrackedPostCheck({
       tracking: initialRecord,
       settings: currentSettings,
-      post: fetched?.snapshot ?? null,
+      post: currentSnapshot,
       now,
     });
 
@@ -261,10 +355,17 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         postId,
         status: decision.status,
         reason: decision.status,
-        score: fetched?.snapshot.score,
+        score: currentSnapshot?.score,
+        negativeDecisionScore: negativeDecision?.score,
+        negativeDecisionSource: negativeDecision?.source,
         checkCount: initialRecord.checkCount,
       });
-      await stopTracking(initialRecord, decision.status, now, decision.status);
+      await stopTracking(
+        applyScoreSignals(initialRecord, currentSnapshot, negativeDecision),
+        decision.status,
+        now,
+        decision.status
+      );
       return c.json<TaskResponse>({}, 200);
     }
 
@@ -276,7 +377,12 @@ scheduledJobs.post('/check-watched-post', async (c) => {
 
       logInfo('Decision: action post because score reached threshold.', {
         postId,
-        score: fetched?.snapshot.score,
+        score: currentSnapshot?.score,
+        upvotes: currentSnapshot?.upvotes,
+        downvotes: currentSnapshot?.downvotes,
+        calculatedVoteScore: negativeDecision?.calculatedVoteScore,
+        negativeDecisionScore: negativeDecision?.score,
+        negativeDecisionSource: negativeDecision?.source,
         negativeScoreThreshold: initialRecord.negativeScoreThreshold,
         actionToTake: initialRecord.actionToTake,
         reason: actionReason,
@@ -316,16 +422,17 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       }
 
       await writeTrackedPost({
-        ...latestRecord,
+        ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision),
         status: 'actioning',
-        lastKnownScore: fetched.snapshot.score,
         updatedAt: now,
       });
 
       logInfo('Applying selected moderation action.', {
         postId,
         actionToTake: latestRecord.actionToTake,
-        score: fetched.snapshot.score,
+        score: currentSnapshot?.score,
+        negativeDecisionScore: negativeDecision?.score,
+        negativeDecisionSource: negativeDecision?.source,
         negativeScoreThreshold: latestRecord.negativeScoreThreshold,
         reason: actionReason,
       });
@@ -339,9 +446,8 @@ scheduledJobs.post('/check-watched-post', async (c) => {
 
       await stopTracking(
         {
-          ...latestRecord,
+          ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision),
           status: 'actioned',
-          lastKnownScore: fetched.snapshot.score,
           actionedAt: Date.now(),
         },
         'actioned',
@@ -357,7 +463,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       logInfo('Post action complete and audit record written.', {
         postId,
         actionToTake: latestRecord.actionToTake,
-        score: fetched.snapshot.score,
+        score: currentSnapshot?.score,
+        negativeDecisionScore: negativeDecision?.score,
+        negativeDecisionSource: negativeDecision?.source,
         auditKey: auditKey(postId),
         status: 'actioned',
       });
@@ -370,7 +478,12 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     const nextRunAt = getNextCheckRunAt(nextCheckCount, now);
     logInfo('Decision: reschedule because no terminal condition was met.', {
       postId,
-      score: fetched?.snapshot.score,
+      score: currentSnapshot?.score,
+      upvotes: currentSnapshot?.upvotes,
+      downvotes: currentSnapshot?.downvotes,
+      calculatedVoteScore: negativeDecision?.calculatedVoteScore,
+      negativeDecisionScore: negativeDecision?.score,
+      negativeDecisionSource: negativeDecision?.source,
       previousCheckCount: initialRecord.checkCount,
       nextCheckCount,
       nextDelayMinutes,
@@ -384,15 +497,11 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     });
 
     const updatedRecord: TrackedPost = {
-      ...initialRecord,
+      ...applyScoreSignals(initialRecord, currentSnapshot, negativeDecision),
       checkCount: nextCheckCount,
       lastJobId: jobId,
       updatedAt: now,
     };
-
-    if (fetched) {
-      updatedRecord.lastKnownScore = fetched.snapshot.score;
-    }
 
     await writeTrackedPost(updatedRecord);
 
@@ -403,6 +512,11 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       nextDelayMinutes,
       nextRunAt,
       score: updatedRecord.lastKnownScore,
+      upvotes: updatedRecord.lastKnownUpvotes,
+      downvotes: updatedRecord.lastKnownDownvotes,
+      calculatedVoteScore: updatedRecord.lastCalculatedVoteScore,
+      negativeDecisionScore: updatedRecord.negativeDecisionScore,
+      negativeDecisionSource: updatedRecord.negativeDecisionSource,
     });
   } catch (err: unknown) {
     await markErrorAndReschedule(initialRecord, err, Date.now());

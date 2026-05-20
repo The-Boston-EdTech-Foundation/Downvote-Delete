@@ -2,7 +2,11 @@ import {
   MODERATOR_ACTION_ALL,
   type DownvoteDeleteSettings,
 } from './settings';
-import type { TrackedPost, TrackingStatus } from './tracking';
+import type {
+  NegativeDecisionSource,
+  TrackedPost,
+  TrackingStatus,
+} from './tracking';
 
 export type TrackEligibilityInput = {
   settings: DownvoteDeleteSettings;
@@ -22,12 +26,21 @@ export function shouldTrackNewPost(input: TrackEligibilityInput): boolean {
 
 export type PostSnapshot = {
   score: number;
+  upvotes?: number;
+  downvotes?: number;
+  calculatedVoteScore?: number;
   approved: boolean;
   removed: boolean;
   filtered: boolean;
   spam: boolean;
   deleted: boolean;
   unavailable: boolean;
+};
+
+export type NegativeDecisionScore = {
+  score: number;
+  source: NegativeDecisionSource;
+  calculatedVoteScore?: number;
 };
 
 export type CheckDecision =
@@ -42,6 +55,47 @@ export function isPostInvalidForTracking(post: PostSnapshot): boolean {
 
 export function isPostAlreadyModerated(post: PostSnapshot): boolean {
   return post.removed || post.filtered || post.spam;
+}
+
+export function calculateVoteScore(args: {
+  upvotes?: number | undefined;
+  downvotes?: number | undefined;
+}): number | undefined {
+  if (typeof args.upvotes !== 'number' || typeof args.downvotes !== 'number') {
+    return undefined;
+  }
+
+  return args.upvotes - args.downvotes;
+}
+
+export function getNegativeDecisionScore(
+  post: PostSnapshot
+): NegativeDecisionScore {
+  const calculatedVoteScore =
+    post.calculatedVoteScore ??
+    calculateVoteScore({ upvotes: post.upvotes, downvotes: post.downvotes });
+
+  if (
+    typeof calculatedVoteScore === 'number' &&
+    calculatedVoteScore < post.score
+  ) {
+    return {
+      score: calculatedVoteScore,
+      source: 'calculated_votes',
+      calculatedVoteScore,
+    };
+  }
+
+  const redditScoreDecision: NegativeDecisionScore = {
+    score: post.score,
+    source: 'reddit_score',
+  };
+
+  if (typeof calculatedVoteScore === 'number') {
+    redditScoreDecision.calculatedVoteScore = calculatedVoteScore;
+  }
+
+  return redditScoreDecision;
 }
 
 export function decideTrackedPostCheck(args: {
@@ -72,12 +126,12 @@ export function decideTrackedPostCheck(args: {
     return { type: 'stop', status: 'stopped_approved' };
   }
 
-  if (post.score <= tracking.negativeScoreThreshold) {
-    return { type: 'action' };
-  }
-
   if (post.score >= tracking.positiveScoreStopThreshold) {
     return { type: 'stop', status: 'stopped_positive' };
+  }
+
+  if (getNegativeDecisionScore(post).score <= tracking.negativeScoreThreshold) {
+    return { type: 'action' };
   }
 
   if (now >= tracking.trackingExpiresAt) {

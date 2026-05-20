@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'vitest';
 import { getNextCheckDelayMinutes } from '../src/core/backoff';
 import {
+  calculateVoteScore,
   decideTrackedPostCheck,
+  getNegativeDecisionScore,
   shouldTrackNewPost,
   type PostSnapshot,
 } from '../src/core/decision';
@@ -61,17 +63,89 @@ function postSnapshot(overrides: Partial<PostSnapshot> = {}): PostSnapshot {
 }
 
 describe('backoff schedule', () => {
-  test('uses the configured early delays and then 10 minutes', () => {
+  test('uses incremental delays for post ages around 2, 5, 10, then every 10 minutes', () => {
     expect(getNextCheckDelayMinutes(0)).toBe(2);
-    expect(getNextCheckDelayMinutes(1)).toBe(5);
-    expect(getNextCheckDelayMinutes(2)).toBe(10);
-    expect(getNextCheckDelayMinutes(3)).toBe(20);
+    expect(getNextCheckDelayMinutes(1)).toBe(3);
+    expect(getNextCheckDelayMinutes(2)).toBe(5);
+    expect(getNextCheckDelayMinutes(3)).toBe(10);
     expect(getNextCheckDelayMinutes(4)).toBe(10);
     expect(getNextCheckDelayMinutes(20)).toBe(10);
   });
 });
 
 describe('tracked post decisions', () => {
+  test('calculates vote score from upvotes and downvotes', () => {
+    expect(calculateVoteScore({ upvotes: 1, downvotes: 2 })).toBe(-1);
+  });
+
+  test('uses the lower calculated vote score for negative threshold decisions', () => {
+    const post = postSnapshot({ score: 0, upvotes: 1, downvotes: 4 });
+
+    expect(getNegativeDecisionScore(post)).toEqual({
+      score: -3,
+      source: 'calculated_votes',
+      calculatedVoteScore: -3,
+    });
+
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -3 }),
+        settings: activeSettings,
+        post,
+        now,
+      })
+    ).toEqual({ type: 'action' });
+  });
+
+  test('uses the normal Reddit score when it is lower than calculated votes', () => {
+    const post = postSnapshot({ score: -3, upvotes: 5, downvotes: 5 });
+
+    expect(getNegativeDecisionScore(post)).toEqual({
+      score: -3,
+      source: 'reddit_score',
+      calculatedVoteScore: 0,
+    });
+
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -3 }),
+        settings: activeSettings,
+        post,
+        now,
+      })
+    ).toEqual({ type: 'action' });
+  });
+
+  test('falls back to normal score when vote counts are unavailable', () => {
+    expect(getNegativeDecisionScore(postSnapshot({ score: 0 }))).toEqual({
+      score: 0,
+      source: 'reddit_score',
+    });
+
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -3 }),
+        settings: activeSettings,
+        post: postSnapshot({ score: 0 }),
+        now,
+      })
+    ).toEqual({ type: 'reschedule' });
+  });
+
+  test('positive stop still uses normal Reddit score instead of calculated votes', () => {
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({
+          negativeScoreThreshold: -3,
+          positiveScoreStopThreshold: 5,
+        }),
+        settings: activeSettings,
+        post: postSnapshot({ score: 5, upvotes: 1, downvotes: 10 }),
+        now,
+      })
+    ).toEqual({ type: 'stop', status: 'stopped_positive' });
+  });
+
   test('actions at the negative score threshold', () => {
     expect(
       decideTrackedPostCheck({

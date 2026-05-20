@@ -1,5 +1,9 @@
 import { Hono } from 'hono';
-import type { OnPostSubmitRequest, TriggerResponse } from '@devvit/web/shared';
+import type {
+  OnPostSubmitRequest,
+  OnPostUpdateRequest,
+  TriggerResponse,
+} from '@devvit/web/shared';
 import {
   reddit,
   redis,
@@ -12,8 +16,9 @@ import {
   normalizeSettings,
   type DownvoteDeleteSettings,
 } from '../core/settings';
-import { shouldTrackNewPost } from '../core/decision';
+import { calculateVoteScore, shouldTrackNewPost } from '../core/decision';
 import {
+  parseTrackedPost,
   serializeTrackedPost,
   statsKey,
   type TrackedPost,
@@ -30,6 +35,68 @@ function getPostId(input: OnPostSubmitRequest): string | undefined {
 
 function getPostCreatedAt(input: OnPostSubmitRequest, now: number): number {
   return input.post?.createdAt ? input.post.createdAt * 1000 : now;
+}
+
+function getPostVoteCounts(post: { upvotes?: number; downvotes?: number }) {
+  const voteCounts: {
+    upvotes?: number;
+    downvotes?: number;
+    calculatedVoteScore?: number;
+  } = {};
+
+  if (typeof post.upvotes === 'number') {
+    voteCounts.upvotes = post.upvotes;
+  }
+
+  if (typeof post.downvotes === 'number') {
+    voteCounts.downvotes = post.downvotes;
+  }
+
+  const calculatedVoteScore = calculateVoteScore(voteCounts);
+  if (typeof calculatedVoteScore === 'number') {
+    voteCounts.calculatedVoteScore = calculatedVoteScore;
+  }
+
+  return voteCounts;
+}
+
+async function loadTrackedPostForTrigger(
+  postId: string
+): Promise<TrackedPost | null> {
+  const redisKey = watchKey(postId);
+  logInfo('Pulling tracking record from Redis for trigger update.', {
+    postId,
+    redisKey,
+  });
+
+  const rawRecord = await redis.get(redisKey);
+  const parsedRecord = parseTrackedPost(rawRecord);
+
+  if (!rawRecord) {
+    logInfo('No active tracking record found for trigger update.', {
+      postId,
+      redisKey,
+    });
+    return null;
+  }
+
+  if (!parsedRecord) {
+    logError('Tracking record for trigger update is malformed.', {
+      postId,
+      redisKey,
+      rawLength: rawRecord.length,
+    });
+    return null;
+  }
+
+  logInfo('Loaded tracking record for trigger update.', {
+    postId,
+    redisKey,
+    status: parsedRecord.status,
+    checkCount: parsedRecord.checkCount,
+  });
+
+  return parsedRecord;
 }
 
 async function isModeratorPost(args: {
@@ -103,6 +170,8 @@ triggers.post('/on-post-submit', async (c) => {
       subredditName,
       authorName,
       initialScore: input.post?.score,
+      upvotes: input.post?.upvotes,
+      downvotes: input.post?.downvotes,
     });
 
     const currentSettings = await readSettings();
@@ -176,6 +245,22 @@ triggers.post('/on-post-submit', async (c) => {
       record.lastKnownScore = input.post.score;
     }
 
+    if (input.post) {
+      const voteCounts = getPostVoteCounts(input.post);
+
+      if (typeof voteCounts.upvotes === 'number') {
+        record.lastKnownUpvotes = voteCounts.upvotes;
+      }
+
+      if (typeof voteCounts.downvotes === 'number') {
+        record.lastKnownDownvotes = voteCounts.downvotes;
+      }
+
+      if (typeof voteCounts.calculatedVoteScore === 'number') {
+        record.lastCalculatedVoteScore = voteCounts.calculatedVoteScore;
+      }
+    }
+
     const redisKey = watchKey(postId);
     logInfo('Writing initial tracking record to Redis.', {
       postId,
@@ -184,6 +269,9 @@ triggers.post('/on-post-submit', async (c) => {
       redisKey,
       checkCount: record.checkCount,
       initialScore: record.lastKnownScore,
+      upvotes: record.lastKnownUpvotes,
+      downvotes: record.lastKnownDownvotes,
+      calculatedVoteScore: record.lastCalculatedVoteScore,
       expiresAt: new Date(record.trackingExpiresAt),
       negativeScoreThreshold: record.negativeScoreThreshold,
       positiveScoreStopThreshold: record.positiveScoreStopThreshold,
@@ -213,10 +301,83 @@ triggers.post('/on-post-submit', async (c) => {
       jobId,
       firstRunAt,
       initialScore: record.lastKnownScore,
+      upvotes: record.lastKnownUpvotes,
+      downvotes: record.lastKnownDownvotes,
+      calculatedVoteScore: record.lastCalculatedVoteScore,
       expiresAt: new Date(record.trackingExpiresAt),
     });
   } catch (err: unknown) {
     logError('Failed to process post submit trigger.', undefined, err);
+  }
+
+  return c.json<TriggerResponse>({}, 200);
+});
+
+triggers.post('/on-post-update', async (c) => {
+  try {
+    const input = await c.req.json<OnPostUpdateRequest>();
+    const postId = input.post?.id;
+
+    logInfo('Received post update trigger.', {
+      postId,
+      subredditId: input.subreddit?.id,
+      authorName: input.author?.name,
+      score: input.post?.score,
+      upvotes: input.post?.upvotes,
+      downvotes: input.post?.downvotes,
+    });
+
+    if (!postId || !input.post) {
+      logWarn('Skipping post update because trigger data is incomplete.', {
+        postId,
+        reason: 'missing_update_data',
+      });
+      return c.json<TriggerResponse>({}, 200);
+    }
+
+    const existingRecord = await loadTrackedPostForTrigger(postId);
+    if (!existingRecord || existingRecord.status !== 'active') {
+      logInfo('Post update did not update tracking because no active record exists.', {
+        postId,
+        status: existingRecord?.status,
+        reason: existingRecord ? 'record_not_active' : 'record_missing',
+      });
+      return c.json<TriggerResponse>({}, 200);
+    }
+
+    const voteCounts = getPostVoteCounts(input.post);
+    const updatedRecord: TrackedPost = {
+      ...existingRecord,
+      updatedAt: Date.now(),
+    };
+
+    if (typeof input.post.score === 'number') {
+      updatedRecord.lastKnownScore = input.post.score;
+    }
+
+    if (typeof voteCounts.upvotes === 'number') {
+      updatedRecord.lastKnownUpvotes = voteCounts.upvotes;
+    }
+
+    if (typeof voteCounts.downvotes === 'number') {
+      updatedRecord.lastKnownDownvotes = voteCounts.downvotes;
+    }
+
+    if (typeof voteCounts.calculatedVoteScore === 'number') {
+      updatedRecord.lastCalculatedVoteScore = voteCounts.calculatedVoteScore;
+    }
+
+    await redis.set(watchKey(postId), serializeTrackedPost(updatedRecord));
+    logInfo('Updated tracked post vote counts from post update trigger.', {
+      postId,
+      redisKey: watchKey(postId),
+      score: updatedRecord.lastKnownScore,
+      upvotes: updatedRecord.lastKnownUpvotes,
+      downvotes: updatedRecord.lastKnownDownvotes,
+      calculatedVoteScore: updatedRecord.lastCalculatedVoteScore,
+    });
+  } catch (err: unknown) {
+    logError('Failed to process post update trigger.', undefined, err);
   }
 
   return c.json<TriggerResponse>({}, 200);

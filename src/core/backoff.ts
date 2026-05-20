@@ -1,4 +1,4 @@
-const backoffMinutesByCheckCount = [2, 5, 10, 20] as const;
+const backoffMinutesByCheckCount = [2, 3, 5] as const;
 
 export function getNextCheckDelayMinutes(checkCount: number): number {
   if (checkCount < 0) {

@@ -15,6 +15,8 @@ export type TrackingStatus =
   | 'stopped_inactive'
   | 'error';
 
+export type NegativeDecisionSource = 'reddit_score' | 'calculated_votes';
+
 export type TrackedPost = {
   subredditId: string;
   subredditName: string;
@@ -26,6 +28,11 @@ export type TrackedPost = {
   trackingExpiresAt: number;
   checkCount: number;
   lastKnownScore?: number;
+  lastKnownUpvotes?: number;
+  lastKnownDownvotes?: number;
+  lastCalculatedVoteScore?: number;
+  negativeDecisionScore?: number;
+  negativeDecisionSource?: NegativeDecisionSource;
   negativeScoreThreshold: number;
   positiveScoreStopThreshold: number;
   actionToTake: DownvoteDeleteAction;

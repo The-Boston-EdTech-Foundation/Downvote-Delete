@@ -17,6 +17,15 @@ Downvote Delete can:
 
 Downvote Delete watches posts only. It does not track comments or scan older posts.
 
+## Timing
+
+The app checks tracked posts on an incremental schedule:
+
+- First check: 2 minutes after submission
+- Second check: 3 minutes later, around post age 5 minutes
+- Third check: 5 minutes later, around post age 10 minutes
+- Later checks: every 10 minutes until tracking stops or expires
+
 ## Recommended Setup
 
 For testing, start with:
@@ -41,5 +50,3 @@ Downvote Delete will not:
 - Use spam removal.
 - Action the same tracked post more than once.
 - Continue watching posts that were already moderated or deleted.
-
-Turn off **Downvote Delete is active** in settings to pause the app.
