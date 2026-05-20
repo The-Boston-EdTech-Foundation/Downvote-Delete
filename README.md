@@ -34,19 +34,6 @@ The app stops watching a post when:
 - the post is removed, filtered, marked spam, deleted, or unavailable
 - Downvote Delete is turned off in settings
 
-## Installation Settings
-
-These settings are configured per subreddit from the app installation settings.
-
-| Setting | Options | Default | What it does |
-| --- | --- | --- | --- |
-| Downvote Delete is active | On or off | On | Turns the app on or pauses it. When off, the app does not start watching new posts and does not action existing tracked posts. |
-| Track posts for | 1 hour, 2 hours, 3 hours | 2 hours | Sets how long a new post can be watched before tracking expires. |
-| Action post at score | -3, -5, -10 | -3 | Sets the negative score threshold. A watched post is actioned when its Reddit score is less than or equal to this value. |
-| Stop watching at positive score | 3, 5, 10 | 5 | Stops tracking a post once it reaches this positive score. |
-| Action to take | Report to Mod Queue, Filter, Remove | Remove | Chooses what happens when a watched post reaches the negative threshold. |
-| Moderator post handling | Ignore downvoted moderator posts, Action all downvoted posts including moderators | Ignore downvoted moderator posts | Controls whether posts submitted by moderators can be watched and actioned. |
-
 ## Action Options
 
 **Report to Mod Queue** sends the post to the moderation queue with a reason such as `Reported for -3 Downvote Karma`.

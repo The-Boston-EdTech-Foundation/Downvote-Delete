@@ -81,6 +81,9 @@
     "build": "vite build",
     "dev": "vite build --watch"
   },
+  "marketingAssets": {
+    "icon": "assets/icon.jpg"
+  },
   "permissions": {
     "reddit": {
       "enable": true,
