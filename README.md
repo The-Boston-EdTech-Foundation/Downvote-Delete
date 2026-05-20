@@ -50,3 +50,7 @@ Downvote Delete will not:
 - Use spam removal.
 - Action the same tracked post more than once.
 - Continue watching posts that were already moderated or deleted.
+
+## Patch Notes
+
+1.0.2 - Initial Public Release. Devvit 0.12.24
