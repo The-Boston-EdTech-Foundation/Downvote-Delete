@@ -97,6 +97,15 @@ async function writeTrackedPost(record: TrackedPost): Promise<void> {
   await redis.set(redisKey, serializeTrackedPost(record));
 }
 
+async function releaseActionLock(postId: string, reason: string): Promise<void> {
+  logInfo('Releasing Redis action lock.', {
+    postId,
+    actionLockKey: actionLockKey(postId),
+    reason,
+  });
+  await redis.del(actionLockKey(postId));
+}
+
 async function stopTracking(
   record: TrackedPost,
   status: Exclude<TrackingStatus, 'active' | 'actioning'>,
@@ -273,6 +282,39 @@ async function markErrorAndReschedule(
   });
 }
 
+async function scheduleRetryWithoutRecordWrite(
+  record: TrackedPost,
+  now: number,
+  reason: string
+): Promise<void> {
+  if (now >= record.trackingExpiresAt) {
+    logWarn('Retry was not scheduled because tracking window is expired.', {
+      postId: record.postId,
+      reason,
+    });
+    return;
+  }
+
+  const nextCheckCount = record.checkCount + 1;
+  const nextRunAt = getNextCheckRunAt(nextCheckCount, now);
+  const nextDelayMinutes = getNextCheckDelayMinutes(nextCheckCount);
+  const jobId = await scheduler.runJob({
+    name: CHECK_WATCHED_POST_TASK,
+    data: { postId: record.postId },
+    runAt: nextRunAt,
+  });
+
+  logInfo('Scheduled retry without rewriting tracking record.', {
+    postId: record.postId,
+    reason,
+    checkCount: record.checkCount,
+    nextCheckCount,
+    nextDelayMinutes,
+    nextRunAt,
+    jobId,
+  });
+}
+
 scheduledJobs.post('/check-watched-post', async (c) => {
   const task = await c.req.json<TaskRequest<CheckWatchedPostData>>();
   const postId = task.data?.postId;
@@ -403,6 +445,14 @@ scheduledJobs.post('/check-watched-post', async (c) => {
           postId,
           actionLockResult: actionLockWasSet,
         });
+        const latestRecord = await loadTrackedPost(postId);
+        if (latestRecord?.status === 'active') {
+          await scheduleRetryWithoutRecordWrite(
+            latestRecord,
+            Date.now(),
+            'action_lock_busy'
+          );
+        }
         return c.json<TaskResponse>({}, 200);
       }
 
@@ -418,6 +468,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
           latestStatus: latestRecord?.status,
           hasFetchedPost: Boolean(fetched),
         });
+        await releaseActionLock(postId, 'latest_record_not_actionable');
         return c.json<TaskResponse>({}, 200);
       }
 
@@ -437,12 +488,25 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         reason: actionReason,
       });
 
-      await applyModerationAction({
-        redditClient: reddit,
-        post: fetched.post,
-        action: latestRecord.actionToTake,
-        threshold: latestRecord.negativeScoreThreshold,
-      });
+      try {
+        await applyModerationAction({
+          redditClient: reddit,
+          post: fetched.post,
+          action: latestRecord.actionToTake,
+          threshold: latestRecord.negativeScoreThreshold,
+        });
+      } catch (err: unknown) {
+        await releaseActionLock(postId, 'moderation_action_failed');
+        await markErrorAndReschedule(
+          {
+            ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision),
+            status: 'active',
+          },
+          err,
+          Date.now()
+        );
+        return c.json<TaskResponse>({}, 200);
+      }
 
       await stopTracking(
         {

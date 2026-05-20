@@ -14,7 +14,10 @@ import {
   MODERATOR_IGNORE,
   type DownvoteDeleteSettings,
 } from '../src/core/settings';
-import type { TrackedPost } from '../src/core/tracking';
+import {
+  applyActiveTrackingVoteSignalUpdate,
+  type TrackedPost,
+} from '../src/core/tracking';
 
 const now = 1_700_000_000_000;
 
@@ -280,6 +283,77 @@ describe('moderator handling', () => {
         isModeratorPost: true,
       })
     ).toBe(true);
+  });
+});
+
+describe('tracking vote signal updates', () => {
+  test('updates vote signal fields for active tracked posts', () => {
+    expect(
+      applyActiveTrackingVoteSignalUpdate(
+        trackedPost({
+          lastKnownScore: 0,
+          lastKnownUpvotes: 2,
+          lastKnownDownvotes: 1,
+          lastCalculatedVoteScore: 1,
+        }),
+        {
+          score: -1,
+          upvotes: 1,
+          downvotes: 4,
+          calculatedVoteScore: -3,
+        },
+        now + 1_000
+      )
+    ).toMatchObject({
+      status: 'active',
+      lastKnownScore: -1,
+      lastKnownUpvotes: 1,
+      lastKnownDownvotes: 4,
+      lastCalculatedVoteScore: -3,
+      updatedAt: now + 1_000,
+      negativeScoreThreshold: -3,
+      positiveScoreStopThreshold: 5,
+    });
+  });
+
+  test.each([
+    'actioning',
+    'actioned',
+    'stopped_positive',
+    'stopped_expired',
+    'stopped_approved',
+    'stopped_invalid',
+    'stopped_removed',
+    'stopped_inactive',
+    'error',
+  ] as const)('refuses to update %s tracked posts', (status) => {
+    expect(
+      applyActiveTrackingVoteSignalUpdate(
+        trackedPost({ status }),
+        {
+          score: -3,
+          upvotes: 1,
+          downvotes: 4,
+          calculatedVoteScore: -3,
+        },
+        now + 1_000
+      )
+    ).toBeNull();
+  });
+
+  test('refuses to update missing records', () => {
+    expect(
+      applyActiveTrackingVoteSignalUpdate(
+        null,
+        {
+          score: -3,
+          upvotes: 1,
+          downvotes: 4,
+          calculatedVoteScore: -3,
+        },
+        now + 1_000
+      )
+    ).toBeNull();
   });
 });
 

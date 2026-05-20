@@ -18,10 +18,12 @@ import {
 } from '../core/settings';
 import { calculateVoteScore, shouldTrackNewPost } from '../core/decision';
 import {
+  applyActiveTrackingVoteSignalUpdate,
   parseTrackedPost,
   serializeTrackedPost,
   statsKey,
   type TrackedPost,
+  type TrackingVoteSignalUpdate,
   watchKey,
 } from '../core/tracking';
 
@@ -58,6 +60,23 @@ function getPostVoteCounts(post: { upvotes?: number; downvotes?: number }) {
   }
 
   return voteCounts;
+}
+
+function getPostVoteSignalUpdate(post: {
+  score?: number;
+  upvotes?: number;
+  downvotes?: number;
+}): TrackingVoteSignalUpdate {
+  const voteCounts = getPostVoteCounts(post);
+  const update: TrackingVoteSignalUpdate = {
+    ...voteCounts,
+  };
+
+  if (typeof post.score === 'number') {
+    update.score = post.score;
+  }
+
+  return update;
 }
 
 async function loadTrackedPostForTrigger(
@@ -345,29 +364,38 @@ triggers.post('/on-post-update', async (c) => {
       return c.json<TriggerResponse>({}, 200);
     }
 
-    const voteCounts = getPostVoteCounts(input.post);
-    const updatedRecord: TrackedPost = {
-      ...existingRecord,
-      updatedAt: Date.now(),
-    };
+    const voteSignalUpdate = getPostVoteSignalUpdate(input.post);
+    const updatedRecord = applyActiveTrackingVoteSignalUpdate(
+      existingRecord,
+      voteSignalUpdate,
+      Date.now()
+    );
 
-    if (typeof input.post.score === 'number') {
-      updatedRecord.lastKnownScore = input.post.score;
+    if (!updatedRecord) {
+      logInfo('Post update did not update tracking because record is no longer active.', {
+        postId,
+        status: existingRecord.status,
+        reason: 'record_not_active_before_write',
+      });
+      return c.json<TriggerResponse>({}, 200);
     }
 
-    if (typeof voteCounts.upvotes === 'number') {
-      updatedRecord.lastKnownUpvotes = voteCounts.upvotes;
+    const writeResult = await redis.set(
+      watchKey(postId),
+      serializeTrackedPost(updatedRecord),
+      { xx: true }
+    );
+
+    if (writeResult !== 'OK') {
+      logWarn('Post update vote-count write skipped because watch key no longer exists.', {
+        postId,
+        redisKey: watchKey(postId),
+        writeResult,
+        reason: 'watch_key_missing_before_write',
+      });
+      return c.json<TriggerResponse>({}, 200);
     }
 
-    if (typeof voteCounts.downvotes === 'number') {
-      updatedRecord.lastKnownDownvotes = voteCounts.downvotes;
-    }
-
-    if (typeof voteCounts.calculatedVoteScore === 'number') {
-      updatedRecord.lastCalculatedVoteScore = voteCounts.calculatedVoteScore;
-    }
-
-    await redis.set(watchKey(postId), serializeTrackedPost(updatedRecord));
     logInfo('Updated tracked post vote counts from post update trigger.', {
       postId,
       redisKey: watchKey(postId),
