@@ -1,81 +1,83 @@
 # Downvote Delete
 
-Downvote Delete is a Reddit Devvit moderation app that watches newly submitted posts and takes action when community voting drops a post to a configured negative score.
+Downvote Delete is a Reddit Devvit moderation app that watches newly submitted posts and takes action when a post drops to a configured negative score.
 
-It is designed for moderators who want a simple safety net for posts that receive strong negative feedback soon after being submitted, without tracking comments or changing older content.
+It is built for communities that want a simple safety net for posts receiving strong negative feedback soon after submission.
 
-## Why Moderators Use It
+## What It Does
 
-- Reduce manual review of heavily downvoted new posts.
-- Choose how strict the app should be for your community.
-- Stop watching posts that recover or become positively received.
-- Respect manual moderation decisions, including approvals and removals.
-- Pause the app from settings without uninstalling it.
+Downvote Delete can:
+
+- Watch new posts for 1, 2, or 3 hours.
+- Take action at -3, -5, or -10 score.
+- Stop watching posts that recover to a positive score.
+- Ignore manually approved posts.
+- Stop tracking posts that are already removed, filtered, spammed, deleted, or unavailable.
+- Be paused from app settings without uninstalling.
+
+Downvote Delete watches posts only. It does not track comments or scan older posts.
 
 ## How It Works
 
-When a new post is submitted, Downvote Delete checks your app installation settings for that subreddit. If the app is active and the post is eligible, it starts watching the post for the selected tracking window.
+When a new post is submitted, Downvote Delete checks whether the app is active and whether the post is eligible.
 
-The app checks the post's Reddit score on this schedule:
+If eligible, the app checks the post's Reddit score after:
 
-- 2 minutes after submission
-- 5 minutes after the first check
-- 10 minutes after the second check
-- 20 minutes after the third check
+- 2 minutes
+- 5 minutes
+- 10 minutes
+- 20 minutes
 - every 10 minutes after that until the tracking window ends
 
-Downvote Delete watches newly submitted posts only. It does not scan older posts when installed, and it does not track comments.
+If the post reaches your negative score threshold, the app takes your selected action immediately.
 
-The app stops watching a post when:
-
-- the post reaches the positive stop threshold
-- the selected tracking window expires
-- a moderator manually approves the post
-- the post is removed, filtered, marked spam, deleted, or unavailable
-- Downvote Delete is turned off in settings
+If the post reaches your positive stop threshold, the app stops watching it.
 
 ## Action Options
 
-**Report to Mod Queue** sends the post to the moderation queue with a reason such as `Reported for -3 Downvote Karma`.
+**Report to Mod Queue**
 
-**Filter** removes the post from public view and sends it to Reddit's moderation review/removal surfaces with a reason such as `Filtered for -3 Downvote Karma`.
+Reports the post with a reason such as:
 
-**Remove** performs a regular non-spam removal and adds a concise moderator note such as `Removed for -3 Downvote Karma`.
+`Reported for -3 Downvote Karma`
 
-Downvote Delete does not leave a public comment or send a private message by default.
+**Filter**
 
-## Recommended Configurations
+Filters the post with a reason such as:
 
-**Conservative communities**
+`Filtered for -3 Downvote Karma`
 
-Use a lower-sensitivity threshold such as `-10`, and start with `Report to Mod Queue` or `Filter` so moderators can review posts before final removal.
+**Remove**
 
-**High-volume communities**
+Performs a regular non-spam removal with a reason such as:
 
-Use `-3` or `-5` with `Remove` to reduce the amount of clearly rejected content that moderators need to handle manually.
+`Removed for -3 Downvote Karma`
 
-**Trial mode**
+Downvote Delete does not leave public comments or send private messages by default.
 
-Keep `Downvote Delete is active` turned on, set `Action to take` to `Report to Mod Queue`, and review what the app reports before switching to `Filter` or `Remove`.
+## Recommended Setup
 
-**Pause mode**
+For testing, start with:
 
-Turn `Downvote Delete is active` off. The app will not start watching new posts and will not action existing tracked posts when checks run.
+- Action threshold: `-3` or `-5`
+- Action to take: `Report to Mod Queue`
+- Tracking window: `2 hours`
 
-## Moderation Safety
+After reviewing results, switch to `Filter` or `Remove` if you want the app to act automatically.
 
-Manually approved posts are exempt. If a watched post is later detected as approved, tracking stops and the post is not actioned.
+For stricter communities, use `-3`.
 
-Posts that are already removed, filtered, marked spam, deleted, or unavailable are no longer tracked. Downvote Delete avoids duplicate actions for the same tracked post.
+For more cautious communities, use `-10`.
 
-Posts that reach the positive stop threshold are treated as accepted by the community and are no longer watched.
+## Safety Rules
 
-## What Downvote Delete Will Not Do
+Downvote Delete will not:
 
-- It will not track comments.
-- It will not scan older posts from before the app was installed.
-- It will not calculate scores manually from upvotes and downvotes.
-- It will not leave public comments by default.
-- It will not send private messages by default.
-- It will not use spam removal.
-- It will not action the same tracked post more than once.
+- Track comments.
+- Scan old posts from before installation.
+- Action manually approved posts.
+- Use spam removal.
+- Action the same tracked post more than once.
+- Continue watching posts that were already moderated or deleted.
+
+Turn off **Downvote Delete is active** in settings to pause the app.
