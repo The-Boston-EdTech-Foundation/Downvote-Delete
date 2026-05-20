@@ -41,6 +41,10 @@ export type TrackedPost = {
   lastJobId?: string;
   updatedAt: number;
   actionedAt?: number;
+  modmailStatus?: 'not_applicable' | 'sent' | 'skipped' | 'failed';
+  modmailSentAt?: number;
+  modmailSkippedReason?: string;
+  modmailErrorMessage?: string;
   stopReason?: string;
   errorMessage?: string;
 };

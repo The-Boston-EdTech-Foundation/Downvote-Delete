@@ -1,4 +1,9 @@
 import { describe, expect, test } from 'vitest';
+import {
+  applyModerationAction,
+  buildRemovedForDownvotesModmailBody,
+  REMOVAL_MODMAIL_SUBJECT,
+} from '../src/core/actions';
 import { getNextCheckDelayMinutes } from '../src/core/backoff';
 import {
   calculateVoteScore,
@@ -9,7 +14,9 @@ import {
 } from '../src/core/decision';
 import { formatLogContext } from '../src/core/logging';
 import {
+  ACTION_FILTER,
   ACTION_REMOVE,
+  ACTION_REPORT,
   MODERATOR_ACTION_ALL,
   MODERATOR_IGNORE,
   type DownvoteDeleteSettings,
@@ -29,6 +36,73 @@ const activeSettings: DownvoteDeleteSettings = {
   actionToTake: ACTION_REMOVE,
   moderatorPostHandling: MODERATOR_IGNORE,
 };
+
+type ApplyModerationActionArgs = Parameters<typeof applyModerationAction>[0];
+
+function mockPost(overrides: Partial<{
+  filterCalls: string[];
+  removalNotes: unknown[];
+  removeCalls: boolean[];
+}> = {}): ApplyModerationActionArgs['post'] & {
+  filterCalls: string[];
+  removalNotes: unknown[];
+  removeCalls: boolean[];
+} {
+  const filterCalls = overrides.filterCalls ?? [];
+  const removalNotes = overrides.removalNotes ?? [];
+  const removeCalls = overrides.removeCalls ?? [];
+  const post = {
+    filterCalls,
+    removalNotes,
+    removeCalls,
+    async filter(reason: string, keep: boolean): Promise<void> {
+      filterCalls.push(`${reason}|${keep}`);
+    },
+    async remove(isSpam: boolean): Promise<void> {
+      removeCalls.push(isSpam);
+    },
+    async addRemovalNote(note: unknown): Promise<void> {
+      removalNotes.push(note);
+    },
+  };
+
+  return post as unknown as ApplyModerationActionArgs['post'] & {
+    filterCalls: string[];
+    removalNotes: unknown[];
+    removeCalls: boolean[];
+  };
+}
+
+function mockRedditClient(args: {
+  failModmail?: boolean;
+} = {}): ApplyModerationActionArgs['redditClient'] & {
+  reports: unknown[];
+  modmailConversations: unknown[];
+} {
+  const reports: unknown[] = [];
+  const modmailConversations: unknown[] = [];
+  const client = {
+    reports,
+    modmailConversations,
+    async report(post: unknown, reportArgs: unknown): Promise<void> {
+      reports.push({ post, reportArgs });
+    },
+    modMail: {
+      createConversation: async (conversation: unknown): Promise<void> => {
+        modmailConversations.push(conversation);
+
+        if (args.failModmail) {
+          throw new Error('modmail unavailable');
+        }
+      },
+    },
+  };
+
+  return client as unknown as ApplyModerationActionArgs['redditClient'] & {
+    reports: unknown[];
+    modmailConversations: unknown[];
+  };
+}
 
 function trackedPost(overrides: Partial<TrackedPost> = {}): TrackedPost {
   return {
@@ -354,6 +428,194 @@ describe('tracking vote signal updates', () => {
         now + 1_000
       )
     ).toBeNull();
+  });
+});
+
+describe('removal modmail notifications', () => {
+  test('builds the requested removal modmail body', () => {
+    const body = buildRemovedForDownvotesModmailBody({
+      username: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(body).toContain('Hi u/someUser,');
+    expect(body).toContain(
+      'Your post was removed because it received too much negative community feedback.'
+    );
+    expect(body).toContain(
+      'https://www.reddit.com/r/mySubreddit/about/rules'
+    );
+    expect(body).toContain(
+      '*Removed post: https://reddit.com/r/mySubreddit/comments/abc123*'
+    );
+    expect(body).toBe(`Hi u/someUser,
+
+Your post was removed because it received too much negative community feedback.
+
+Posts may be downvoted for many reasons, including rule issues, content quality, or controversial opinions. This removal helps prevent your account from accumulating additional negative karma from the post.
+
+Please review the [community rules](https://www.reddit.com/r/mySubreddit/about/rules) before posting again.
+
+
+*Removed post: https://reddit.com/r/mySubreddit/comments/abc123*`);
+  });
+
+  test('sends modmail after a successful remove action', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost();
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.removeCalls).toEqual([false]);
+    expect(post.removalNotes).toEqual([
+      { reasonId: '', modNote: 'Removed for -3 Downvote Karma' },
+    ]);
+    expect(redditClient.modmailConversations).toEqual([
+      {
+        subredditName: 'mySubreddit',
+        subject: REMOVAL_MODMAIL_SUBJECT,
+        body: buildRemovedForDownvotesModmailBody({
+          username: 'someUser',
+          subredditName: 'mySubreddit',
+          postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+        }),
+        to: 'u/someUser',
+        isAuthorHidden: true,
+      },
+    ]);
+    expect(result.modmailSentAt).toEqual(expect.any(Number));
+    expect(result.modmailStatus).toBe('sent');
+    expect(result.modmailErrorMessage).toBeUndefined();
+  });
+
+  test('does not send modmail for report or filter actions', async () => {
+    const reportClient = mockRedditClient();
+    const filterClient = mockRedditClient();
+
+    const reportResult = await applyModerationAction({
+      redditClient: reportClient,
+      post: mockPost(),
+      action: ACTION_REPORT,
+      threshold: -3,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    const filteredPost = mockPost();
+    const filterResult = await applyModerationAction({
+      redditClient: filterClient,
+      post: filteredPost,
+      action: ACTION_FILTER,
+      threshold: -3,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(reportClient.modmailConversations).toEqual([]);
+    expect(filterClient.modmailConversations).toEqual([]);
+    expect(filteredPost.filterCalls).toEqual([
+      'Filtered for -3 Downvote Karma|false',
+    ]);
+    expect(reportResult).toEqual({ modmailStatus: 'not_applicable' });
+    expect(filterResult).toEqual({ modmailStatus: 'not_applicable' });
+  });
+
+  test('missing username skips modmail without failing removal', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost();
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.removeCalls).toEqual([false]);
+    expect(redditClient.modmailConversations).toEqual([]);
+    expect(result).toEqual({
+      modmailStatus: 'skipped',
+      modmailSkippedReason: 'missing_author_name',
+    });
+  });
+
+  test('missing subreddit skips modmail without failing removal', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost();
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      authorName: 'someUser',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.removeCalls).toEqual([false]);
+    expect(redditClient.modmailConversations).toEqual([]);
+    expect(result).toEqual({
+      modmailStatus: 'skipped',
+      modmailSkippedReason: 'missing_subreddit_name',
+    });
+  });
+
+  test('missing post link skips modmail without failing removal', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost();
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+    });
+
+    expect(post.removeCalls).toEqual([false]);
+    expect(redditClient.modmailConversations).toEqual([]);
+    expect(result).toEqual({
+      modmailStatus: 'skipped',
+      modmailSkippedReason: 'missing_post_link',
+    });
+  });
+
+  test('modmail failure does not fail the remove action', async () => {
+    const redditClient = mockRedditClient({ failModmail: true });
+    const post = mockPost();
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.removeCalls).toEqual([false]);
+    expect(post.removalNotes).toEqual([
+      { reasonId: '', modNote: 'Removed for -3 Downvote Karma' },
+    ]);
+    expect(redditClient.modmailConversations).toHaveLength(1);
+    expect(result.modmailStatus).toBe('failed');
+    expect(result.modmailErrorMessage).toBe('modmail unavailable');
+    expect(result.modmailError).toBeInstanceOf(Error);
   });
 });
 

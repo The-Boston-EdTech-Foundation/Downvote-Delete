@@ -7,7 +7,13 @@ import {
   settings as devvitSettings,
 } from '@devvit/web/server';
 import type { T3 } from '@devvit/shared-types/tid.js';
-import { applyModerationAction, buildActionReason } from '../core/actions';
+import {
+  applyModerationAction,
+  buildActionReason,
+  REMOVAL_MODMAIL_SUBJECT,
+  type ModerationActionArgs,
+  type ModerationActionResult,
+} from '../core/actions';
 import { getNextCheckDelayMinutes, getNextCheckRunAt } from '../core/backoff';
 import {
   decideTrackedPostCheck,
@@ -38,6 +44,26 @@ export const scheduledJobs = new Hono();
 
 const actionLockKey = (postId: string): string =>
   `downvote-delete:action-lock:${postId}`;
+
+function buildFallbackPostLink(postId: string, subredditName: string): string {
+  return `https://reddit.com/r/${subredditName}/comments/${postId.replace(/^t3_/, '')}`;
+}
+
+function buildPostLink(args: {
+  postId: string;
+  subredditName: string;
+  permalink?: string;
+}): string {
+  if (args.permalink?.startsWith('http')) {
+    return args.permalink;
+  }
+
+  if (args.permalink?.startsWith('/')) {
+    return `https://reddit.com${args.permalink}`;
+  }
+
+  return buildFallbackPostLink(args.postId, args.subredditName);
+}
 
 async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
   const redisKey = watchKey(postId);
@@ -488,13 +514,41 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         reason: actionReason,
       });
 
+      let moderationActionResult: ModerationActionResult = {
+        modmailStatus: 'not_applicable',
+      };
+
       try {
-        await applyModerationAction({
+        const postLink = buildPostLink({
+          postId,
+          subredditName: latestRecord.subredditName,
+          permalink: fetched.post.permalink,
+        });
+        const moderationActionArgs: ModerationActionArgs = {
           redditClient: reddit,
           post: fetched.post,
           action: latestRecord.actionToTake,
           threshold: latestRecord.negativeScoreThreshold,
-        });
+          subredditName: latestRecord.subredditName,
+          postLink,
+        };
+
+        if (latestRecord.authorName) {
+          moderationActionArgs.authorName = latestRecord.authorName;
+        }
+
+        if (latestRecord.actionToTake === 'remove') {
+          logInfo('Preparing removal modmail notification.', {
+            postId,
+            authorName: latestRecord.authorName,
+            subredditName: latestRecord.subredditName,
+            postLink,
+            subject: REMOVAL_MODMAIL_SUBJECT,
+          });
+        }
+
+        moderationActionResult =
+          await applyModerationAction(moderationActionArgs);
       } catch (err: unknown) {
         await releaseActionLock(postId, 'moderation_action_failed');
         await markErrorAndReschedule(
@@ -508,12 +562,57 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         return c.json<TaskResponse>({}, 200);
       }
 
+      if (moderationActionResult.modmailStatus === 'sent') {
+        logInfo('Removal modmail notification sent.', {
+          postId,
+          authorName: latestRecord.authorName,
+          subredditName: latestRecord.subredditName,
+          modmailSentAt: moderationActionResult.modmailSentAt,
+        });
+      } else if (moderationActionResult.modmailStatus === 'failed') {
+        logError(
+          'Removal modmail notification failed.',
+          {
+            postId,
+            authorName: latestRecord.authorName,
+            subredditName: latestRecord.subredditName,
+            modmailErrorMessage: moderationActionResult.modmailErrorMessage,
+          },
+          moderationActionResult.modmailError
+        );
+      } else if (moderationActionResult.modmailStatus === 'skipped') {
+        logWarn('Removal modmail notification skipped.', {
+          postId,
+          authorName: latestRecord.authorName,
+          subredditName: latestRecord.subredditName,
+          reason: moderationActionResult.modmailSkippedReason,
+        });
+      }
+
+      const actionedRecord: TrackedPost = {
+        ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision),
+        status: 'actioned',
+        actionedAt: Date.now(),
+      };
+
+      actionedRecord.modmailStatus = moderationActionResult.modmailStatus;
+
+      if (typeof moderationActionResult.modmailSentAt === 'number') {
+        actionedRecord.modmailSentAt = moderationActionResult.modmailSentAt;
+      }
+
+      if (typeof moderationActionResult.modmailSkippedReason === 'string') {
+        actionedRecord.modmailSkippedReason =
+          moderationActionResult.modmailSkippedReason;
+      }
+
+      if (typeof moderationActionResult.modmailErrorMessage === 'string') {
+        actionedRecord.modmailErrorMessage =
+          moderationActionResult.modmailErrorMessage;
+      }
+
       await stopTracking(
-        {
-          ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision),
-          status: 'actioned',
-          actionedAt: Date.now(),
-        },
+        actionedRecord,
         'actioned',
         Date.now(),
         latestRecord.actionToTake
