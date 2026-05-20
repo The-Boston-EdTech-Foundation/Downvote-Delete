@@ -17,44 +17,6 @@ Downvote Delete can:
 
 Downvote Delete watches posts only. It does not track comments or scan older posts.
 
-## How It Works
-
-When a new post is submitted, Downvote Delete checks whether the app is active and whether the post is eligible.
-
-If eligible, the app checks the post's Reddit score after:
-
-- 2 minutes
-- 5 minutes
-- 10 minutes
-- 20 minutes
-- every 10 minutes after that until the tracking window ends
-
-If the post reaches your negative score threshold, the app takes your selected action immediately.
-
-If the post reaches your positive stop threshold, the app stops watching it.
-
-## Action Options
-
-**Report to Mod Queue**
-
-Reports the post with a reason such as:
-
-`Reported for -3 Downvote Karma`
-
-**Filter**
-
-Filters the post with a reason such as:
-
-`Filtered for -3 Downvote Karma`
-
-**Remove**
-
-Performs a regular non-spam removal with a reason such as:
-
-`Removed for -3 Downvote Karma`
-
-Downvote Delete does not leave public comments or send private messages by default.
-
 ## Recommended Setup
 
 For testing, start with:
