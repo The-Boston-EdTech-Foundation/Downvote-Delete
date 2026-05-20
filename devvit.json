@@ -5,37 +5,88 @@
     "dir": "dist/server",
     "entry": "index.cjs"
   },
-  "menu": {
-    "items": [
-      {
-        "label": "Mop comments",
-        "description": "Remove this comment and all child comments. This might take a few seconds to run.",
-        "location": "comment",
-        "forUserType": "moderator",
-        "endpoint": "/internal/menu/mop-comment"
-      },
-      {
-        "label": "Mop post comments",
-        "description": "Remove all comments of this post. This might take a few seconds to run.",
-        "location": "post",
-        "forUserType": "moderator",
-        "endpoint": "/internal/menu/mop-post"
-      }
-    ]
-  },
-  "forms": {
-    "mopComment": "/internal/form/mop-comment-submit",
-    "mopPost": "/internal/form/mop-post-submit"
-  },
   "triggers": {
-    "onAppInstall": "/internal/triggers/on-app-install"
+    "onPostSubmit": "/internal/triggers/on-post-submit"
+  },
+  "scheduler": {
+    "tasks": {
+      "checkWatchedPost": {
+        "endpoint": "/internal/scheduler/check-watched-post"
+      }
+    }
+  },
+  "settings": {
+    "subreddit": {
+      "isActive": {
+        "type": "boolean",
+        "label": "Downvote Delete is active",
+        "helpText": "Disable this to temporarily pause downvote delete from actioning content.",
+        "defaultValue": true
+      },
+      "trackingDurationHours": {
+        "type": "select",
+        "label": "Track posts for",
+        "options": [
+          { "label": "1 hour", "value": "1" },
+          { "label": "2 hours", "value": "2" },
+          { "label": "3 hours", "value": "3" }
+        ],
+        "defaultValue": "2"
+      },
+      "negativeScoreThreshold": {
+        "type": "select",
+        "label": "Action post at score",
+        "options": [
+          { "label": "-3", "value": "-3" },
+          { "label": "-5", "value": "-5" },
+          { "label": "-10", "value": "-10" }
+        ],
+        "defaultValue": "-3"
+      },
+      "positiveScoreStopThreshold": {
+        "type": "select",
+        "label": "Stop watching at positive score",
+        "options": [
+          { "label": "3", "value": "3" },
+          { "label": "5", "value": "5" },
+          { "label": "10", "value": "10" }
+        ],
+        "defaultValue": "5"
+      },
+      "actionToTake": {
+        "type": "select",
+        "label": "Action to take",
+        "options": [
+          { "label": "Report to Mod Queue", "value": "report" },
+          { "label": "Filter", "value": "filter" },
+          { "label": "Remove", "value": "remove" }
+        ],
+        "defaultValue": "remove"
+      },
+      "moderatorPostHandling": {
+        "type": "select",
+        "label": "Moderator post handling",
+        "options": [
+          { "label": "Ignore downvoted moderator posts", "value": "ignore" },
+          {
+            "label": "Action all downvoted posts including moderators",
+            "value": "action_all"
+          }
+        ],
+        "defaultValue": "ignore"
+      }
+    }
   },
   "scripts": {
     "build": "vite build",
     "dev": "vite build --watch"
   },
   "permissions": {
-    "reddit": true
+    "reddit": {
+      "enable": true,
+      "scope": "moderator"
+    },
+    "redis": true
   },
   "dev": {
     "subreddit": "downvote_delete_dev"
