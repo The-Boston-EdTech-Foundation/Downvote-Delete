@@ -38,4 +38,4 @@ Downvote Delete will not:
 
 ## Patch Notes
 
-1.0.4 - Initial Public Release. Devvit 0.12.24
+1.0.5 - Initial Public Release. Devvit 0.12.24
