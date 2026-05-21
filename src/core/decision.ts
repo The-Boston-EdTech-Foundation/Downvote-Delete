@@ -28,7 +28,10 @@ export type PostSnapshot = {
   score: number;
   upvotes?: number;
   downvotes?: number;
+  postDataUps?: number;
+  upvoteRatio?: number;
   calculatedVoteScore?: number;
+  ratioEstimatedScore?: number;
   approved: boolean;
   removed: boolean;
   filtered: boolean;
@@ -41,6 +44,7 @@ export type NegativeDecisionScore = {
   score: number;
   source: NegativeDecisionSource;
   calculatedVoteScore?: number;
+  ratioEstimatedScore?: number;
 };
 
 export type CheckDecision =
@@ -68,34 +72,76 @@ export function calculateVoteScore(args: {
   return args.upvotes - args.downvotes;
 }
 
+export function estimateScoreFromUpvoteRatio(args: {
+  upvotes?: number | undefined;
+  postDataUps?: number | undefined;
+  upvoteRatio?: number | undefined;
+}): number | undefined {
+  const knownUpvotes =
+    typeof args.postDataUps === 'number' &&
+    Number.isFinite(args.postDataUps) &&
+    args.postDataUps > 0
+      ? args.postDataUps
+      : args.upvotes;
+
+  if (
+    typeof knownUpvotes !== 'number' ||
+    !Number.isFinite(knownUpvotes) ||
+    knownUpvotes <= 0
+  ) {
+    return undefined;
+  }
+
+  if (
+    typeof args.upvoteRatio !== 'number' ||
+    !Number.isFinite(args.upvoteRatio) ||
+    args.upvoteRatio <= 0 ||
+    args.upvoteRatio >= 0.5
+  ) {
+    return undefined;
+  }
+
+  return Math.round(knownUpvotes * (2 - 1 / args.upvoteRatio));
+}
+
 export function getNegativeDecisionScore(
   post: PostSnapshot
 ): NegativeDecisionScore {
   const calculatedVoteScore =
     post.calculatedVoteScore ??
     calculateVoteScore({ upvotes: post.upvotes, downvotes: post.downvotes });
+  const ratioEstimatedScore =
+    post.ratioEstimatedScore ??
+    estimateScoreFromUpvoteRatio({
+      upvotes: post.upvotes,
+      postDataUps: post.postDataUps,
+      upvoteRatio: post.upvoteRatio,
+    });
 
-  if (
-    typeof calculatedVoteScore === 'number' &&
-    calculatedVoteScore < post.score
-  ) {
-    return {
-      score: calculatedVoteScore,
-      source: 'calculated_votes',
-      calculatedVoteScore,
-    };
-  }
-
-  const redditScoreDecision: NegativeDecisionScore = {
+  const decision: NegativeDecisionScore = {
     score: post.score,
     source: 'reddit_score',
   };
 
   if (typeof calculatedVoteScore === 'number') {
-    redditScoreDecision.calculatedVoteScore = calculatedVoteScore;
+    decision.calculatedVoteScore = calculatedVoteScore;
+
+    if (calculatedVoteScore < decision.score) {
+      decision.score = calculatedVoteScore;
+      decision.source = 'calculated_votes';
+    }
   }
 
-  return redditScoreDecision;
+  if (typeof ratioEstimatedScore === 'number') {
+    decision.ratioEstimatedScore = ratioEstimatedScore;
+
+    if (ratioEstimatedScore < decision.score) {
+      decision.score = ratioEstimatedScore;
+      decision.source = 'upvote_ratio_estimate';
+    }
+  }
+
+  return decision;
 }
 
 export function decideTrackedPostCheck(args: {

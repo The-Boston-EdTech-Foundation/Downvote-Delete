@@ -40,6 +40,13 @@ type CheckWatchedPostData = {
   postId?: string;
 };
 
+type PostDataVoteSignals = {
+  score?: number;
+  ups?: number;
+  upvoteRatio?: number;
+  viewCount?: number;
+};
+
 export const scheduledJobs = new Hono();
 
 const actionLockKey = (postId: string): string =>
@@ -63,6 +70,48 @@ function buildPostLink(args: {
   }
 
   return buildFallbackPostLink(args.postId, args.subredditName);
+}
+
+function getNumberField(
+  source: Record<string, unknown> | undefined,
+  fieldName: string
+): number | undefined {
+  const value = source?.[fieldName];
+  return typeof value === 'number' && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+function readPostDataVoteSignals(
+  postData: unknown
+): PostDataVoteSignals {
+  const source =
+    postData && typeof postData === 'object'
+      ? (postData as Record<string, unknown>)
+      : undefined;
+  const signals: PostDataVoteSignals = {};
+  const score = getNumberField(source, 'score');
+  const ups = getNumberField(source, 'ups');
+  const upvoteRatio = getNumberField(source, 'upvoteRatio');
+  const viewCount = getNumberField(source, 'viewCount');
+
+  if (typeof score === 'number') {
+    signals.score = score;
+  }
+
+  if (typeof ups === 'number') {
+    signals.ups = ups;
+  }
+
+  if (typeof upvoteRatio === 'number') {
+    signals.upvoteRatio = upvoteRatio;
+  }
+
+  if (typeof viewCount === 'number') {
+    signals.viewCount = viewCount;
+  }
+
+  return signals;
 }
 
 async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
@@ -94,7 +143,10 @@ async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
     lastKnownScore: parsedRecord.lastKnownScore,
     lastKnownUpvotes: parsedRecord.lastKnownUpvotes,
     lastKnownDownvotes: parsedRecord.lastKnownDownvotes,
+    lastKnownUpvoteRatio: parsedRecord.lastKnownUpvoteRatio,
+    lastKnownPostDataUps: parsedRecord.lastKnownPostDataUps,
     lastCalculatedVoteScore: parsedRecord.lastCalculatedVoteScore,
+    lastRatioEstimatedScore: parsedRecord.lastRatioEstimatedScore,
     negativeDecisionScore: parsedRecord.negativeDecisionScore,
     negativeDecisionSource: parsedRecord.negativeDecisionSource,
     negativeScoreThreshold: parsedRecord.negativeScoreThreshold,
@@ -115,7 +167,10 @@ async function writeTrackedPost(record: TrackedPost): Promise<void> {
     lastKnownScore: record.lastKnownScore,
     lastKnownUpvotes: record.lastKnownUpvotes,
     lastKnownDownvotes: record.lastKnownDownvotes,
+    lastKnownUpvoteRatio: record.lastKnownUpvoteRatio,
+    lastKnownPostDataUps: record.lastKnownPostDataUps,
     lastCalculatedVoteScore: record.lastCalculatedVoteScore,
+    lastRatioEstimatedScore: record.lastRatioEstimatedScore,
     negativeDecisionScore: record.negativeDecisionScore,
     negativeDecisionSource: record.negativeDecisionSource,
     lastJobId: record.lastJobId,
@@ -157,7 +212,10 @@ async function stopTracking(
     lastKnownScore: record.lastKnownScore,
     lastKnownUpvotes: record.lastKnownUpvotes,
     lastKnownDownvotes: record.lastKnownDownvotes,
+    lastKnownUpvoteRatio: record.lastKnownUpvoteRatio,
+    lastKnownPostDataUps: record.lastKnownPostDataUps,
     lastCalculatedVoteScore: record.lastCalculatedVoteScore,
+    lastRatioEstimatedScore: record.lastRatioEstimatedScore,
     negativeDecisionScore: record.negativeDecisionScore,
     negativeDecisionSource: record.negativeDecisionSource,
     auditKey: auditKey(record.postId),
@@ -203,9 +261,37 @@ async function fetchPostSnapshot(
   }
 }
 
+async function fetchPostDataVoteSignals(
+  postId: string
+): Promise<PostDataVoteSignals> {
+  try {
+    logInfo('Fetching Reddit post data vote signals.', { postId });
+    const postData = await reddit.getPostData(postId as T3);
+    const signals = readPostDataVoteSignals(postData);
+
+    logInfo('Fetched Reddit post data vote signals.', {
+      postId,
+      postDataHasScore: typeof signals.score === 'number',
+      postDataScore: signals.score,
+      postDataHasUps: typeof signals.ups === 'number',
+      postDataUps: signals.ups,
+      postDataHasUpvoteRatio: typeof signals.upvoteRatio === 'number',
+      postDataUpvoteRatio: signals.upvoteRatio,
+      postDataHasViewCount: typeof signals.viewCount === 'number',
+      postDataViewCount: signals.viewCount,
+    });
+
+    return signals;
+  } catch (err: unknown) {
+    logError('Could not fetch Reddit post data vote signals.', { postId }, err);
+    return {};
+  }
+}
+
 function enrichSnapshotWithStoredVotes(
   snapshot: PostSnapshot,
-  record: TrackedPost
+  record: TrackedPost,
+  postDataVoteSignals: PostDataVoteSignals = {}
 ): PostSnapshot {
   const enrichedSnapshot: PostSnapshot = {
     ...snapshot,
@@ -217,6 +303,18 @@ function enrichSnapshotWithStoredVotes(
 
   if (typeof record.lastKnownDownvotes === 'number') {
     enrichedSnapshot.downvotes = record.lastKnownDownvotes;
+  }
+
+  if (typeof postDataVoteSignals.ups === 'number') {
+    enrichedSnapshot.postDataUps = postDataVoteSignals.ups;
+  } else if (typeof record.lastKnownPostDataUps === 'number') {
+    enrichedSnapshot.postDataUps = record.lastKnownPostDataUps;
+  }
+
+  if (typeof postDataVoteSignals.upvoteRatio === 'number') {
+    enrichedSnapshot.upvoteRatio = postDataVoteSignals.upvoteRatio;
+  } else if (typeof record.lastKnownUpvoteRatio === 'number') {
+    enrichedSnapshot.upvoteRatio = record.lastKnownUpvoteRatio;
   }
 
   if (typeof record.lastCalculatedVoteScore === 'number') {
@@ -243,11 +341,24 @@ function applyScoreSignals(
     if (typeof snapshot.downvotes === 'number') {
       updatedRecord.lastKnownDownvotes = snapshot.downvotes;
     }
+
+    if (typeof snapshot.postDataUps === 'number') {
+      updatedRecord.lastKnownPostDataUps = snapshot.postDataUps;
+    }
+
+    if (typeof snapshot.upvoteRatio === 'number') {
+      updatedRecord.lastKnownUpvoteRatio = snapshot.upvoteRatio;
+    }
   }
 
   if (typeof negativeDecision?.calculatedVoteScore === 'number') {
     updatedRecord.lastCalculatedVoteScore =
       negativeDecision.calculatedVoteScore;
+  }
+
+  if (typeof negativeDecision?.ratioEstimatedScore === 'number') {
+    updatedRecord.lastRatioEstimatedScore =
+      negativeDecision.ratioEstimatedScore;
   }
 
   if (typeof negativeDecision?.score === 'number') {
@@ -383,8 +494,15 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     });
 
     const fetched = await fetchPostSnapshot(postId);
+    const postDataVoteSignals = fetched
+      ? await fetchPostDataVoteSignals(postId)
+      : {};
     const currentSnapshot = fetched
-      ? enrichSnapshotWithStoredVotes(fetched.snapshot, initialRecord)
+      ? enrichSnapshotWithStoredVotes(
+          fetched.snapshot,
+          initialRecord,
+          postDataVoteSignals
+        )
       : null;
     const negativeDecision = currentSnapshot
       ? getNegativeDecisionScore(currentSnapshot)
@@ -396,7 +514,10 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         fetchedScore: currentSnapshot.score,
         storedUpvotes: currentSnapshot.upvotes,
         storedDownvotes: currentSnapshot.downvotes,
+        postDataUps: currentSnapshot.postDataUps,
+        upvoteRatio: currentSnapshot.upvoteRatio,
         calculatedVoteScore: negativeDecision.calculatedVoteScore,
+        ratioEstimatedScore: negativeDecision.ratioEstimatedScore,
         negativeDecisionScore: negativeDecision.score,
         negativeDecisionSource: negativeDecision.source,
       });
@@ -426,6 +547,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         score: currentSnapshot?.score,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
+        ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
         checkCount: initialRecord.checkCount,
       });
       await stopTracking(
@@ -448,7 +570,10 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         score: currentSnapshot?.score,
         upvotes: currentSnapshot?.upvotes,
         downvotes: currentSnapshot?.downvotes,
+        postDataUps: currentSnapshot?.postDataUps,
+        upvoteRatio: currentSnapshot?.upvoteRatio,
         calculatedVoteScore: negativeDecision?.calculatedVoteScore,
+        ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
         negativeScoreThreshold: initialRecord.negativeScoreThreshold,
@@ -508,6 +633,12 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         postId,
         actionToTake: latestRecord.actionToTake,
         score: currentSnapshot?.score,
+        upvotes: currentSnapshot?.upvotes,
+        downvotes: currentSnapshot?.downvotes,
+        postDataUps: currentSnapshot?.postDataUps,
+        upvoteRatio: currentSnapshot?.upvoteRatio,
+        calculatedVoteScore: negativeDecision?.calculatedVoteScore,
+        ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
         negativeScoreThreshold: latestRecord.negativeScoreThreshold,
@@ -627,6 +758,12 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         postId,
         actionToTake: latestRecord.actionToTake,
         score: currentSnapshot?.score,
+        upvotes: currentSnapshot?.upvotes,
+        downvotes: currentSnapshot?.downvotes,
+        postDataUps: currentSnapshot?.postDataUps,
+        upvoteRatio: currentSnapshot?.upvoteRatio,
+        calculatedVoteScore: negativeDecision?.calculatedVoteScore,
+        ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
         auditKey: auditKey(postId),
@@ -644,7 +781,10 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       score: currentSnapshot?.score,
       upvotes: currentSnapshot?.upvotes,
       downvotes: currentSnapshot?.downvotes,
+      postDataUps: currentSnapshot?.postDataUps,
+      upvoteRatio: currentSnapshot?.upvoteRatio,
       calculatedVoteScore: negativeDecision?.calculatedVoteScore,
+      ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
       negativeDecisionScore: negativeDecision?.score,
       negativeDecisionSource: negativeDecision?.source,
       previousCheckCount: initialRecord.checkCount,
@@ -677,7 +817,10 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       score: updatedRecord.lastKnownScore,
       upvotes: updatedRecord.lastKnownUpvotes,
       downvotes: updatedRecord.lastKnownDownvotes,
+      postDataUps: updatedRecord.lastKnownPostDataUps,
+      upvoteRatio: updatedRecord.lastKnownUpvoteRatio,
       calculatedVoteScore: updatedRecord.lastCalculatedVoteScore,
+      ratioEstimatedScore: updatedRecord.lastRatioEstimatedScore,
       negativeDecisionScore: updatedRecord.negativeDecisionScore,
       negativeDecisionSource: updatedRecord.negativeDecisionSource,
     });

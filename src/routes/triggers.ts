@@ -39,6 +39,20 @@ function getPostCreatedAt(input: OnPostSubmitRequest, now: number): number {
   return input.post?.createdAt ? input.post.createdAt * 1000 : now;
 }
 
+function getRuntimeNumberField(
+  source: object | undefined,
+  fieldName: string
+): number | undefined {
+  if (!source) {
+    return undefined;
+  }
+
+  const value = (source as Record<string, unknown>)[fieldName];
+  return typeof value === 'number' && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
 function getPostVoteCounts(post: { upvotes?: number; downvotes?: number }) {
   const voteCounts: {
     upvotes?: number;
@@ -66,7 +80,7 @@ function getPostVoteSignalUpdate(post: {
   score?: number;
   upvotes?: number;
   downvotes?: number;
-}): TrackingVoteSignalUpdate {
+} & object): TrackingVoteSignalUpdate {
   const voteCounts = getPostVoteCounts(post);
   const update: TrackingVoteSignalUpdate = {
     ...voteCounts,
@@ -74,6 +88,11 @@ function getPostVoteSignalUpdate(post: {
 
   if (typeof post.score === 'number') {
     update.score = post.score;
+  }
+
+  const upvoteRatio = getRuntimeNumberField(post, 'upvoteRatio');
+  if (typeof upvoteRatio === 'number') {
+    update.upvoteRatio = upvoteRatio;
   }
 
   return update;
@@ -182,6 +201,10 @@ triggers.post('/on-post-submit', async (c) => {
     const subredditId = input.subreddit?.id;
     const subredditName = input.subreddit?.name;
     const authorName = input.author?.name;
+    const initialUpvoteRatio = getRuntimeNumberField(
+      input.post,
+      'upvoteRatio'
+    );
 
     logInfo('Received new post submit trigger.', {
       postId,
@@ -191,6 +214,7 @@ triggers.post('/on-post-submit', async (c) => {
       initialScore: input.post?.score,
       upvotes: input.post?.upvotes,
       downvotes: input.post?.downvotes,
+      upvoteRatio: initialUpvoteRatio,
     });
 
     const currentSettings = await readSettings();
@@ -278,6 +302,10 @@ triggers.post('/on-post-submit', async (c) => {
       if (typeof voteCounts.calculatedVoteScore === 'number') {
         record.lastCalculatedVoteScore = voteCounts.calculatedVoteScore;
       }
+
+      if (typeof initialUpvoteRatio === 'number') {
+        record.lastKnownUpvoteRatio = initialUpvoteRatio;
+      }
     }
 
     const redisKey = watchKey(postId);
@@ -290,6 +318,7 @@ triggers.post('/on-post-submit', async (c) => {
       initialScore: record.lastKnownScore,
       upvotes: record.lastKnownUpvotes,
       downvotes: record.lastKnownDownvotes,
+      upvoteRatio: record.lastKnownUpvoteRatio,
       calculatedVoteScore: record.lastCalculatedVoteScore,
       expiresAt: new Date(record.trackingExpiresAt),
       negativeScoreThreshold: record.negativeScoreThreshold,
@@ -322,6 +351,7 @@ triggers.post('/on-post-submit', async (c) => {
       initialScore: record.lastKnownScore,
       upvotes: record.lastKnownUpvotes,
       downvotes: record.lastKnownDownvotes,
+      upvoteRatio: record.lastKnownUpvoteRatio,
       calculatedVoteScore: record.lastCalculatedVoteScore,
       expiresAt: new Date(record.trackingExpiresAt),
     });
@@ -336,6 +366,7 @@ triggers.post('/on-post-update', async (c) => {
   try {
     const input = await c.req.json<OnPostUpdateRequest>();
     const postId = input.post?.id;
+    const upvoteRatio = getRuntimeNumberField(input.post, 'upvoteRatio');
 
     logInfo('Received post update trigger.', {
       postId,
@@ -344,6 +375,7 @@ triggers.post('/on-post-update', async (c) => {
       score: input.post?.score,
       upvotes: input.post?.upvotes,
       downvotes: input.post?.downvotes,
+      upvoteRatio,
     });
 
     if (!postId || !input.post) {
@@ -402,6 +434,7 @@ triggers.post('/on-post-update', async (c) => {
       score: updatedRecord.lastKnownScore,
       upvotes: updatedRecord.lastKnownUpvotes,
       downvotes: updatedRecord.lastKnownDownvotes,
+      upvoteRatio: updatedRecord.lastKnownUpvoteRatio,
       calculatedVoteScore: updatedRecord.lastCalculatedVoteScore,
     });
   } catch (err: unknown) {

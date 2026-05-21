@@ -15,7 +15,10 @@ export type TrackingStatus =
   | 'stopped_inactive'
   | 'error';
 
-export type NegativeDecisionSource = 'reddit_score' | 'calculated_votes';
+export type NegativeDecisionSource =
+  | 'reddit_score'
+  | 'calculated_votes'
+  | 'upvote_ratio_estimate';
 
 export type TrackedPost = {
   subredditId: string;
@@ -30,7 +33,10 @@ export type TrackedPost = {
   lastKnownScore?: number;
   lastKnownUpvotes?: number;
   lastKnownDownvotes?: number;
+  lastKnownUpvoteRatio?: number;
+  lastKnownPostDataUps?: number;
   lastCalculatedVoteScore?: number;
+  lastRatioEstimatedScore?: number;
   negativeDecisionScore?: number;
   negativeDecisionSource?: NegativeDecisionSource;
   negativeScoreThreshold: number;
@@ -57,6 +63,8 @@ export type TrackingVoteSignalUpdate = {
   score?: number;
   upvotes?: number;
   downvotes?: number;
+  upvoteRatio?: number;
+  postDataUps?: number;
   calculatedVoteScore?: number;
 };
 
@@ -116,6 +124,14 @@ export function applyActiveTrackingVoteSignalUpdate(
 
   if (typeof update.downvotes === 'number') {
     updatedRecord.lastKnownDownvotes = update.downvotes;
+  }
+
+  if (typeof update.upvoteRatio === 'number') {
+    updatedRecord.lastKnownUpvoteRatio = update.upvoteRatio;
+  }
+
+  if (typeof update.postDataUps === 'number') {
+    updatedRecord.lastKnownPostDataUps = update.postDataUps;
   }
 
   if (typeof update.calculatedVoteScore === 'number') {

@@ -8,6 +8,7 @@ import { getNextCheckDelayMinutes } from '../src/core/backoff';
 import {
   calculateVoteScore,
   decideTrackedPostCheck,
+  estimateScoreFromUpvoteRatio,
   getNegativeDecisionScore,
   shouldTrackNewPost,
   type PostSnapshot,
@@ -155,6 +156,25 @@ describe('tracked post decisions', () => {
     expect(calculateVoteScore({ upvotes: 1, downvotes: 2 })).toBe(-1);
   });
 
+  test('estimates a negative score from low upvote ratio and known upvotes', () => {
+    expect(
+      estimateScoreFromUpvoteRatio({ upvotes: 1, upvoteRatio: 0.25 })
+    ).toBe(-2);
+    expect(
+      estimateScoreFromUpvoteRatio({ upvotes: 2, upvoteRatio: 0.25 })
+    ).toBe(-4);
+  });
+
+  test('does not estimate a ratio score without a useful negative ratio signal', () => {
+    expect(estimateScoreFromUpvoteRatio({ upvotes: 1 })).toBeUndefined();
+    expect(
+      estimateScoreFromUpvoteRatio({ upvotes: 1, upvoteRatio: 0.5 })
+    ).toBeUndefined();
+    expect(
+      estimateScoreFromUpvoteRatio({ upvoteRatio: 0.25 })
+    ).toBeUndefined();
+  });
+
   test('uses the lower calculated vote score for negative threshold decisions', () => {
     const post = postSnapshot({ score: 0, upvotes: 1, downvotes: 4 });
 
@@ -209,7 +229,72 @@ describe('tracked post decisions', () => {
     ).toEqual({ type: 'reschedule' });
   });
 
-  test('positive stop still uses normal Reddit score instead of calculated votes', () => {
+  test('uses the ratio estimate for negative threshold decisions when it is lowest', () => {
+    const post = postSnapshot({ score: 0, upvotes: 2, upvoteRatio: 0.25 });
+
+    expect(getNegativeDecisionScore(post)).toEqual({
+      score: -4,
+      source: 'upvote_ratio_estimate',
+      ratioEstimatedScore: -4,
+    });
+
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -3 }),
+        settings: activeSettings,
+        post,
+        now,
+      })
+    ).toEqual({ type: 'action' });
+  });
+
+  test('actions when an explicit ratio estimate reaches the negative threshold', () => {
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -3 }),
+        settings: activeSettings,
+        post: postSnapshot({
+          score: 0,
+          ratioEstimatedScore: -3,
+        }),
+        now,
+      })
+    ).toEqual({ type: 'action' });
+  });
+
+  test('does not action from ratio estimate when it stays above the threshold', () => {
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -3 }),
+        settings: activeSettings,
+        post: postSnapshot({
+          score: 0,
+          ratioEstimatedScore: -2,
+        }),
+        now,
+      })
+    ).toEqual({ type: 'reschedule' });
+  });
+
+  test('uses the lowest available negative signal', () => {
+    expect(
+      getNegativeDecisionScore(
+        postSnapshot({
+          score: 0,
+          upvotes: 2,
+          downvotes: 4,
+          upvoteRatio: 0.25,
+        })
+      )
+    ).toEqual({
+      score: -4,
+      source: 'upvote_ratio_estimate',
+      calculatedVoteScore: -2,
+      ratioEstimatedScore: -4,
+    });
+  });
+
+  test('positive stop still uses normal Reddit score instead of calculated votes or ratio estimates', () => {
     expect(
       decideTrackedPostCheck({
         tracking: trackedPost({
@@ -217,7 +302,12 @@ describe('tracked post decisions', () => {
           positiveScoreStopThreshold: 5,
         }),
         settings: activeSettings,
-        post: postSnapshot({ score: 5, upvotes: 1, downvotes: 10 }),
+        post: postSnapshot({
+          score: 5,
+          upvotes: 1,
+          downvotes: 10,
+          upvoteRatio: 0.25,
+        }),
         now,
       })
     ).toEqual({ type: 'stop', status: 'stopped_positive' });
@@ -374,6 +464,8 @@ describe('tracking vote signal updates', () => {
           score: -1,
           upvotes: 1,
           downvotes: 4,
+          upvoteRatio: 0.25,
+          postDataUps: 1,
           calculatedVoteScore: -3,
         },
         now + 1_000
@@ -383,6 +475,8 @@ describe('tracking vote signal updates', () => {
       lastKnownScore: -1,
       lastKnownUpvotes: 1,
       lastKnownDownvotes: 4,
+      lastKnownUpvoteRatio: 0.25,
+      lastKnownPostDataUps: 1,
       lastCalculatedVoteScore: -3,
       updatedAt: now + 1_000,
       negativeScoreThreshold: -3,
