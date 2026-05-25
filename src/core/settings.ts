@@ -18,7 +18,7 @@ export type ModeratorPostHandling =
 
 export type DownvoteDeleteSettings = {
   isActive: boolean;
-  trackingDurationHours: 1 | 2 | 3;
+  trackingDurationHours: 1 | 2 | 3 | 4 | 6;
   negativeScoreThreshold: -3 | -5 | -10;
   positiveScoreStopThreshold: 3 | 5 | 10;
   actionToTake: DownvoteDeleteAction;
@@ -27,14 +27,14 @@ export type DownvoteDeleteSettings = {
 
 export const defaultSettings: DownvoteDeleteSettings = {
   isActive: true,
-  trackingDurationHours: 2,
+  trackingDurationHours: 4,
   negativeScoreThreshold: -3,
   positiveScoreStopThreshold: 5,
   actionToTake: ACTION_REMOVE,
   moderatorPostHandling: MODERATOR_IGNORE,
 };
 
-const validTrackingDurations = [1, 2, 3] as const;
+const validTrackingDurations = [1, 2, 3, 4, 6] as const;
 const validNegativeThresholds = [-3, -5, -10] as const;
 const validPositiveThresholds = [3, 5, 10] as const;
 const validActions = [ACTION_REPORT, ACTION_FILTER, ACTION_REMOVE] as const;

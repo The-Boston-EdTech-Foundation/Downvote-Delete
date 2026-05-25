@@ -20,6 +20,7 @@ import {
   ACTION_REPORT,
   MODERATOR_ACTION_ALL,
   MODERATOR_IGNORE,
+  normalizeSettings,
   type DownvoteDeleteSettings,
 } from '../src/core/settings';
 import {
@@ -139,6 +140,44 @@ function postSnapshot(overrides: Partial<PostSnapshot> = {}): PostSnapshot {
     ...overrides,
   };
 }
+
+describe('settings normalization', () => {
+  test('defaults tracking duration to 4 hours when unset', () => {
+    expect(normalizeSettings({}).trackingDurationHours).toBe(4);
+  });
+
+  test.each([2, 4, 6] as const)(
+    'accepts current tracking duration %s hours',
+    (trackingDurationHours) => {
+      expect(
+        normalizeSettings({ trackingDurationHours }).trackingDurationHours
+      ).toBe(trackingDurationHours);
+      expect(
+        normalizeSettings({
+          trackingDurationHours: String(trackingDurationHours),
+        }).trackingDurationHours
+      ).toBe(trackingDurationHours);
+    }
+  );
+
+  test.each([1, 3] as const)(
+    'keeps legacy tracking duration %s hours for existing installs',
+    (trackingDurationHours) => {
+      expect(
+        normalizeSettings({ trackingDurationHours }).trackingDurationHours
+      ).toBe(trackingDurationHours);
+    }
+  );
+
+  test.each([5, '', 'abc'] as const)(
+    'falls back to 4 hours for invalid tracking duration %s',
+    (trackingDurationHours) => {
+      expect(
+        normalizeSettings({ trackingDurationHours }).trackingDurationHours
+      ).toBe(4);
+    }
+  );
+});
 
 describe('backoff schedule', () => {
   test('uses incremental delays for post ages around 2, 5, 10, then every 10 minutes', () => {
