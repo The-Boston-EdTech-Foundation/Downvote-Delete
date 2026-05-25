@@ -47,6 +47,16 @@ export type NegativeDecisionScore = {
   ratioEstimatedScore?: number;
 };
 
+type RatioDecisionScore = {
+  score: number;
+  source: Extract<
+    NegativeDecisionSource,
+    | 'upvote_ratio_estimate'
+    | 'single_upvote_ratio_cutoff'
+    | 'zero_upvote_ratio_cutoff'
+  >;
+};
+
 export type CheckDecision =
   | { type: 'exit' }
   | { type: 'stop'; status: Exclude<TrackingStatus, 'active' | 'actioning'> }
@@ -101,22 +111,165 @@ export function estimateScoreFromUpvoteRatio(args: {
     return undefined;
   }
 
-  return Math.round(knownUpvotes * (2 - 1 / args.upvoteRatio));
+  const roundedScore = Math.round(knownUpvotes * (2 - 1 / args.upvoteRatio));
+  return Object.is(roundedScore, -0) ? 0 : roundedScore;
+}
+
+function estimateScoreFromSingleUpvoteRatioCutoff(args: {
+  upvotes?: number | undefined;
+  postDataUps?: number | undefined;
+  upvoteRatio?: number | undefined;
+  negativeScoreThreshold?: number | undefined;
+}): number | undefined {
+  if (
+    typeof args.upvotes === 'number' ||
+    typeof args.postDataUps === 'number'
+  ) {
+    return undefined;
+  }
+
+  if (
+    typeof args.negativeScoreThreshold !== 'number' ||
+    !Number.isFinite(args.negativeScoreThreshold) ||
+    args.negativeScoreThreshold >= 0
+  ) {
+    return undefined;
+  }
+
+  if (
+    typeof args.upvoteRatio !== 'number' ||
+    !Number.isFinite(args.upvoteRatio) ||
+    args.upvoteRatio <= 0 ||
+    args.upvoteRatio >= 0.5
+  ) {
+    return undefined;
+  }
+
+  const ratioCutoff = 1 / (Math.abs(args.negativeScoreThreshold) + 2);
+  return args.upvoteRatio <= ratioCutoff
+    ? args.negativeScoreThreshold
+    : undefined;
+}
+
+function estimateScoreFromZeroUpvoteRatioCutoff(args: {
+  score: number;
+  upvotes?: number | undefined;
+  downvotes?: number | undefined;
+  postDataUps?: number | undefined;
+  upvoteRatio?: number | undefined;
+  negativeScoreThreshold?: number | undefined;
+}): number | undefined {
+  const hasZeroUpvotes =
+    args.upvotes === 0 ||
+    (typeof args.postDataUps === 'number' &&
+      Number.isFinite(args.postDataUps) &&
+      args.postDataUps === 0);
+
+  if (
+    !hasZeroUpvotes ||
+    typeof args.downvotes === 'number' ||
+    args.score !== 0
+  ) {
+    return undefined;
+  }
+
+  if (
+    typeof args.negativeScoreThreshold !== 'number' ||
+    !Number.isFinite(args.negativeScoreThreshold) ||
+    args.negativeScoreThreshold >= 0
+  ) {
+    return undefined;
+  }
+
+  if (
+    typeof args.upvoteRatio !== 'number' ||
+    !Number.isFinite(args.upvoteRatio) ||
+    args.upvoteRatio < 0 ||
+    args.upvoteRatio >= 0.5
+  ) {
+    return undefined;
+  }
+
+  return args.upvoteRatio < 0.5 ? -1 : undefined;
+}
+
+function getRatioDecisionScore(args: {
+  score: number;
+  upvotes?: number | undefined;
+  downvotes?: number | undefined;
+  postDataUps?: number | undefined;
+  upvoteRatio?: number | undefined;
+  ratioEstimatedScore?: number | undefined;
+  negativeScoreThreshold?: number | undefined;
+}): RatioDecisionScore | undefined {
+  if (typeof args.ratioEstimatedScore === 'number') {
+    return {
+      score: args.ratioEstimatedScore,
+      source: 'upvote_ratio_estimate',
+    };
+  }
+
+  const ratioEstimatedScore = estimateScoreFromUpvoteRatio({
+    upvotes: args.upvotes,
+    postDataUps: args.postDataUps,
+    upvoteRatio: args.upvoteRatio,
+  });
+
+  if (typeof ratioEstimatedScore === 'number') {
+    return {
+      score: ratioEstimatedScore,
+      source: 'upvote_ratio_estimate',
+    };
+  }
+
+  const zeroUpvoteCutoffScore = estimateScoreFromZeroUpvoteRatioCutoff({
+    score: args.score,
+    upvotes: args.upvotes,
+    downvotes: args.downvotes,
+    postDataUps: args.postDataUps,
+    upvoteRatio: args.upvoteRatio,
+    negativeScoreThreshold: args.negativeScoreThreshold,
+  });
+
+  if (typeof zeroUpvoteCutoffScore === 'number') {
+    return {
+      score: zeroUpvoteCutoffScore,
+      source: 'zero_upvote_ratio_cutoff',
+    };
+  }
+
+  const cutoffScore = estimateScoreFromSingleUpvoteRatioCutoff({
+    upvotes: args.upvotes,
+    postDataUps: args.postDataUps,
+    upvoteRatio: args.upvoteRatio,
+    negativeScoreThreshold: args.negativeScoreThreshold,
+  });
+
+  return typeof cutoffScore === 'number'
+    ? {
+        score: cutoffScore,
+        source: 'single_upvote_ratio_cutoff',
+      }
+    : undefined;
 }
 
 export function getNegativeDecisionScore(
-  post: PostSnapshot
+  post: PostSnapshot,
+  options: { negativeScoreThreshold?: number } = {}
 ): NegativeDecisionScore {
-  const calculatedVoteScore =
-    post.calculatedVoteScore ??
-    calculateVoteScore({ upvotes: post.upvotes, downvotes: post.downvotes });
-  const ratioEstimatedScore =
-    post.ratioEstimatedScore ??
-    estimateScoreFromUpvoteRatio({
-      upvotes: post.upvotes,
-      postDataUps: post.postDataUps,
-      upvoteRatio: post.upvoteRatio,
-    });
+  const calculatedVoteScore = calculateVoteScore({
+    upvotes: post.upvotes,
+    downvotes: post.downvotes,
+  });
+  const ratioDecisionScore = getRatioDecisionScore({
+    score: post.score,
+    upvotes: post.upvotes,
+    downvotes: post.downvotes,
+    postDataUps: post.postDataUps,
+    upvoteRatio: post.upvoteRatio,
+    ratioEstimatedScore: post.ratioEstimatedScore,
+    negativeScoreThreshold: options.negativeScoreThreshold,
+  });
 
   const decision: NegativeDecisionScore = {
     score: post.score,
@@ -132,12 +285,12 @@ export function getNegativeDecisionScore(
     }
   }
 
-  if (typeof ratioEstimatedScore === 'number') {
-    decision.ratioEstimatedScore = ratioEstimatedScore;
+  if (ratioDecisionScore) {
+    decision.ratioEstimatedScore = ratioDecisionScore.score;
 
-    if (ratioEstimatedScore < decision.score) {
-      decision.score = ratioEstimatedScore;
-      decision.source = 'upvote_ratio_estimate';
+    if (ratioDecisionScore.score < decision.score) {
+      decision.score = ratioDecisionScore.score;
+      decision.source = ratioDecisionScore.source;
     }
   }
 
@@ -176,7 +329,11 @@ export function decideTrackedPostCheck(args: {
     return { type: 'stop', status: 'stopped_positive' };
   }
 
-  if (getNegativeDecisionScore(post).score <= tracking.negativeScoreThreshold) {
+  if (
+    getNegativeDecisionScore(post, {
+      negativeScoreThreshold: tracking.negativeScoreThreshold,
+    }).score <= tracking.negativeScoreThreshold
+  ) {
     return { type: 'action' };
   }
 

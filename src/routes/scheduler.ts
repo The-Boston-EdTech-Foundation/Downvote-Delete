@@ -29,6 +29,8 @@ import {
   createAuditRecord,
   parseTrackedPost,
   serializeTrackedPost,
+  shouldUseStoredExactVoteCounts,
+  shouldUseStoredRatioSignals,
   statsKey,
   type TrackedPost,
   type TrackingStatus,
@@ -141,10 +143,13 @@ async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
     status: parsedRecord.status,
     checkCount: parsedRecord.checkCount,
     lastKnownScore: parsedRecord.lastKnownScore,
+    lastKnownScoreAt: parsedRecord.lastKnownScoreAt,
     lastKnownUpvotes: parsedRecord.lastKnownUpvotes,
     lastKnownDownvotes: parsedRecord.lastKnownDownvotes,
+    lastExactVoteCountsAt: parsedRecord.lastExactVoteCountsAt,
     lastKnownUpvoteRatio: parsedRecord.lastKnownUpvoteRatio,
     lastKnownPostDataUps: parsedRecord.lastKnownPostDataUps,
+    lastRatioSignalsAt: parsedRecord.lastRatioSignalsAt,
     lastCalculatedVoteScore: parsedRecord.lastCalculatedVoteScore,
     lastRatioEstimatedScore: parsedRecord.lastRatioEstimatedScore,
     negativeDecisionScore: parsedRecord.negativeDecisionScore,
@@ -165,10 +170,13 @@ async function writeTrackedPost(record: TrackedPost): Promise<void> {
     status: record.status,
     checkCount: record.checkCount,
     lastKnownScore: record.lastKnownScore,
+    lastKnownScoreAt: record.lastKnownScoreAt,
     lastKnownUpvotes: record.lastKnownUpvotes,
     lastKnownDownvotes: record.lastKnownDownvotes,
+    lastExactVoteCountsAt: record.lastExactVoteCountsAt,
     lastKnownUpvoteRatio: record.lastKnownUpvoteRatio,
     lastKnownPostDataUps: record.lastKnownPostDataUps,
+    lastRatioSignalsAt: record.lastRatioSignalsAt,
     lastCalculatedVoteScore: record.lastCalculatedVoteScore,
     lastRatioEstimatedScore: record.lastRatioEstimatedScore,
     negativeDecisionScore: record.negativeDecisionScore,
@@ -288,37 +296,60 @@ async function fetchPostDataVoteSignals(
   }
 }
 
-function enrichSnapshotWithStoredVotes(
+export function enrichSnapshotWithStoredVotes(
   snapshot: PostSnapshot,
   record: TrackedPost,
-  postDataVoteSignals: PostDataVoteSignals = {}
+  postDataVoteSignals: PostDataVoteSignals = {},
+  now = Date.now()
 ): PostSnapshot {
   const enrichedSnapshot: PostSnapshot = {
     ...snapshot,
   };
+  const hasCurrentPostDataSignals =
+    typeof postDataVoteSignals.ups === 'number' ||
+    typeof postDataVoteSignals.upvoteRatio === 'number';
+  const hasCurrentRatioPair =
+    typeof postDataVoteSignals.ups === 'number' &&
+    typeof postDataVoteSignals.upvoteRatio === 'number';
+  const storedUpvotes = record.lastKnownUpvotes;
+  const storedDownvotes = record.lastKnownDownvotes;
+  const currentPostDataUps = postDataVoteSignals.ups;
+  const currentUpvoteRatio = postDataVoteSignals.upvoteRatio;
+  const storedPostDataUps = record.lastKnownPostDataUps;
+  const storedUpvoteRatio = record.lastKnownUpvoteRatio;
+  const canUseStoredExactCounts = shouldUseStoredExactVoteCounts({
+    record,
+    hasCurrentPostDataSignals,
+    now,
+  });
 
-  if (typeof record.lastKnownUpvotes === 'number') {
-    enrichedSnapshot.upvotes = record.lastKnownUpvotes;
+  if (
+    canUseStoredExactCounts &&
+    typeof storedUpvotes === 'number' &&
+    typeof storedDownvotes === 'number'
+  ) {
+    enrichedSnapshot.upvotes = storedUpvotes;
+    enrichedSnapshot.downvotes = storedDownvotes;
   }
 
-  if (typeof record.lastKnownDownvotes === 'number') {
-    enrichedSnapshot.downvotes = record.lastKnownDownvotes;
-  }
-
-  if (typeof postDataVoteSignals.ups === 'number') {
-    enrichedSnapshot.postDataUps = postDataVoteSignals.ups;
-  } else if (typeof record.lastKnownPostDataUps === 'number') {
-    enrichedSnapshot.postDataUps = record.lastKnownPostDataUps;
-  }
-
-  if (typeof postDataVoteSignals.upvoteRatio === 'number') {
-    enrichedSnapshot.upvoteRatio = postDataVoteSignals.upvoteRatio;
-  } else if (typeof record.lastKnownUpvoteRatio === 'number') {
-    enrichedSnapshot.upvoteRatio = record.lastKnownUpvoteRatio;
-  }
-
-  if (typeof record.lastCalculatedVoteScore === 'number') {
-    enrichedSnapshot.calculatedVoteScore = record.lastCalculatedVoteScore;
+  if (
+    hasCurrentRatioPair &&
+    typeof currentPostDataUps === 'number' &&
+    typeof currentUpvoteRatio === 'number'
+  ) {
+    enrichedSnapshot.postDataUps = currentPostDataUps;
+    enrichedSnapshot.upvoteRatio = currentUpvoteRatio;
+  } else if (
+    shouldUseStoredRatioSignals({
+      record,
+      hasCurrentPostDataSignals,
+      now,
+    }) &&
+    typeof storedPostDataUps === 'number' &&
+    typeof storedUpvoteRatio === 'number'
+  ) {
+    enrichedSnapshot.postDataUps = storedPostDataUps;
+    enrichedSnapshot.upvoteRatio = storedUpvoteRatio;
   }
 
   return enrichedSnapshot;
@@ -327,12 +358,14 @@ function enrichSnapshotWithStoredVotes(
 function applyScoreSignals(
   record: TrackedPost,
   snapshot: PostSnapshot | null | undefined,
-  negativeDecision: NegativeDecisionScore | undefined
+  negativeDecision: NegativeDecisionScore | undefined,
+  now: number
 ): TrackedPost {
   const updatedRecord: TrackedPost = { ...record };
 
   if (snapshot) {
     updatedRecord.lastKnownScore = snapshot.score;
+    updatedRecord.lastKnownScoreAt = now;
 
     if (typeof snapshot.upvotes === 'number') {
       updatedRecord.lastKnownUpvotes = snapshot.upvotes;
@@ -344,10 +377,12 @@ function applyScoreSignals(
 
     if (typeof snapshot.postDataUps === 'number') {
       updatedRecord.lastKnownPostDataUps = snapshot.postDataUps;
+      updatedRecord.lastRatioSignalsAt = now;
     }
 
     if (typeof snapshot.upvoteRatio === 'number') {
       updatedRecord.lastKnownUpvoteRatio = snapshot.upvoteRatio;
+      updatedRecord.lastRatioSignalsAt = now;
     }
   }
 
@@ -501,11 +536,14 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       ? enrichSnapshotWithStoredVotes(
           fetched.snapshot,
           initialRecord,
-          postDataVoteSignals
+          postDataVoteSignals,
+          now
         )
       : null;
     const negativeDecision = currentSnapshot
-      ? getNegativeDecisionScore(currentSnapshot)
+      ? getNegativeDecisionScore(currentSnapshot, {
+          negativeScoreThreshold: initialRecord.negativeScoreThreshold,
+        })
       : undefined;
 
     if (currentSnapshot && negativeDecision) {
@@ -520,6 +558,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         ratioEstimatedScore: negativeDecision.ratioEstimatedScore,
         negativeDecisionScore: negativeDecision.score,
         negativeDecisionSource: negativeDecision.source,
+        lastKnownScoreAt: initialRecord.lastKnownScoreAt,
+        lastExactVoteCountsAt: initialRecord.lastExactVoteCountsAt,
+        lastRatioSignalsAt: initialRecord.lastRatioSignalsAt,
       });
     }
 
@@ -548,10 +589,13 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
         ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
+        lastKnownScoreAt: initialRecord.lastKnownScoreAt,
+        lastExactVoteCountsAt: initialRecord.lastExactVoteCountsAt,
+        lastRatioSignalsAt: initialRecord.lastRatioSignalsAt,
         checkCount: initialRecord.checkCount,
       });
       await stopTracking(
-        applyScoreSignals(initialRecord, currentSnapshot, negativeDecision),
+        applyScoreSignals(initialRecord, currentSnapshot, negativeDecision, now),
         decision.status,
         now,
         decision.status
@@ -578,6 +622,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         negativeDecisionSource: negativeDecision?.source,
         negativeScoreThreshold: initialRecord.negativeScoreThreshold,
         actionToTake: initialRecord.actionToTake,
+        lastKnownScoreAt: initialRecord.lastKnownScoreAt,
+        lastExactVoteCountsAt: initialRecord.lastExactVoteCountsAt,
+        lastRatioSignalsAt: initialRecord.lastRatioSignalsAt,
         reason: actionReason,
       });
 
@@ -624,7 +671,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       }
 
       await writeTrackedPost({
-        ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision),
+        ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision, now),
         status: 'actioning',
         updatedAt: now,
       });
@@ -642,6 +689,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
         negativeScoreThreshold: latestRecord.negativeScoreThreshold,
+        lastKnownScoreAt: latestRecord.lastKnownScoreAt,
+        lastExactVoteCountsAt: latestRecord.lastExactVoteCountsAt,
+        lastRatioSignalsAt: latestRecord.lastRatioSignalsAt,
         reason: actionReason,
       });
 
@@ -684,7 +734,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         await releaseActionLock(postId, 'moderation_action_failed');
         await markErrorAndReschedule(
           {
-            ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision),
+            ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision, now),
             status: 'active',
           },
           err,
@@ -721,7 +771,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       }
 
       const actionedRecord: TrackedPost = {
-        ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision),
+        ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision, now),
         status: 'actioned',
         actionedAt: Date.now(),
       };
@@ -766,6 +816,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
+        lastKnownScoreAt: latestRecord.lastKnownScoreAt,
+        lastExactVoteCountsAt: latestRecord.lastExactVoteCountsAt,
+        lastRatioSignalsAt: latestRecord.lastRatioSignalsAt,
         auditKey: auditKey(postId),
         status: 'actioned',
       });
@@ -787,6 +840,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
       negativeDecisionScore: negativeDecision?.score,
       negativeDecisionSource: negativeDecision?.source,
+      lastKnownScoreAt: initialRecord.lastKnownScoreAt,
+      lastExactVoteCountsAt: initialRecord.lastExactVoteCountsAt,
+      lastRatioSignalsAt: initialRecord.lastRatioSignalsAt,
       previousCheckCount: initialRecord.checkCount,
       nextCheckCount,
       nextDelayMinutes,
@@ -800,7 +856,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     });
 
     const updatedRecord: TrackedPost = {
-      ...applyScoreSignals(initialRecord, currentSnapshot, negativeDecision),
+      ...applyScoreSignals(initialRecord, currentSnapshot, negativeDecision, now),
       checkCount: nextCheckCount,
       lastJobId: jobId,
       updatedAt: now,
@@ -823,6 +879,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       ratioEstimatedScore: updatedRecord.lastRatioEstimatedScore,
       negativeDecisionScore: updatedRecord.negativeDecisionScore,
       negativeDecisionSource: updatedRecord.negativeDecisionSource,
+      lastKnownScoreAt: updatedRecord.lastKnownScoreAt,
+      lastExactVoteCountsAt: updatedRecord.lastExactVoteCountsAt,
+      lastRatioSignalsAt: updatedRecord.lastRatioSignalsAt,
     });
   } catch (err: unknown) {
     await markErrorAndReschedule(initialRecord, err, Date.now());

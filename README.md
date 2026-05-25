@@ -9,7 +9,7 @@ Community members downvote instead of reporting, so use that signal!
 Downvote Delete can:
 
 - Watch new posts for 2, 4, or 6 hours.
-- Detect when a post reaches negative scores (-3, -5, or -10).
+- Detect when a post reaches negative scores (-1 through -5).
 - Stops watching posts that grow positively (+3, +5 or +10).
 - Ignore manually approved posts.
 - Stop tracking posts that are already removed, filtered, spammed, deleted, or unavailable.
@@ -28,5 +28,5 @@ Downvote Delete will not:
 
 ## Patch Notes
 
-1.1.1 - Default tracking now 4 hours. Tracking changed to 2, 4, 6 hours. Improved downvote tracking.
+1.1.1 - Default tracking now 4 hours at -3. Tracking for 2, 4, 6 hours. Downvote thresholds -1 to -5. Improved downvote tracking.
 1.0.5 - Initial Public Release. Devvit 0.12.24

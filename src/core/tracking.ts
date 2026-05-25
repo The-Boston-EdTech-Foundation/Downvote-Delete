@@ -18,7 +18,9 @@ export type TrackingStatus =
 export type NegativeDecisionSource =
   | 'reddit_score'
   | 'calculated_votes'
-  | 'upvote_ratio_estimate';
+  | 'upvote_ratio_estimate'
+  | 'single_upvote_ratio_cutoff'
+  | 'zero_upvote_ratio_cutoff';
 
 export type TrackedPost = {
   subredditId: string;
@@ -31,10 +33,14 @@ export type TrackedPost = {
   trackingExpiresAt: number;
   checkCount: number;
   lastKnownScore?: number;
+  lastKnownScoreAt?: number;
   lastKnownUpvotes?: number;
   lastKnownDownvotes?: number;
+  lastExactVoteCountsAt?: number;
   lastKnownUpvoteRatio?: number;
   lastKnownPostDataUps?: number;
+  lastRatioSignalsAt?: number;
+  // Audit/debug only; action decisions recompute from raw vote counts.
   lastCalculatedVoteScore?: number;
   lastRatioEstimatedScore?: number;
   negativeDecisionScore?: number;
@@ -68,6 +74,8 @@ export type TrackingVoteSignalUpdate = {
   calculatedVoteScore?: number;
 };
 
+export const STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS = 15 * 60 * 1000;
+
 export const watchKey = (postId: string): string =>
   `downvote-delete:watch:${postId}`;
 
@@ -100,6 +108,52 @@ export function createAuditRecord(record: TrackedPost, now: number): AuditRecord
   };
 }
 
+export function isFreshTimestamp(args: {
+  timestamp: number | undefined;
+  maxAgeMs: number;
+  now: number;
+}): boolean {
+  return (
+    typeof args.timestamp === 'number' &&
+    args.timestamp <= args.now &&
+    args.now - args.timestamp <= args.maxAgeMs
+  );
+}
+
+export function shouldUseStoredExactVoteCounts(args: {
+  record: TrackedPost;
+  hasCurrentPostDataSignals: boolean;
+  now: number;
+}): boolean {
+  return (
+    !args.hasCurrentPostDataSignals &&
+    isFreshTimestamp({
+      timestamp: args.record.lastExactVoteCountsAt,
+      maxAgeMs: STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS,
+      now: args.now,
+    }) &&
+    typeof args.record.lastKnownUpvotes === 'number' &&
+    typeof args.record.lastKnownDownvotes === 'number'
+  );
+}
+
+export function shouldUseStoredRatioSignals(args: {
+  record: TrackedPost;
+  hasCurrentPostDataSignals: boolean;
+  now: number;
+}): boolean {
+  return (
+    !args.hasCurrentPostDataSignals &&
+    isFreshTimestamp({
+      timestamp: args.record.lastRatioSignalsAt,
+      maxAgeMs: STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS,
+      now: args.now,
+    }) &&
+    typeof args.record.lastKnownPostDataUps === 'number' &&
+    typeof args.record.lastKnownUpvoteRatio === 'number'
+  );
+}
+
 export function applyActiveTrackingVoteSignalUpdate(
   record: TrackedPost | null,
   update: TrackingVoteSignalUpdate,
@@ -116,6 +170,7 @@ export function applyActiveTrackingVoteSignalUpdate(
 
   if (typeof update.score === 'number') {
     updatedRecord.lastKnownScore = update.score;
+    updatedRecord.lastKnownScoreAt = now;
   }
 
   if (typeof update.upvotes === 'number') {
@@ -126,12 +181,21 @@ export function applyActiveTrackingVoteSignalUpdate(
     updatedRecord.lastKnownDownvotes = update.downvotes;
   }
 
+  if (
+    typeof update.upvotes === 'number' &&
+    typeof update.downvotes === 'number'
+  ) {
+    updatedRecord.lastExactVoteCountsAt = now;
+  }
+
   if (typeof update.upvoteRatio === 'number') {
     updatedRecord.lastKnownUpvoteRatio = update.upvoteRatio;
+    updatedRecord.lastRatioSignalsAt = now;
   }
 
   if (typeof update.postDataUps === 'number') {
     updatedRecord.lastKnownPostDataUps = update.postDataUps;
+    updatedRecord.lastRatioSignalsAt = now;
   }
 
   if (typeof update.calculatedVoteScore === 'number') {

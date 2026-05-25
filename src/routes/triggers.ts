@@ -286,6 +286,7 @@ triggers.post('/on-post-submit', async (c) => {
 
     if (typeof input.post?.score === 'number') {
       record.lastKnownScore = input.post.score;
+      record.lastKnownScoreAt = now;
     }
 
     if (input.post) {
@@ -299,12 +300,20 @@ triggers.post('/on-post-submit', async (c) => {
         record.lastKnownDownvotes = voteCounts.downvotes;
       }
 
+      if (
+        typeof voteCounts.upvotes === 'number' &&
+        typeof voteCounts.downvotes === 'number'
+      ) {
+        record.lastExactVoteCountsAt = now;
+      }
+
       if (typeof voteCounts.calculatedVoteScore === 'number') {
         record.lastCalculatedVoteScore = voteCounts.calculatedVoteScore;
       }
 
       if (typeof initialUpvoteRatio === 'number') {
         record.lastKnownUpvoteRatio = initialUpvoteRatio;
+        record.lastRatioSignalsAt = now;
       }
     }
 
@@ -320,6 +329,9 @@ triggers.post('/on-post-submit', async (c) => {
       downvotes: record.lastKnownDownvotes,
       upvoteRatio: record.lastKnownUpvoteRatio,
       calculatedVoteScore: record.lastCalculatedVoteScore,
+      lastKnownScoreAt: record.lastKnownScoreAt,
+      lastExactVoteCountsAt: record.lastExactVoteCountsAt,
+      lastRatioSignalsAt: record.lastRatioSignalsAt,
       expiresAt: new Date(record.trackingExpiresAt),
       negativeScoreThreshold: record.negativeScoreThreshold,
       positiveScoreStopThreshold: record.positiveScoreStopThreshold,
@@ -353,6 +365,9 @@ triggers.post('/on-post-submit', async (c) => {
       downvotes: record.lastKnownDownvotes,
       upvoteRatio: record.lastKnownUpvoteRatio,
       calculatedVoteScore: record.lastCalculatedVoteScore,
+      lastKnownScoreAt: record.lastKnownScoreAt,
+      lastExactVoteCountsAt: record.lastExactVoteCountsAt,
+      lastRatioSignalsAt: record.lastRatioSignalsAt,
       expiresAt: new Date(record.trackingExpiresAt),
     });
   } catch (err: unknown) {
@@ -436,6 +451,9 @@ triggers.post('/on-post-update', async (c) => {
       downvotes: updatedRecord.lastKnownDownvotes,
       upvoteRatio: updatedRecord.lastKnownUpvoteRatio,
       calculatedVoteScore: updatedRecord.lastCalculatedVoteScore,
+      lastKnownScoreAt: updatedRecord.lastKnownScoreAt,
+      lastExactVoteCountsAt: updatedRecord.lastExactVoteCountsAt,
+      lastRatioSignalsAt: updatedRecord.lastRatioSignalsAt,
     });
   } catch (err: unknown) {
     logError('Failed to process post update trigger.', undefined, err);

@@ -14,6 +14,7 @@ import {
   type PostSnapshot,
 } from '../src/core/decision';
 import { formatLogContext } from '../src/core/logging';
+import { enrichSnapshotWithStoredVotes } from '../src/routes/scheduler';
 import {
   ACTION_FILTER,
   ACTION_REMOVE,
@@ -25,6 +26,10 @@ import {
 } from '../src/core/settings';
 import {
   applyActiveTrackingVoteSignalUpdate,
+  isFreshTimestamp,
+  shouldUseStoredExactVoteCounts,
+  shouldUseStoredRatioSignals,
+  STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS,
   type TrackedPost,
 } from '../src/core/tracking';
 
@@ -177,6 +182,29 @@ describe('settings normalization', () => {
       ).toBe(4);
     }
   );
+
+  test.each([-1, -2, -3, -4, -5] as const)(
+    'accepts negative score threshold %s',
+    (negativeScoreThreshold) => {
+      expect(
+        normalizeSettings({ negativeScoreThreshold }).negativeScoreThreshold
+      ).toBe(negativeScoreThreshold);
+      expect(
+        normalizeSettings({
+          negativeScoreThreshold: String(negativeScoreThreshold),
+        }).negativeScoreThreshold
+      ).toBe(negativeScoreThreshold);
+    }
+  );
+
+  test.each([-10, 0, '', 'abc'] as const)(
+    'falls back to -3 for invalid negative score threshold %s',
+    (negativeScoreThreshold) => {
+      expect(
+        normalizeSettings({ negativeScoreThreshold }).negativeScoreThreshold
+      ).toBe(-3);
+    }
+  );
 });
 
 describe('backoff schedule', () => {
@@ -202,6 +230,15 @@ describe('tracked post decisions', () => {
     expect(
       estimateScoreFromUpvoteRatio({ upvotes: 2, upvoteRatio: 0.25 })
     ).toBe(-4);
+    expect(
+      estimateScoreFromUpvoteRatio({ upvotes: 8, upvoteRatio: 0.42 })
+    ).toBe(-3);
+    expect(
+      estimateScoreFromUpvoteRatio({ upvotes: 4, upvoteRatio: 0.34 })
+    ).toBe(-4);
+    expect(
+      estimateScoreFromUpvoteRatio({ upvotes: 1, upvoteRatio: 0.34 })
+    ).toBe(-1);
   });
 
   test('does not estimate a ratio score without a useful negative ratio signal', () => {
@@ -211,6 +248,9 @@ describe('tracked post decisions', () => {
     ).toBeUndefined();
     expect(
       estimateScoreFromUpvoteRatio({ upvoteRatio: 0.25 })
+    ).toBeUndefined();
+    expect(
+      estimateScoreFromUpvoteRatio({ upvotes: 0, upvoteRatio: 0.25 })
     ).toBeUndefined();
   });
 
@@ -285,6 +325,144 @@ describe('tracked post decisions', () => {
         now,
       })
     ).toEqual({ type: 'action' });
+  });
+
+  test('uses single-upvote ratio cutoff when upvotes are missing', () => {
+    expect(
+      getNegativeDecisionScore(
+        postSnapshot({ score: 0, upvoteRatio: 0.2 }),
+        { negativeScoreThreshold: -3 }
+      )
+    ).toEqual({
+      score: -3,
+      source: 'single_upvote_ratio_cutoff',
+      ratioEstimatedScore: -3,
+    });
+  });
+
+  test('uses zero-upvote ratio cutoff when upvotes are explicitly zero', () => {
+    expect(
+      getNegativeDecisionScore(
+        postSnapshot({ score: 0, upvotes: 0, upvoteRatio: 0.25 }),
+        { negativeScoreThreshold: -3 }
+      )
+    ).toEqual({
+      score: -1,
+      source: 'zero_upvote_ratio_cutoff',
+      ratioEstimatedScore: -1,
+    });
+  });
+
+  test('does not action from zero-upvote ratio cutoff below threshold -1', () => {
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -2 }),
+        settings: activeSettings,
+        post: postSnapshot({ score: 0, upvotes: 0, upvoteRatio: 0.25 }),
+        now,
+      })
+    ).toEqual({ type: 'reschedule' });
+  });
+
+  test('uses exact downvotes when upvotes are explicitly zero', () => {
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -3 }),
+        settings: activeSettings,
+        post: postSnapshot({
+          score: 0,
+          upvotes: 0,
+          downvotes: 3,
+          upvoteRatio: 0,
+        }),
+        now,
+      })
+    ).toEqual({ type: 'action' });
+  });
+
+  test('does not use single-upvote ratio cutoff above the configured threshold ratio', () => {
+    expect(
+      getNegativeDecisionScore(
+        postSnapshot({ score: 0, upvoteRatio: 0.21 }),
+        { negativeScoreThreshold: -3 }
+      )
+    ).toEqual({
+      score: 0,
+      source: 'reddit_score',
+    });
+  });
+
+  test.each([
+    [-1, 0.333],
+    [-2, 0.25],
+    [-5, 0.142],
+  ] as const)(
+    'uses single-upvote ratio cutoff for threshold %s',
+    (negativeScoreThreshold, upvoteRatio) => {
+      expect(
+        getNegativeDecisionScore(
+          postSnapshot({ score: 0, upvoteRatio }),
+          { negativeScoreThreshold }
+        )
+      ).toEqual({
+        score: negativeScoreThreshold,
+        source: 'single_upvote_ratio_cutoff',
+        ratioEstimatedScore: negativeScoreThreshold,
+      });
+    }
+  );
+
+  test('actions from the single-upvote ratio cutoff at the negative threshold', () => {
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -3 }),
+        settings: activeSettings,
+        post: postSnapshot({ score: 0, upvoteRatio: 0.2 }),
+        now,
+      })
+    ).toEqual({ type: 'action' });
+  });
+
+  test('actions from the zero-upvote ratio cutoff at the negative threshold', () => {
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -1 }),
+        settings: activeSettings,
+        post: postSnapshot({ score: 0, upvotes: 0, upvoteRatio: 0.25 }),
+        now,
+      })
+    ).toEqual({ type: 'action' });
+  });
+
+  test('uses exact vote counts when they are lower than the ratio estimate', () => {
+    expect(
+      getNegativeDecisionScore(
+        postSnapshot({
+          score: 0,
+          upvotes: 8,
+          downvotes: 11,
+          upvoteRatio: 0.49,
+        }),
+        { negativeScoreThreshold: -3 }
+      )
+    ).toEqual({
+      score: -3,
+      source: 'calculated_votes',
+      calculatedVoteScore: -3,
+      ratioEstimatedScore: 0,
+    });
+  });
+
+  test('ignores cached calculated vote scores without raw vote counts', () => {
+    expect(
+      getNegativeDecisionScore(
+        postSnapshot({ score: 0, calculatedVoteScore: -3 }),
+        { negativeScoreThreshold: -3 }
+      )
+    ).toEqual({
+      score: 0,
+      source: 'reddit_score',
+    });
   });
 
   test('actions when an explicit ratio estimate reaches the negative threshold', () => {
@@ -490,6 +668,188 @@ describe('moderator handling', () => {
 });
 
 describe('tracking vote signal updates', () => {
+  test('validates vote signal timestamps against age and future values', () => {
+    expect(
+      isFreshTimestamp({
+        timestamp: now - 1_000,
+        maxAgeMs: STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS,
+        now,
+      })
+    ).toBe(true);
+    expect(
+      isFreshTimestamp({
+        timestamp: now + 1_000,
+        maxAgeMs: STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS,
+        now,
+      })
+    ).toBe(false);
+    expect(
+      isFreshTimestamp({
+        timestamp: now - STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS - 1,
+        maxAgeMs: STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS,
+        now,
+      })
+    ).toBe(false);
+  });
+
+  test('uses recent stored exact vote counts when no current post data exists', () => {
+    expect(
+      shouldUseStoredExactVoteCounts({
+        record: trackedPost({
+          lastKnownUpvotes: 1,
+          lastKnownDownvotes: 4,
+          lastExactVoteCountsAt:
+            now - STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS + 1_000,
+        }),
+        hasCurrentPostDataSignals: false,
+        now,
+      })
+    ).toBe(true);
+  });
+
+  test('does not use stale stored exact vote counts', () => {
+    expect(
+      shouldUseStoredExactVoteCounts({
+        record: trackedPost({
+          lastKnownUpvotes: 1,
+          lastKnownDownvotes: 4,
+          lastExactVoteCountsAt:
+            now - STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS - 1_000,
+        }),
+        hasCurrentPostDataSignals: false,
+        now,
+      })
+    ).toBe(false);
+  });
+
+  test('does not use future stored exact vote counts', () => {
+    expect(
+      shouldUseStoredExactVoteCounts({
+        record: trackedPost({
+          lastKnownUpvotes: 1,
+          lastKnownDownvotes: 4,
+          lastExactVoteCountsAt: now + 1_000,
+        }),
+        hasCurrentPostDataSignals: false,
+        now,
+      })
+    ).toBe(false);
+  });
+
+  test('does not use stored exact vote counts when current post data exists', () => {
+    expect(
+      shouldUseStoredExactVoteCounts({
+        record: trackedPost({
+          lastKnownUpvotes: 1,
+          lastKnownDownvotes: 4,
+          lastExactVoteCountsAt: now,
+        }),
+        hasCurrentPostDataSignals: true,
+        now,
+      })
+    ).toBe(false);
+  });
+
+  test('uses stored ratio signals only when the stored pair is fresh', () => {
+    expect(
+      shouldUseStoredRatioSignals({
+        record: trackedPost({
+          lastKnownPostDataUps: 1,
+          lastKnownUpvoteRatio: 0.25,
+          lastRatioSignalsAt: now - 1_000,
+        }),
+        hasCurrentPostDataSignals: false,
+        now,
+      })
+    ).toBe(true);
+    expect(
+      shouldUseStoredRatioSignals({
+        record: trackedPost({
+          lastKnownPostDataUps: 1,
+          lastKnownUpvoteRatio: 0.25,
+          lastRatioSignalsAt:
+            now - STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS - 1_000,
+        }),
+        hasCurrentPostDataSignals: false,
+        now,
+      })
+    ).toBe(false);
+    expect(
+      shouldUseStoredRatioSignals({
+        record: trackedPost({
+          lastKnownPostDataUps: 1,
+          lastKnownUpvoteRatio: 0.25,
+          lastRatioSignalsAt: now,
+        }),
+        hasCurrentPostDataSignals: true,
+        now,
+      })
+    ).toBe(false);
+  });
+
+  test('does not mix current ratio signals with stored ratio signals', () => {
+    const record = trackedPost({
+      lastKnownPostDataUps: 8,
+      lastKnownUpvoteRatio: 0.25,
+      lastRatioSignalsAt: now,
+    });
+
+    expect(
+      enrichSnapshotWithStoredVotes(
+        postSnapshot({ score: 0 }),
+        record,
+        { upvoteRatio: 0.2 },
+        now
+      )
+    ).toEqual(postSnapshot({ score: 0 }));
+
+    expect(
+      enrichSnapshotWithStoredVotes(
+        postSnapshot({ score: 0 }),
+        record,
+        { ups: 1 },
+        now
+      )
+    ).toEqual(postSnapshot({ score: 0 }));
+  });
+
+  test('uses current ratio pairs and fresh stored ratio pairs', () => {
+    const record = trackedPost({
+      lastKnownPostDataUps: 8,
+      lastKnownUpvoteRatio: 0.25,
+      lastRatioSignalsAt: now,
+    });
+
+    expect(
+      enrichSnapshotWithStoredVotes(
+        postSnapshot({ score: 0 }),
+        record,
+        { ups: 1, upvoteRatio: 0.2 },
+        now
+      )
+    ).toEqual(postSnapshot({ score: 0, postDataUps: 1, upvoteRatio: 0.2 }));
+
+    expect(
+      enrichSnapshotWithStoredVotes(postSnapshot({ score: 0 }), record, {}, now)
+    ).toEqual(postSnapshot({ score: 0, postDataUps: 8, upvoteRatio: 0.25 }));
+  });
+
+  test('ignores stale stored ratio pairs', () => {
+    expect(
+      enrichSnapshotWithStoredVotes(
+        postSnapshot({ score: 0 }),
+        trackedPost({
+          lastKnownPostDataUps: 8,
+          lastKnownUpvoteRatio: 0.25,
+          lastRatioSignalsAt:
+            now - STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS - 1_000,
+        }),
+        {},
+        now
+      )
+    ).toEqual(postSnapshot({ score: 0 }));
+  });
+
   test('updates vote signal fields for active tracked posts', () => {
     expect(
       applyActiveTrackingVoteSignalUpdate(
@@ -512,10 +872,13 @@ describe('tracking vote signal updates', () => {
     ).toMatchObject({
       status: 'active',
       lastKnownScore: -1,
+      lastKnownScoreAt: now + 1_000,
       lastKnownUpvotes: 1,
       lastKnownDownvotes: 4,
+      lastExactVoteCountsAt: now + 1_000,
       lastKnownUpvoteRatio: 0.25,
       lastKnownPostDataUps: 1,
+      lastRatioSignalsAt: now + 1_000,
       lastCalculatedVoteScore: -3,
       updatedAt: now + 1_000,
       negativeScoreThreshold: -3,
