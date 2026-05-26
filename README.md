@@ -27,6 +27,6 @@ Downvote Delete will not:
 - Continue watching posts that were already moderated or deleted.
 
 ## Patch Notes
-1.2.1 - Added addTrigger for karma score tracking until V2 upvoteRatio is added.
-1.1.1 - Default tracking now 4 hours at -3. Tracking for 2, 4, 6 hours. Downvote thresholds -1 to -5. Improved downvote tracking.
-1.0.5 - Initial Public Release. Devvit 0.12.24
+1.2.1 - Added addTrigger for karma score tracking until V2 upvoteRatio is added. 
+1.1.1 - Default tracking now 4 hours at -3. Tracking for 2, 4, 6 hours. Downvote thresholds -1 to -5. Improved downvote tracking. 
+1.0.5 - Initial Public Release. Devvit 0.12.24. 
