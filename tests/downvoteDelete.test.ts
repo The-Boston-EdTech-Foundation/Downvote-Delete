@@ -14,7 +14,18 @@ import {
   type PostSnapshot,
 } from '../src/core/decision';
 import { formatLogContext } from '../src/core/logging';
-import { enrichSnapshotWithStoredVotes } from '../src/routes/scheduler';
+import {
+  enrichSnapshotWithStoredVotes,
+  handleScheduledPostCheck,
+  type ScheduledCheckClients,
+} from '../src/routes/scheduler';
+import {
+  deriveUpvoteRatio,
+  getPostVoteSignalUpdate,
+  handlePostSubmitTrigger,
+  handlePostUpdateTrigger,
+  type TriggerClients,
+} from '../src/core/triggerHandlers';
 import {
   ACTION_FILTER,
   ACTION_REMOVE,
@@ -30,6 +41,8 @@ import {
   shouldUseStoredExactVoteCounts,
   shouldUseStoredRatioSignals,
   STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS,
+  parseTrackedPost,
+  watchKey,
   type TrackedPost,
 } from '../src/core/tracking';
 
@@ -46,11 +59,13 @@ const activeSettings: DownvoteDeleteSettings = {
 
 type ApplyModerationActionArgs = Parameters<typeof applyModerationAction>[0];
 
-function mockPost(overrides: Partial<{
-  filterCalls: string[];
-  removalNotes: unknown[];
-  removeCalls: boolean[];
-}> = {}): ApplyModerationActionArgs['post'] & {
+function mockPost(
+  overrides: Partial<{
+    filterCalls: string[];
+    removalNotes: unknown[];
+    removeCalls: boolean[];
+  }> = {}
+): ApplyModerationActionArgs['post'] & {
   filterCalls: string[];
   removalNotes: unknown[];
   removeCalls: boolean[];
@@ -80,9 +95,11 @@ function mockPost(overrides: Partial<{
   };
 }
 
-function mockRedditClient(args: {
-  failModmail?: boolean;
-} = {}): ApplyModerationActionArgs['redditClient'] & {
+function mockRedditClient(
+  args: {
+    failModmail?: boolean;
+  } = {}
+): ApplyModerationActionArgs['redditClient'] & {
   reports: unknown[];
   modmailConversations: unknown[];
 } {
@@ -143,6 +160,132 @@ function postSnapshot(overrides: Partial<PostSnapshot> = {}): PostSnapshot {
     deleted: false,
     unavailable: false,
     ...overrides,
+  };
+}
+
+function mockTriggerClients(
+  args: {
+    settings?: DownvoteDeleteSettings;
+    redisValues?: Record<string, string>;
+  } = {}
+): TriggerClients & {
+  redisValues: Map<string, string>;
+  scheduledJobs: unknown[];
+  statIncrements: unknown[];
+} {
+  const redisValues = new Map(Object.entries(args.redisValues ?? {}));
+  const scheduledJobs: unknown[] = [];
+  const statIncrements: unknown[] = [];
+
+  return {
+    redisValues,
+    scheduledJobs,
+    statIncrements,
+    reddit: {
+      getModerators: () => ({
+        all: async () => [],
+      }),
+    },
+    redis: {
+      get: async (key: string) => redisValues.get(key),
+      set: async (key: string, value: string, options = {}) => {
+        if (options.nx && redisValues.has(key)) {
+          return null as unknown as string;
+        }
+
+        if (options.xx && !redisValues.has(key)) {
+          return null as unknown as string;
+        }
+
+        redisValues.set(key, value);
+        return 'OK';
+      },
+      del: async (...keys: string[]) => {
+        for (const key of keys) {
+          redisValues.delete(key);
+        }
+        return keys.length;
+      },
+      hIncrBy: async (key: string, field: string, value: number) => {
+        statIncrements.push({ key, field, value });
+        return value;
+      },
+    },
+    scheduler: {
+      runJob: async (job: unknown) => {
+        scheduledJobs.push(job);
+        return `job-${scheduledJobs.length}`;
+      },
+    },
+    settings: {
+      getAll: async () => args.settings ?? activeSettings,
+    },
+  };
+}
+
+function mockScheduledCheckClients(
+  args: {
+    settings?: DownvoteDeleteSettings;
+    redisValues?: Record<string, string>;
+    score?: number;
+  } = {}
+): ScheduledCheckClients & {
+  redisValues: Map<string, string>;
+  scheduledJobs: unknown[];
+  statIncrements: unknown[];
+} {
+  const redisValues = new Map(Object.entries(args.redisValues ?? {}));
+  const scheduledJobs: unknown[] = [];
+  const statIncrements: unknown[] = [];
+  const post = {
+    score: args.score ?? 0,
+    approved: false,
+    removed: false,
+    spam: false,
+    removedByCategory: undefined,
+    permalink: '/r/test/comments/t3_post/test/',
+    isApproved: () => false,
+    isRemoved: () => false,
+    isSpam: () => false,
+  };
+
+  return {
+    redisValues,
+    scheduledJobs,
+    statIncrements,
+    reddit: {
+      getPostById: async () => post,
+    },
+    redis: {
+      get: async (key: string) => redisValues.get(key),
+      set: async (key: string, value: string) => {
+        redisValues.set(key, value);
+        return 'OK';
+      },
+      del: async (...keys: string[]) => {
+        for (const key of keys) {
+          redisValues.delete(key);
+        }
+        return keys.length;
+      },
+      hIncrBy: async (key: string, field: string, value: number) => {
+        statIncrements.push({ key, field, value });
+        return value;
+      },
+    },
+    scheduler: {
+      runJob: async (job: unknown) => {
+        scheduledJobs.push(job);
+        return `job-${scheduledJobs.length}`;
+      },
+    },
+    settings: {
+      getAll: async () => args.settings ?? activeSettings,
+    },
+  } as unknown as ScheduledCheckClients & {
+    redisValues: Map<string, string>;
+    scheduledJobs: unknown[];
+    statIncrements: unknown[];
   };
 }
 
@@ -246,9 +389,7 @@ describe('tracked post decisions', () => {
     expect(
       estimateScoreFromUpvoteRatio({ upvotes: 1, upvoteRatio: 0.5 })
     ).toBeUndefined();
-    expect(
-      estimateScoreFromUpvoteRatio({ upvoteRatio: 0.25 })
-    ).toBeUndefined();
+    expect(estimateScoreFromUpvoteRatio({ upvoteRatio: 0.25 })).toBeUndefined();
     expect(
       estimateScoreFromUpvoteRatio({ upvotes: 0, upvoteRatio: 0.25 })
     ).toBeUndefined();
@@ -329,10 +470,9 @@ describe('tracked post decisions', () => {
 
   test('uses single-upvote ratio cutoff when upvotes are missing', () => {
     expect(
-      getNegativeDecisionScore(
-        postSnapshot({ score: 0, upvoteRatio: 0.2 }),
-        { negativeScoreThreshold: -3 }
-      )
+      getNegativeDecisionScore(postSnapshot({ score: 0, upvoteRatio: 0.2 }), {
+        negativeScoreThreshold: -3,
+      })
     ).toEqual({
       score: -3,
       source: 'single_upvote_ratio_cutoff',
@@ -382,10 +522,9 @@ describe('tracked post decisions', () => {
 
   test('does not use single-upvote ratio cutoff above the configured threshold ratio', () => {
     expect(
-      getNegativeDecisionScore(
-        postSnapshot({ score: 0, upvoteRatio: 0.21 }),
-        { negativeScoreThreshold: -3 }
-      )
+      getNegativeDecisionScore(postSnapshot({ score: 0, upvoteRatio: 0.21 }), {
+        negativeScoreThreshold: -3,
+      })
     ).toEqual({
       score: 0,
       source: 'reddit_score',
@@ -400,10 +539,9 @@ describe('tracked post decisions', () => {
     'uses single-upvote ratio cutoff for threshold %s',
     (negativeScoreThreshold, upvoteRatio) => {
       expect(
-        getNegativeDecisionScore(
-          postSnapshot({ score: 0, upvoteRatio }),
-          { negativeScoreThreshold }
-        )
+        getNegativeDecisionScore(postSnapshot({ score: 0, upvoteRatio }), {
+          negativeScoreThreshold,
+        })
       ).toEqual({
         score: negativeScoreThreshold,
         source: 'single_upvote_ratio_cutoff',
@@ -668,6 +806,220 @@ describe('moderator handling', () => {
 });
 
 describe('tracking vote signal updates', () => {
+  test('derives an upvote ratio from exact vote counts', () => {
+    expect(deriveUpvoteRatio({ upvotes: 1, downvotes: 4 })).toBe(0.2);
+    expect(
+      getPostVoteSignalUpdate({ score: 0, upvotes: 1, downvotes: 4 })
+    ).toMatchObject({
+      score: 0,
+      upvotes: 1,
+      downvotes: 4,
+      postDataUps: 1,
+      upvoteRatio: 0.2,
+      calculatedVoteScore: -3,
+    });
+  });
+
+  test('omits derived upvote ratio when vote counts are missing or total is zero', () => {
+    expect(deriveUpvoteRatio({ upvotes: 0, downvotes: 0 })).toBeUndefined();
+    expect(deriveUpvoteRatio({ upvotes: 1 })).toBeUndefined();
+    expect(getPostVoteSignalUpdate({ score: 0 })).toEqual({ score: 0 });
+    expect(
+      getPostVoteSignalUpdate({ score: 0, upvotes: 0, downvotes: 0 })
+    ).toEqual({
+      score: 0,
+      upvotes: 0,
+      downvotes: 0,
+      calculatedVoteScore: 0,
+    });
+  });
+
+  test('shared submit handler creates one watch record and schedules one first check', async () => {
+    const clients = mockTriggerClients();
+
+    await expect(
+      handlePostSubmitTrigger({
+        clients,
+        triggerSource: 'web_endpoint',
+        now,
+        input: {
+          post: {
+            id: 't3_new',
+            createdAt: now / 1000,
+            score: 1,
+            upvotes: 1,
+            downvotes: 0,
+          },
+          author: { id: 't2_author', name: 'author' },
+          subreddit: { id: 't5_test', name: 'test' },
+        },
+      })
+    ).resolves.toBe('started');
+
+    const record = parseTrackedPost(
+      clients.redisValues.get(watchKey('t3_new'))
+    );
+
+    expect(record).toMatchObject({
+      status: 'active',
+      postId: 't3_new',
+      subredditId: 't5_test',
+      lastJobId: 'job-1',
+      lastKnownScore: 1,
+      lastKnownUpvotes: 1,
+      lastKnownDownvotes: 0,
+      lastKnownUpvoteRatio: 1,
+      lastKnownPostDataUps: 1,
+      lastExactVoteCountsAt: now,
+      lastRatioSignalsAt: now,
+    });
+    expect(clients.scheduledJobs).toHaveLength(1);
+    expect(clients.statIncrements).toHaveLength(1);
+  });
+
+  test('shared submit handler skips duplicate active records without scheduling again', async () => {
+    const existingRecord = trackedPost({ postId: 't3_existing' });
+    const clients = mockTriggerClients({
+      redisValues: {
+        [watchKey('t3_existing')]: JSON.stringify(existingRecord),
+      },
+    });
+
+    await expect(
+      handlePostSubmitTrigger({
+        clients,
+        triggerSource: 'legacy_addTrigger',
+        now,
+        input: {
+          post: {
+            id: 't3_existing',
+            createdAt: now / 1000,
+            score: 1,
+            upvotes: 1,
+            downvotes: 0,
+          },
+          author: { id: 't2_author', name: 'author' },
+          subreddit: { id: 't5_test', name: 'test' },
+        },
+      })
+    ).resolves.toBe('duplicate_active');
+
+    expect(
+      parseTrackedPost(clients.redisValues.get(watchKey('t3_existing')))
+    ).toEqual(existingRecord);
+    expect(clients.scheduledJobs).toHaveLength(0);
+    expect(clients.statIncrements).toHaveLength(0);
+  });
+
+  test('shared submit handler rolls back the watch record if first scheduling fails', async () => {
+    const clients = mockTriggerClients();
+    clients.scheduler.runJob = async () => {
+      throw new Error('scheduler unavailable');
+    };
+
+    await expect(
+      handlePostSubmitTrigger({
+        clients,
+        triggerSource: 'legacy_addTrigger',
+        now,
+        input: {
+          post: {
+            id: 't3_rollback',
+            createdAt: now / 1000,
+            score: 1,
+            upvotes: 1,
+            downvotes: 0,
+          },
+          author: { id: 't2_author', name: 'author' },
+          subreddit: { id: 't5_test', name: 'test' },
+        },
+      })
+    ).resolves.toBe('error');
+
+    expect(clients.redisValues.has(watchKey('t3_rollback'))).toBe(false);
+    expect(clients.statIncrements).toHaveLength(0);
+  });
+
+  test('shared update handler stores derived ratio from post update counts', async () => {
+    const clients = mockTriggerClients({
+      redisValues: {
+        [watchKey('t3_post')]: JSON.stringify(
+          trackedPost({
+            postId: 't3_post',
+            lastKnownScore: 1,
+            lastKnownUpvotes: 1,
+            lastKnownDownvotes: 0,
+          })
+        ),
+      },
+    });
+
+    await expect(
+      handlePostUpdateTrigger({
+        clients,
+        triggerSource: 'legacy_addTrigger',
+        now: now + 1_000,
+        input: {
+          post: {
+            id: 't3_post',
+            score: 0,
+            upvotes: 1,
+            downvotes: 4,
+          },
+          author: { id: 't2_author', name: 'author' },
+          subreddit: { id: 't5_test', name: 'test' },
+        },
+      })
+    ).resolves.toBe('updated');
+
+    expect(
+      parseTrackedPost(clients.redisValues.get(watchKey('t3_post')))
+    ).toMatchObject({
+      lastKnownScore: 0,
+      lastKnownUpvotes: 1,
+      lastKnownDownvotes: 4,
+      lastKnownUpvoteRatio: 0.2,
+      lastKnownPostDataUps: 1,
+      lastExactVoteCountsAt: now + 1_000,
+      lastRatioSignalsAt: now + 1_000,
+      lastCalculatedVoteScore: -3,
+    });
+  });
+
+  test.each(['web_endpoint', 'legacy_addSchedulerJob'] as const)(
+    'shared scheduled handler can run from %s',
+    async (schedulerSource) => {
+      const scheduledNow = Date.now();
+      const record = trackedPost({
+        postId: `t3_${schedulerSource}`,
+        subredditId: 't5_test',
+        subredditName: 'test',
+        trackingExpiresAt: scheduledNow + 60 * 60 * 1000,
+      });
+      const clients = mockScheduledCheckClients({
+        score: 5,
+        redisValues: {
+          [watchKey(record.postId)]: JSON.stringify(record),
+        },
+      });
+
+      await expect(
+        handleScheduledPostCheck({
+          postId: record.postId,
+          payload: { postId: record.postId },
+          clients,
+          schedulerSource,
+        })
+      ).resolves.toBeUndefined();
+
+      expect(clients.redisValues.has(watchKey(record.postId))).toBe(false);
+      expect(
+        clients.redisValues.has(`downvote-delete:audit:${record.postId}`)
+      ).toBe(true);
+      expect(clients.scheduledJobs).toHaveLength(0);
+    }
+  );
+
   test('validates vote signal timestamps against age and future values', () => {
     expect(
       isFreshTimestamp({
@@ -767,8 +1119,7 @@ describe('tracking vote signal updates', () => {
         record: trackedPost({
           lastKnownPostDataUps: 1,
           lastKnownUpvoteRatio: 0.25,
-          lastRatioSignalsAt:
-            now - STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS - 1_000,
+          lastRatioSignalsAt: now - STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS - 1_000,
         }),
         hasCurrentPostDataSignals: false,
         now,
@@ -841,8 +1192,7 @@ describe('tracking vote signal updates', () => {
         trackedPost({
           lastKnownPostDataUps: 8,
           lastKnownUpvoteRatio: 0.25,
-          lastRatioSignalsAt:
-            now - STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS - 1_000,
+          lastRatioSignalsAt: now - STORED_EXACT_VOTE_COUNTS_MAX_AGE_MS - 1_000,
         }),
         {},
         now
@@ -939,9 +1289,7 @@ describe('removal modmail notifications', () => {
     expect(body).toContain(
       'Your post was removed because it received too much negative community feedback.'
     );
-    expect(body).toContain(
-      'https://www.reddit.com/r/mySubreddit/about/rules'
-    );
+    expect(body).toContain('https://www.reddit.com/r/mySubreddit/about/rules');
     expect(body).toContain(
       '*Removed post: https://reddit.com/r/mySubreddit/comments/abc123*'
     );

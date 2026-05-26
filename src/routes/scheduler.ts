@@ -1,9 +1,9 @@
 import { Hono } from 'hono';
 import type { TaskRequest, TaskResponse } from '@devvit/web/server';
 import {
-  reddit,
-  redis,
-  scheduler,
+  reddit as webReddit,
+  redis as webRedis,
+  scheduler as webScheduler,
   settings as devvitSettings,
 } from '@devvit/web/server';
 import type { T3 } from '@devvit/shared-types/tid.js';
@@ -36,10 +36,42 @@ import {
   type TrackingStatus,
   watchKey,
 } from '../core/tracking';
-import { CHECK_WATCHED_POST_TASK } from './triggers';
+import { CHECK_WATCHED_POST_TASK } from '../core/constants';
 
 type CheckWatchedPostData = {
   postId?: string;
+};
+
+type RedisSetOptions = {
+  nx?: boolean;
+  xx?: boolean;
+  expiration?: Date;
+};
+
+export type SchedulerSource = 'web_endpoint' | 'legacy_addSchedulerJob';
+
+type ScheduledRedditClient = Omit<typeof webReddit, 'getPostData'> & {
+  getPostData?: (postId: T3) => Promise<unknown>;
+};
+
+export type ScheduledCheckClients = {
+  reddit: ScheduledRedditClient;
+  redis: {
+    get(key: string): Promise<string | undefined>;
+    set(key: string, value: string, options?: RedisSetOptions): Promise<string>;
+    del(...keys: string[]): Promise<unknown>;
+    hIncrBy(key: string, field: string, value: number): Promise<unknown>;
+  };
+  scheduler: {
+    runJob(job: {
+      name: string;
+      data?: { postId: string };
+      runAt: Date;
+    }): Promise<string>;
+  };
+  settings: {
+    getAll(): Promise<Record<string, unknown>>;
+  };
 };
 
 type PostDataVoteSignals = {
@@ -50,6 +82,13 @@ type PostDataVoteSignals = {
 };
 
 export const scheduledJobs = new Hono();
+
+const webScheduledCheckClients: ScheduledCheckClients = {
+  reddit: webReddit,
+  redis: webRedis,
+  scheduler: webScheduler,
+  settings: devvitSettings,
+};
 
 const actionLockKey = (postId: string): string =>
   `downvote-delete:action-lock:${postId}`;
@@ -84,9 +123,7 @@ function getNumberField(
     : undefined;
 }
 
-function readPostDataVoteSignals(
-  postData: unknown
-): PostDataVoteSignals {
+function readPostDataVoteSignals(postData: unknown): PostDataVoteSignals {
   const source =
     postData && typeof postData === 'object'
       ? (postData as Record<string, unknown>)
@@ -116,15 +153,27 @@ function readPostDataVoteSignals(
   return signals;
 }
 
-async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
+async function loadTrackedPost(
+  clients: ScheduledCheckClients,
+  postId: string,
+  schedulerSource: SchedulerSource
+): Promise<TrackedPost | null> {
   const redisKey = watchKey(postId);
-  logInfo('Pulling tracking record from Redis.', { postId, redisKey });
+  logInfo('Pulling tracking record from Redis.', {
+    postId,
+    redisKey,
+    schedulerSource,
+  });
 
-  const rawRecord = await redis.get(redisKey);
+  const rawRecord = await clients.redis.get(redisKey);
   const parsedRecord = parseTrackedPost(rawRecord);
 
   if (!rawRecord) {
-    logInfo('No tracking record found in Redis.', { postId, redisKey });
+    logInfo('No tracking record found in Redis.', {
+      postId,
+      redisKey,
+      schedulerSource,
+    });
     return null;
   }
 
@@ -132,6 +181,7 @@ async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
     logError('Tracking record in Redis is malformed.', {
       postId,
       redisKey,
+      schedulerSource,
       rawLength: rawRecord.length,
     });
     return null;
@@ -140,6 +190,7 @@ async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
   logInfo('Loaded tracking record from Redis.', {
     postId,
     redisKey,
+    schedulerSource,
     status: parsedRecord.status,
     checkCount: parsedRecord.checkCount,
     lastKnownScore: parsedRecord.lastKnownScore,
@@ -162,11 +213,16 @@ async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
   return parsedRecord;
 }
 
-async function writeTrackedPost(record: TrackedPost): Promise<void> {
+async function writeTrackedPost(
+  clients: ScheduledCheckClients,
+  record: TrackedPost,
+  schedulerSource: SchedulerSource
+): Promise<void> {
   const redisKey = watchKey(record.postId);
   logInfo('Writing tracking record to Redis.', {
     postId: record.postId,
     redisKey,
+    schedulerSource,
     status: record.status,
     checkCount: record.checkCount,
     lastKnownScore: record.lastKnownScore,
@@ -183,22 +239,30 @@ async function writeTrackedPost(record: TrackedPost): Promise<void> {
     negativeDecisionSource: record.negativeDecisionSource,
     lastJobId: record.lastJobId,
   });
-  await redis.set(redisKey, serializeTrackedPost(record));
+  await clients.redis.set(redisKey, serializeTrackedPost(record));
 }
 
-async function releaseActionLock(postId: string, reason: string): Promise<void> {
+async function releaseActionLock(
+  clients: ScheduledCheckClients,
+  postId: string,
+  reason: string,
+  schedulerSource: SchedulerSource
+): Promise<void> {
   logInfo('Releasing Redis action lock.', {
     postId,
     actionLockKey: actionLockKey(postId),
     reason,
+    schedulerSource,
   });
-  await redis.del(actionLockKey(postId));
+  await clients.redis.del(actionLockKey(postId));
 }
 
 async function stopTracking(
+  clients: ScheduledCheckClients,
   record: TrackedPost,
   status: Exclude<TrackingStatus, 'active' | 'actioning'>,
   now: number,
+  schedulerSource: SchedulerSource,
   stopReason?: string
 ): Promise<void> {
   const stoppedRecord: TrackedPost = {
@@ -216,6 +280,7 @@ async function stopTracking(
     subredditName: record.subredditName,
     status,
     reason: stopReason ?? status,
+    schedulerSource,
     checkCount: record.checkCount,
     lastKnownScore: record.lastKnownScore,
     lastKnownUpvotes: record.lastKnownUpvotes,
@@ -230,27 +295,33 @@ async function stopTracking(
     redisKey: watchKey(record.postId),
   });
 
-  await redis.set(
+  await clients.redis.set(
     auditKey(record.postId),
     JSON.stringify(createAuditRecord(stoppedRecord, now))
   );
-  await redis.hIncrBy(statsKey(record.subredditId), status, 1);
-  await redis.del(watchKey(record.postId));
+  await clients.redis.hIncrBy(statsKey(record.subredditId), status, 1);
+  await clients.redis.del(watchKey(record.postId));
 
   logInfo('Tracking stopped and Redis watch key deleted.', {
     postId: record.postId,
     status,
+    schedulerSource,
     auditKey: auditKey(record.postId),
     deletedRedisKey: watchKey(record.postId),
   });
 }
 
 async function fetchPostSnapshot(
+  clients: ScheduledCheckClients,
+  schedulerSource: SchedulerSource,
   postId: string
-): Promise<{ post: Awaited<ReturnType<typeof reddit.getPostById>>; snapshot: PostSnapshot } | null> {
+): Promise<{
+  post: Awaited<ReturnType<typeof webReddit.getPostById>>;
+  snapshot: PostSnapshot;
+} | null> {
   try {
-    logInfo('Fetching current Reddit post state.', { postId });
-    const post = await reddit.getPostById(postId as T3);
+    logInfo('Fetching current Reddit post state.', { postId, schedulerSource });
+    const post = await clients.reddit.getPostById(postId as T3);
     const snapshot = postToSnapshot(post);
     logInfo('Fetched current Reddit post state.', {
       postId,
@@ -261,20 +332,39 @@ async function fetchPostSnapshot(
       spam: snapshot.spam,
       deleted: snapshot.deleted,
       unavailable: snapshot.unavailable,
+      schedulerSource,
     });
     return { post, snapshot };
   } catch (err: unknown) {
-    logError('Could not fetch post from Reddit.', { postId }, err);
+    logError(
+      'Could not fetch post from Reddit.',
+      { postId, schedulerSource },
+      err
+    );
     return null;
   }
 }
 
 async function fetchPostDataVoteSignals(
-  postId: string
+  clients: ScheduledCheckClients,
+  schedulerSource: SchedulerSource,
+  postId: string,
+  post?: Awaited<ReturnType<typeof webReddit.getPostById>>
 ): Promise<PostDataVoteSignals> {
   try {
-    logInfo('Fetching Reddit post data vote signals.', { postId });
-    const postData = await reddit.getPostData(postId as T3);
+    logInfo('Fetching Reddit post data vote signals.', {
+      postId,
+      schedulerSource,
+    });
+    const postData =
+      typeof clients.reddit.getPostData === 'function'
+        ? await clients.reddit.getPostData(postId as T3)
+        : typeof (post as { getPostData?: () => Promise<unknown> } | undefined)
+              ?.getPostData === 'function'
+          ? await (
+              post as { getPostData: () => Promise<unknown> }
+            ).getPostData()
+          : undefined;
     const signals = readPostDataVoteSignals(postData);
 
     logInfo('Fetched Reddit post data vote signals.', {
@@ -287,11 +377,16 @@ async function fetchPostDataVoteSignals(
       postDataUpvoteRatio: signals.upvoteRatio,
       postDataHasViewCount: typeof signals.viewCount === 'number',
       postDataViewCount: signals.viewCount,
+      schedulerSource,
     });
 
     return signals;
   } catch (err: unknown) {
-    logError('Could not fetch Reddit post data vote signals.', { postId }, err);
+    logError(
+      'Could not fetch Reddit post data vote signals.',
+      { postId, schedulerSource },
+      err
+    );
     return {};
   }
 }
@@ -405,9 +500,11 @@ function applyScoreSignals(
 }
 
 async function markErrorAndReschedule(
+  clients: ScheduledCheckClients,
   record: TrackedPost,
   err: unknown,
-  now: number
+  now: number,
+  schedulerSource: SchedulerSource
 ): Promise<void> {
   logError(
     'Scheduled check failed before completion.',
@@ -415,6 +512,7 @@ async function markErrorAndReschedule(
       postId: record.postId,
       checkCount: record.checkCount,
       expiresAt: new Date(record.trackingExpiresAt),
+      schedulerSource,
     },
     err
   );
@@ -424,26 +522,37 @@ async function markErrorAndReschedule(
       postId: record.postId,
       reason: 'check_failed_after_expiration',
     });
-    await stopTracking(record, 'error', now, 'check_failed_after_expiration');
+    await stopTracking(
+      clients,
+      record,
+      'error',
+      now,
+      schedulerSource,
+      'check_failed_after_expiration'
+    );
     return;
   }
 
   const nextCheckCount = record.checkCount + 1;
   const nextRunAt = getNextCheckRunAt(nextCheckCount, now);
   const nextDelayMinutes = getNextCheckDelayMinutes(nextCheckCount);
-  const jobId = await scheduler.runJob({
+  const jobId = await clients.scheduler.runJob({
     name: CHECK_WATCHED_POST_TASK,
     data: { postId: record.postId },
     runAt: nextRunAt,
   });
 
-  await writeTrackedPost({
-    ...record,
-    checkCount: nextCheckCount,
-    lastJobId: jobId,
-    updatedAt: now,
-    errorMessage: err instanceof Error ? err.message : String(err),
-  });
+  await writeTrackedPost(
+    clients,
+    {
+      ...record,
+      checkCount: nextCheckCount,
+      lastJobId: jobId,
+      updatedAt: now,
+      errorMessage: err instanceof Error ? err.message : String(err),
+    },
+    schedulerSource
+  );
 
   logInfo('Rescheduled post check after error.', {
     postId: record.postId,
@@ -451,18 +560,22 @@ async function markErrorAndReschedule(
     nextDelayMinutes,
     nextRunAt,
     jobId,
+    schedulerSource,
   });
 }
 
 async function scheduleRetryWithoutRecordWrite(
+  clients: ScheduledCheckClients,
   record: TrackedPost,
   now: number,
-  reason: string
+  reason: string,
+  schedulerSource: SchedulerSource
 ): Promise<void> {
   if (now >= record.trackingExpiresAt) {
     logWarn('Retry was not scheduled because tracking window is expired.', {
       postId: record.postId,
       reason,
+      schedulerSource,
     });
     return;
   }
@@ -470,7 +583,7 @@ async function scheduleRetryWithoutRecordWrite(
   const nextCheckCount = record.checkCount + 1;
   const nextRunAt = getNextCheckRunAt(nextCheckCount, now);
   const nextDelayMinutes = getNextCheckDelayMinutes(nextCheckCount);
-  const jobId = await scheduler.runJob({
+  const jobId = await clients.scheduler.runJob({
     name: CHECK_WATCHED_POST_TASK,
     data: { postId: record.postId },
     runAt: nextRunAt,
@@ -484,40 +597,55 @@ async function scheduleRetryWithoutRecordWrite(
     nextDelayMinutes,
     nextRunAt,
     jobId,
+    schedulerSource,
   });
 }
 
-scheduledJobs.post('/check-watched-post', async (c) => {
-  const task = await c.req.json<TaskRequest<CheckWatchedPostData>>();
-  const postId = task.data?.postId;
+export async function handleScheduledPostCheck(args: {
+  postId: string | undefined;
+  payload: CheckWatchedPostData | undefined;
+  clients: ScheduledCheckClients;
+  schedulerSource: SchedulerSource;
+}): Promise<void> {
+  const { clients, schedulerSource } = args;
+  const postId = args.postId;
 
   logInfo('Scheduled post check started.', {
     postId,
-    payload: task.data,
+    payload: args.payload,
+    schedulerSource,
   });
 
   if (!postId) {
     logWarn('Scheduled post check ran without a post id.', {
       reason: 'missing_post_id',
+      schedulerSource,
     });
-    return c.json<TaskResponse>({}, 200);
+    return;
   }
 
-  const initialRecord = await loadTrackedPost(postId);
+  const initialRecord = await loadTrackedPost(clients, postId, schedulerSource);
   if (!initialRecord || initialRecord.status !== 'active') {
-    logInfo('Scheduled check exited without action because no active record exists.', {
-      postId,
-      status: initialRecord?.status,
-      reason: initialRecord ? 'record_not_active' : 'record_missing',
-    });
-    return c.json<TaskResponse>({}, 200);
+    logInfo(
+      'Scheduled check exited without action because no active record exists.',
+      {
+        postId,
+        status: initialRecord?.status,
+        reason: initialRecord ? 'record_not_active' : 'record_missing',
+        schedulerSource,
+      }
+    );
+    return;
   }
 
   const now = Date.now();
 
   try {
-    logInfo('Reading app installation settings for scheduled check.', { postId });
-    const currentSettings = normalizeSettings(await devvitSettings.getAll());
+    logInfo('Reading app installation settings for scheduled check.', {
+      postId,
+      schedulerSource,
+    });
+    const currentSettings = normalizeSettings(await clients.settings.getAll());
     logInfo('Loaded app installation settings for scheduled check.', {
       postId,
       isActive: currentSettings.isActive,
@@ -526,11 +654,17 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
       actionToTake: currentSettings.actionToTake,
       moderatorPostHandling: currentSettings.moderatorPostHandling,
+      schedulerSource,
     });
 
-    const fetched = await fetchPostSnapshot(postId);
+    const fetched = await fetchPostSnapshot(clients, schedulerSource, postId);
     const postDataVoteSignals = fetched
-      ? await fetchPostDataVoteSignals(postId)
+      ? await fetchPostDataVoteSignals(
+          clients,
+          schedulerSource,
+          postId,
+          fetched.post
+        )
       : {};
     const currentSnapshot = fetched
       ? enrichSnapshotWithStoredVotes(
@@ -561,6 +695,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         lastKnownScoreAt: initialRecord.lastKnownScoreAt,
         lastExactVoteCountsAt: initialRecord.lastExactVoteCountsAt,
         lastRatioSignalsAt: initialRecord.lastRatioSignalsAt,
+        schedulerSource,
       });
     }
 
@@ -576,8 +711,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         postId,
         status: initialRecord.status,
         reason: 'decision_exit',
+        schedulerSource,
       });
-      return c.json<TaskResponse>({}, 200);
+      return;
     }
 
     if (decision.type === 'stop') {
@@ -593,14 +729,22 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         lastExactVoteCountsAt: initialRecord.lastExactVoteCountsAt,
         lastRatioSignalsAt: initialRecord.lastRatioSignalsAt,
         checkCount: initialRecord.checkCount,
+        schedulerSource,
       });
       await stopTracking(
-        applyScoreSignals(initialRecord, currentSnapshot, negativeDecision, now),
+        clients,
+        applyScoreSignals(
+          initialRecord,
+          currentSnapshot,
+          negativeDecision,
+          now
+        ),
         decision.status,
         now,
+        schedulerSource,
         decision.status
       );
-      return c.json<TaskResponse>({}, 200);
+      return;
     }
 
     if (decision.type === 'action') {
@@ -626,55 +770,94 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         lastExactVoteCountsAt: initialRecord.lastExactVoteCountsAt,
         lastRatioSignalsAt: initialRecord.lastRatioSignalsAt,
         reason: actionReason,
+        schedulerSource,
       });
 
       logInfo('Attempting Redis action lock.', {
         postId,
         actionLockKey: actionLockKey(postId),
+        schedulerSource,
       });
 
-      const actionLockWasSet = await redis.set(actionLockKey(postId), '1', {
-        nx: true,
-        expiration: new Date(now + 60 * 60 * 1000),
-      });
+      const actionLockWasSet = await clients.redis.set(
+        actionLockKey(postId),
+        '1',
+        {
+          nx: true,
+          expiration: new Date(now + 60 * 60 * 1000),
+        }
+      );
 
       if (actionLockWasSet !== 'OK') {
-        logWarn('Action skipped because another check already owns the action lock.', {
+        logWarn(
+          'Action skipped because another check already owns the action lock.',
+          {
+            postId,
+            actionLockResult: actionLockWasSet,
+            schedulerSource,
+          }
+        );
+        const latestRecord = await loadTrackedPost(
+          clients,
           postId,
-          actionLockResult: actionLockWasSet,
-        });
-        const latestRecord = await loadTrackedPost(postId);
+          schedulerSource
+        );
         if (latestRecord?.status === 'active') {
           await scheduleRetryWithoutRecordWrite(
+            clients,
             latestRecord,
             Date.now(),
-            'action_lock_busy'
+            'action_lock_busy',
+            schedulerSource
           );
         }
-        return c.json<TaskResponse>({}, 200);
+        return;
       }
 
       logInfo('Redis action lock acquired.', {
         postId,
         actionLockResult: actionLockWasSet,
+        schedulerSource,
       });
 
-      const latestRecord = await loadTrackedPost(postId);
+      const latestRecord = await loadTrackedPost(
+        clients,
+        postId,
+        schedulerSource
+      );
       if (!latestRecord || latestRecord.status !== 'active' || !fetched) {
-        logWarn('Action skipped after lock because latest record is no longer actionable.', {
+        logWarn(
+          'Action skipped after lock because latest record is no longer actionable.',
+          {
+            postId,
+            latestStatus: latestRecord?.status,
+            hasFetchedPost: Boolean(fetched),
+            schedulerSource,
+          }
+        );
+        await releaseActionLock(
+          clients,
           postId,
-          latestStatus: latestRecord?.status,
-          hasFetchedPost: Boolean(fetched),
-        });
-        await releaseActionLock(postId, 'latest_record_not_actionable');
-        return c.json<TaskResponse>({}, 200);
+          'latest_record_not_actionable',
+          schedulerSource
+        );
+        return;
       }
 
-      await writeTrackedPost({
-        ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision, now),
-        status: 'actioning',
-        updatedAt: now,
-      });
+      await writeTrackedPost(
+        clients,
+        {
+          ...applyScoreSignals(
+            latestRecord,
+            currentSnapshot,
+            negativeDecision,
+            now
+          ),
+          status: 'actioning',
+          updatedAt: now,
+        },
+        schedulerSource
+      );
 
       logInfo('Applying selected moderation action.', {
         postId,
@@ -693,6 +876,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         lastExactVoteCountsAt: latestRecord.lastExactVoteCountsAt,
         lastRatioSignalsAt: latestRecord.lastRatioSignalsAt,
         reason: actionReason,
+        schedulerSource,
       });
 
       let moderationActionResult: ModerationActionResult = {
@@ -706,7 +890,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
           permalink: fetched.post.permalink,
         });
         const moderationActionArgs: ModerationActionArgs = {
-          redditClient: reddit,
+          redditClient: clients.reddit as typeof webReddit,
           post: fetched.post,
           action: latestRecord.actionToTake,
           threshold: latestRecord.negativeScoreThreshold,
@@ -725,22 +909,35 @@ scheduledJobs.post('/check-watched-post', async (c) => {
             subredditName: latestRecord.subredditName,
             postLink,
             subject: REMOVAL_MODMAIL_SUBJECT,
+            schedulerSource,
           });
         }
 
         moderationActionResult =
           await applyModerationAction(moderationActionArgs);
       } catch (err: unknown) {
-        await releaseActionLock(postId, 'moderation_action_failed');
+        await releaseActionLock(
+          clients,
+          postId,
+          'moderation_action_failed',
+          schedulerSource
+        );
         await markErrorAndReschedule(
+          clients,
           {
-            ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision, now),
+            ...applyScoreSignals(
+              latestRecord,
+              currentSnapshot,
+              negativeDecision,
+              now
+            ),
             status: 'active',
           },
           err,
-          Date.now()
+          Date.now(),
+          schedulerSource
         );
-        return c.json<TaskResponse>({}, 200);
+        return;
       }
 
       if (moderationActionResult.modmailStatus === 'sent') {
@@ -749,6 +946,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
           authorName: latestRecord.authorName,
           subredditName: latestRecord.subredditName,
           modmailSentAt: moderationActionResult.modmailSentAt,
+          schedulerSource,
         });
       } else if (moderationActionResult.modmailStatus === 'failed') {
         logError(
@@ -758,6 +956,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
             authorName: latestRecord.authorName,
             subredditName: latestRecord.subredditName,
             modmailErrorMessage: moderationActionResult.modmailErrorMessage,
+            schedulerSource,
           },
           moderationActionResult.modmailError
         );
@@ -767,11 +966,17 @@ scheduledJobs.post('/check-watched-post', async (c) => {
           authorName: latestRecord.authorName,
           subredditName: latestRecord.subredditName,
           reason: moderationActionResult.modmailSkippedReason,
+          schedulerSource,
         });
       }
 
       const actionedRecord: TrackedPost = {
-        ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision, now),
+        ...applyScoreSignals(
+          latestRecord,
+          currentSnapshot,
+          negativeDecision,
+          now
+        ),
         status: 'actioned',
         actionedAt: Date.now(),
       };
@@ -793,12 +998,14 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       }
 
       await stopTracking(
+        clients,
         actionedRecord,
         'actioned',
         Date.now(),
+        schedulerSource,
         latestRecord.actionToTake
       );
-      await redis.hIncrBy(
+      await clients.redis.hIncrBy(
         statsKey(latestRecord.subredditId),
         `action_${latestRecord.actionToTake}`,
         1
@@ -821,9 +1028,10 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         lastRatioSignalsAt: latestRecord.lastRatioSignalsAt,
         auditKey: auditKey(postId),
         status: 'actioned',
+        schedulerSource,
       });
 
-      return c.json<TaskResponse>({}, 200);
+      return;
     }
 
     const nextCheckCount = initialRecord.checkCount + 1;
@@ -847,22 +1055,28 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       nextCheckCount,
       nextDelayMinutes,
       nextRunAt,
+      schedulerSource,
     });
 
-    const jobId = await scheduler.runJob({
+    const jobId = await clients.scheduler.runJob({
       name: CHECK_WATCHED_POST_TASK,
       data: { postId },
       runAt: nextRunAt,
     });
 
     const updatedRecord: TrackedPost = {
-      ...applyScoreSignals(initialRecord, currentSnapshot, negativeDecision, now),
+      ...applyScoreSignals(
+        initialRecord,
+        currentSnapshot,
+        negativeDecision,
+        now
+      ),
       checkCount: nextCheckCount,
       lastJobId: jobId,
       updatedAt: now,
     };
 
-    await writeTrackedPost(updatedRecord);
+    await writeTrackedPost(clients, updatedRecord, schedulerSource);
 
     logInfo('Scheduled next post check.', {
       postId,
@@ -882,10 +1096,29 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       lastKnownScoreAt: updatedRecord.lastKnownScoreAt,
       lastExactVoteCountsAt: updatedRecord.lastExactVoteCountsAt,
       lastRatioSignalsAt: updatedRecord.lastRatioSignalsAt,
+      schedulerSource,
     });
   } catch (err: unknown) {
-    await markErrorAndReschedule(initialRecord, err, Date.now());
+    await markErrorAndReschedule(
+      clients,
+      initialRecord,
+      err,
+      Date.now(),
+      schedulerSource
+    );
   }
+
+  return;
+}
+
+scheduledJobs.post('/check-watched-post', async (c) => {
+  const task = await c.req.json<TaskRequest<CheckWatchedPostData>>();
+  await handleScheduledPostCheck({
+    postId: task.data?.postId,
+    payload: task.data,
+    clients: webScheduledCheckClients,
+    schedulerSource: 'web_endpoint',
+  });
 
   return c.json<TaskResponse>({}, 200);
 });

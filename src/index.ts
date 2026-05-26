@@ -4,6 +4,7 @@ import { createServer, getServerPort } from '@devvit/web/server';
 import { api } from './routes/api';
 import { scheduledJobs } from './routes/scheduler';
 import { triggers } from './routes/triggers';
+import legacyDevvit from './legacy';
 
 const app = new Hono();
 const internal = new Hono();
@@ -19,3 +20,5 @@ serve({
   createServer,
   port: getServerPort(),
 });
+
+export default legacyDevvit;

@@ -1,5 +1,3 @@
-import type { SettingsValues } from '@devvit/web/server';
-
 export const ACTION_REPORT = 'report';
 export const ACTION_FILTER = 'filter';
 export const ACTION_REMOVE = 'remove';
@@ -48,11 +46,12 @@ function selectNumber<T extends number>(
   validValues: readonly T[],
   fallback: T
 ): T {
+  const candidate = Array.isArray(value) ? value[0] : value;
   const normalized =
-    typeof value === 'number'
-      ? value
-      : typeof value === 'string'
-        ? Number(value)
+    typeof candidate === 'number'
+      ? candidate
+      : typeof candidate === 'string'
+        ? Number(candidate)
         : Number.NaN;
 
   return validValues.includes(normalized as T) ? (normalized as T) : fallback;
@@ -63,13 +62,14 @@ function selectString<T extends string>(
   validValues: readonly T[],
   fallback: T
 ): T {
-  return typeof value === 'string' && validValues.includes(value as T)
-    ? (value as T)
+  const candidate = Array.isArray(value) ? value[0] : value;
+  return typeof candidate === 'string' && validValues.includes(candidate as T)
+    ? (candidate as T)
     : fallback;
 }
 
 export function normalizeSettings(
-  values: SettingsValues
+  values: Record<string, unknown>
 ): DownvoteDeleteSettings {
   return {
     isActive:
