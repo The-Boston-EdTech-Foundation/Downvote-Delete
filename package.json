@@ -25,7 +25,7 @@
     "node": ">=22.2.0"
   },
   "dependencies": {
-    "@devvit/start": "0.12.24",
+    "@devvit/start": "0.13.0",
     "@devvit/web": "0.12.24",
     "@hono/node-server": "^1.19.9",
     "hono": "^4.12.18"
