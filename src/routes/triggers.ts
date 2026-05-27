@@ -13,6 +13,7 @@ import { getNextCheckRunAt } from '../core/backoff';
 import { logError, logInfo, logWarn } from '../core/logging';
 import {
   normalizeSettings,
+  summarizeSubredditSettingsShapes,
   type DownvoteDeleteSettings,
 } from '../core/settings';
 import { shouldTrackNewPost } from '../core/decision';
@@ -76,7 +77,8 @@ async function isModeratorPost(args: {
 
 async function readSettings(): Promise<DownvoteDeleteSettings> {
   try {
-    const currentSettings = normalizeSettings(await devvitSettings.getAll());
+    const rawSettings = await devvitSettings.getAll();
+    const currentSettings = normalizeSettings(rawSettings);
     logInfo('Loaded app installation settings.', {
       isActive: currentSettings.isActive,
       trackingDurationHours: currentSettings.trackingDurationHours,
@@ -84,6 +86,7 @@ async function readSettings(): Promise<DownvoteDeleteSettings> {
       positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
       actionToTake: currentSettings.actionToTake,
       moderatorPostHandling: currentSettings.moderatorPostHandling,
+      rawSettingShapes: summarizeSubredditSettingsShapes(rawSettings),
     });
     return currentSettings;
   } catch (err: unknown) {

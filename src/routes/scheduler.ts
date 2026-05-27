@@ -31,7 +31,10 @@ import {
   type OpenAIRatioFetchResult,
 } from '../core/openaiRatio';
 import { postToSnapshot } from '../core/postStatus';
-import { normalizeSettings } from '../core/settings';
+import {
+  normalizeSettings,
+  summarizeSubredditSettingsShapes,
+} from '../core/settings';
 import {
   auditKey,
   createAuditRecord,
@@ -902,6 +905,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
       actionToTake: currentSettings.actionToTake,
       moderatorPostHandling: currentSettings.moderatorPostHandling,
+      rawSettingShapes: summarizeSubredditSettingsShapes(settingsValues),
     });
     activeRecord = refreshTrackedPostActionSettings(
       initialRecord,

@@ -43,16 +43,21 @@ const validModeratorHandling = [
   MODERATOR_ACTION_ALL,
 ] as const;
 
+function firstSelectValue(value: unknown): unknown {
+  return Array.isArray(value) ? value[0] : value;
+}
+
 function selectNumber<T extends number>(
   value: unknown,
   validValues: readonly T[],
   fallback: T
 ): T {
+  const selectedValue = firstSelectValue(value);
   const normalized =
-    typeof value === 'number'
-      ? value
-      : typeof value === 'string'
-        ? Number(value)
+    typeof selectedValue === 'number'
+      ? selectedValue
+      : typeof selectedValue === 'string'
+        ? Number(selectedValue)
         : Number.NaN;
 
   return validValues.includes(normalized as T) ? (normalized as T) : fallback;
@@ -63,9 +68,40 @@ function selectString<T extends string>(
   validValues: readonly T[],
   fallback: T
 ): T {
-  return typeof value === 'string' && validValues.includes(value as T)
-    ? (value as T)
+  const selectedValue = firstSelectValue(value);
+  return typeof selectedValue === 'string' &&
+    validValues.includes(selectedValue as T)
+    ? (selectedValue as T)
     : fallback;
+}
+
+export function summarizeSettingsValueShape(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `array:${value.length}`;
+  }
+
+  return value === undefined ? 'missing' : typeof value;
+}
+
+export function summarizeSubredditSettingsShapes(
+  values: SettingsValues
+): Record<string, string> {
+  return {
+    isActive: summarizeSettingsValueShape(values.isActive),
+    trackingDurationHours: summarizeSettingsValueShape(
+      values.trackingDurationHours
+    ),
+    negativeScoreThreshold: summarizeSettingsValueShape(
+      values.negativeScoreThreshold
+    ),
+    positiveScoreStopThreshold: summarizeSettingsValueShape(
+      values.positiveScoreStopThreshold
+    ),
+    actionToTake: summarizeSettingsValueShape(values.actionToTake),
+    moderatorPostHandling: summarizeSettingsValueShape(
+      values.moderatorPostHandling
+    ),
+  };
 }
 
 export function normalizeSettings(

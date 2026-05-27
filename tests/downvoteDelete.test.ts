@@ -173,6 +173,22 @@ describe('settings normalization', () => {
     }
   );
 
+  test('accepts Devvit single-select array values for numeric settings', () => {
+    expect(
+      normalizeSettings({ trackingDurationHours: ['4'] }).trackingDurationHours
+    ).toBe(4);
+    expect(
+      normalizeSettings({
+        negativeScoreThreshold: ['-1'],
+      }).negativeScoreThreshold
+    ).toBe(-1);
+    expect(
+      normalizeSettings({
+        positiveScoreStopThreshold: ['3'],
+      }).positiveScoreStopThreshold
+    ).toBe(3);
+  });
+
   test.each([1, 3] as const)(
     'keeps legacy tracking duration %s hours for existing installs',
     (trackingDurationHours) => {
@@ -213,6 +229,31 @@ describe('settings normalization', () => {
       ).toBe(-3);
     }
   );
+
+  test('accepts Devvit single-select array values for string settings', () => {
+    expect(normalizeSettings({ actionToTake: ['remove'] }).actionToTake).toBe(
+      ACTION_REMOVE
+    );
+    expect(
+      normalizeSettings({
+        moderatorPostHandling: ['ignore'],
+      }).moderatorPostHandling
+    ).toBe(MODERATOR_IGNORE);
+  });
+
+  test('falls back to -3 for empty negative score threshold arrays', () => {
+    expect(
+      normalizeSettings({ negativeScoreThreshold: [] }).negativeScoreThreshold
+    ).toBe(-3);
+  });
+
+  test('falls back to -3 for invalid negative score threshold arrays', () => {
+    expect(
+      normalizeSettings({
+        negativeScoreThreshold: ['abc'],
+      }).negativeScoreThreshold
+    ).toBe(-3);
+  });
 });
 
 describe('backoff schedule', () => {
