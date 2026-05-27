@@ -6,8 +6,7 @@
     "entry": "index.cjs"
   },
   "triggers": {
-    "onPostSubmit": "/internal/triggers/on-post-submit",
-    "onPostUpdate": "/internal/triggers/on-post-update"
+    "onPostSubmit": "/internal/triggers/on-post-submit"
   },
   "scheduler": {
     "tasks": {

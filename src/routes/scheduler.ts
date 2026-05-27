@@ -43,6 +43,7 @@ import {
   watchKey,
 } from '../core/tracking';
 import {
+  advancedTrackingMaxRatio,
   confidenceModelMaxVotes,
   shouldRemoveByRatio,
   type RatioDecision,
@@ -111,10 +112,6 @@ async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
     checkCount: parsedRecord.checkCount,
     trackingMode: parsedRecord.trackingMode,
     lastKnownScore: parsedRecord.lastKnownScore,
-    lastKnownUpvotes: parsedRecord.lastKnownUpvotes,
-    lastKnownDownvotes: parsedRecord.lastKnownDownvotes,
-    lastKnownUpvoteRatio: parsedRecord.lastKnownUpvoteRatio,
-    lastCalculatedVoteScore: parsedRecord.lastCalculatedVoteScore,
     lastRawUpvoteRatio: parsedRecord.lastRawUpvoteRatio,
     lastRawRatioPercent: parsedRecord.lastRawRatioPercent,
     minimumTotalVotes: parsedRecord.minimumTotalVotes,
@@ -141,10 +138,6 @@ async function writeTrackedPost(record: TrackedPost): Promise<void> {
     checkCount: record.checkCount,
     trackingMode: record.trackingMode,
     lastKnownScore: record.lastKnownScore,
-    lastKnownUpvotes: record.lastKnownUpvotes,
-    lastKnownDownvotes: record.lastKnownDownvotes,
-    lastKnownUpvoteRatio: record.lastKnownUpvoteRatio,
-    lastCalculatedVoteScore: record.lastCalculatedVoteScore,
     lastRawUpvoteRatio: record.lastRawUpvoteRatio,
     lastRawRatioPercent: record.lastRawRatioPercent,
     minimumTotalVotes: record.minimumTotalVotes,
@@ -192,10 +185,6 @@ async function stopTracking(
     checkCount: record.checkCount,
     trackingMode: record.trackingMode,
     lastKnownScore: record.lastKnownScore,
-    lastKnownUpvotes: record.lastKnownUpvotes,
-    lastKnownDownvotes: record.lastKnownDownvotes,
-    lastKnownUpvoteRatio: record.lastKnownUpvoteRatio,
-    lastCalculatedVoteScore: record.lastCalculatedVoteScore,
     lastRawUpvoteRatio: record.lastRawUpvoteRatio,
     lastRawRatioPercent: record.lastRawRatioPercent,
     minimumTotalVotes: record.minimumTotalVotes,
@@ -248,29 +237,6 @@ async function fetchPostSnapshot(
   }
 }
 
-function enrichSnapshotWithStoredVotes(
-  snapshot: PostSnapshot,
-  record: TrackedPost
-): PostSnapshot {
-  const enrichedSnapshot: PostSnapshot = {
-    ...snapshot,
-  };
-
-  if (typeof record.lastKnownUpvotes === 'number') {
-    enrichedSnapshot.upvotes = record.lastKnownUpvotes;
-  }
-
-  if (typeof record.lastKnownDownvotes === 'number') {
-    enrichedSnapshot.downvotes = record.lastKnownDownvotes;
-  }
-
-  if (typeof record.lastCalculatedVoteScore === 'number') {
-    enrichedSnapshot.calculatedVoteScore = record.lastCalculatedVoteScore;
-  }
-
-  return enrichedSnapshot;
-}
-
 function applyScoreSignals(
   record: TrackedPost,
   snapshot: PostSnapshot | null | undefined,
@@ -280,20 +246,6 @@ function applyScoreSignals(
 
   if (snapshot) {
     updatedRecord.lastKnownScore = snapshot.score;
-
-    if (typeof snapshot.upvotes === 'number') {
-      updatedRecord.lastKnownUpvotes = snapshot.upvotes;
-    }
-
-    if (typeof snapshot.downvotes === 'number') {
-      updatedRecord.lastKnownDownvotes = snapshot.downvotes;
-    }
-
-  }
-
-  if (typeof negativeDecision?.calculatedVoteScore === 'number') {
-    updatedRecord.lastCalculatedVoteScore =
-      negativeDecision.calculatedVoteScore;
   }
 
   if (typeof negativeDecision?.score === 'number') {
@@ -311,6 +263,16 @@ function readOpenAIApiKey(settingsValues: { openaiApiKey?: unknown }): string {
 
 function shouldUseAdvancedTracking(snapshot: PostSnapshot | null): boolean {
   return Boolean(snapshot && snapshot.score <= 0);
+}
+
+function clearFreshRatioDecision(
+  record: TrackedPost,
+  reason: 'invalid_ratio' | 'no_possible_states_after_filter'
+): void {
+  record.lastRatioDecision = 'none';
+  record.lastRatioDecisionReason = reason;
+  record.guaranteedSpread = null;
+  record.possibleStates = [];
 }
 
 async function fetchAndLogRawRatio(args: {
@@ -377,45 +339,48 @@ function applyOpenAIRatioResult(
     updatedRecord.enteredAdvancedTrackingAt = now;
   }
 
+  if (!result.fields || typeof result.fields.upvoteRatio !== 'number') {
+    clearFreshRatioDecision(updatedRecord, 'invalid_ratio');
+  } else {
+    updatedRecord.lastRawUpvoteRatio = result.fields.upvoteRatio;
+
+    const ratioDecision = shouldRemoveByRatio({
+      ratio: result.fields.upvoteRatio,
+      moderatorThreshold,
+      minimumTotalVotes: record.minimumTotalVotes ?? 0,
+    });
+
+    updatedRecord.minimumTotalVotes = ratioDecision.updatedMinimumTotalVotes;
+    updatedRecord.maximumTotalVotesCap = confidenceModelMaxVotes;
+    updatedRecord.guaranteedSpread = ratioDecision.guaranteedSpread;
+    updatedRecord.possibleStates = ratioDecision.possibleStates;
+    updatedRecord.consecutiveNegativeChecks =
+      Number.isFinite(result.fields.upvoteRatio) &&
+      result.fields.upvoteRatio <= advancedTrackingMaxRatio
+        ? (record.consecutiveNegativeChecks ?? 0) + 1
+        : 0;
+    updatedRecord.lastRatioDecision = ratioDecision.remove
+      ? 'remove'
+      : Number.isFinite(result.fields.upvoteRatio) &&
+          result.fields.upvoteRatio <= advancedTrackingMaxRatio
+        ? 'watch'
+        : 'none';
+    updatedRecord.lastRatioDecisionReason = ratioDecision.reason;
+
+    logInfo('Advanced vote tracking updated ratio confidence.', {
+      postId: record.postId,
+      ratio: result.fields.upvoteRatio,
+      latestScore,
+      minimumTotalVotes: updatedRecord.minimumTotalVotes,
+      guaranteedSpread: updatedRecord.guaranteedSpread,
+      threshold: moderatorThreshold,
+      decision: updatedRecord.lastRatioDecision,
+      reason: updatedRecord.lastRatioDecisionReason,
+      possibleStateCount: ratioDecision.possibleStates.length,
+    });
+  }
+
   if (result.fields) {
-    if (typeof result.fields.upvoteRatio === 'number') {
-      updatedRecord.lastRawUpvoteRatio = result.fields.upvoteRatio;
-
-      const ratioDecision = shouldRemoveByRatio({
-        ratio: result.fields.upvoteRatio,
-        moderatorThreshold,
-        minimumTotalVotes: record.minimumTotalVotes ?? 0,
-      });
-
-      updatedRecord.minimumTotalVotes =
-        ratioDecision.updatedMinimumTotalVotes;
-      updatedRecord.maximumTotalVotesCap = confidenceModelMaxVotes;
-      updatedRecord.guaranteedSpread = ratioDecision.guaranteedSpread;
-      updatedRecord.possibleStates = ratioDecision.possibleStates;
-      updatedRecord.consecutiveNegativeChecks =
-        result.fields.upvoteRatio <= 0.4
-          ? (record.consecutiveNegativeChecks ?? 0) + 1
-          : 0;
-      updatedRecord.lastRatioDecision = ratioDecision.remove
-        ? 'remove'
-        : result.fields.upvoteRatio <= 0.4
-          ? 'watch'
-          : 'none';
-      updatedRecord.lastRatioDecisionReason = ratioDecision.reason;
-
-      logInfo('Advanced vote tracking updated ratio confidence.', {
-        postId: record.postId,
-        ratio: result.fields.upvoteRatio,
-        latestScore,
-        minimumTotalVotes: updatedRecord.minimumTotalVotes,
-        guaranteedSpread: updatedRecord.guaranteedSpread,
-        threshold: moderatorThreshold,
-        decision: updatedRecord.lastRatioDecision,
-        reason: updatedRecord.lastRatioDecisionReason,
-        possibleStateCount: ratioDecision.possibleStates.length,
-      });
-    }
-
     if (result.fields.ratioPercent !== 'missing') {
       updatedRecord.lastRawRatioPercent = result.fields.ratioPercent;
     }
@@ -434,6 +399,117 @@ function applyOpenAIRatioResult(
   }
 
   return updatedRecord;
+}
+
+function mergeFreshActionFields(
+  latestRecord: TrackedPost,
+  recordForAction: TrackedPost
+): TrackedPost {
+  const actionRecord: TrackedPost = {
+    ...latestRecord,
+    status: latestRecord.status,
+  };
+
+  if (recordForAction.trackingMode) {
+    actionRecord.trackingMode = recordForAction.trackingMode;
+  }
+
+  if (typeof recordForAction.lastKnownScore === 'number') {
+    actionRecord.lastKnownScore = recordForAction.lastKnownScore;
+  }
+
+  if (typeof recordForAction.negativeDecisionScore === 'number') {
+    actionRecord.negativeDecisionScore = recordForAction.negativeDecisionScore;
+  }
+
+  if (recordForAction.negativeDecisionSource) {
+    actionRecord.negativeDecisionSource =
+      recordForAction.negativeDecisionSource;
+  }
+
+  if (typeof recordForAction.advancedTrackingStartedAt === 'number') {
+    actionRecord.advancedTrackingStartedAt =
+      recordForAction.advancedTrackingStartedAt;
+  }
+
+  if (typeof recordForAction.lastOpenAIRatioCheckAt === 'number') {
+    actionRecord.lastOpenAIRatioCheckAt =
+      recordForAction.lastOpenAIRatioCheckAt;
+  }
+
+  if (typeof recordForAction.lastOpenAIRequestedUrl === 'string') {
+    actionRecord.lastOpenAIRequestedUrl =
+      recordForAction.lastOpenAIRequestedUrl;
+  }
+
+  if (typeof recordForAction.lastOpenAIRetrievedUrl === 'string') {
+    actionRecord.lastOpenAIRetrievedUrl =
+      recordForAction.lastOpenAIRetrievedUrl;
+  }
+
+  if (typeof recordForAction.lastOpenAIJsonReceived === 'boolean') {
+    actionRecord.lastOpenAIJsonReceived =
+      recordForAction.lastOpenAIJsonReceived;
+  }
+
+  if (typeof recordForAction.lastOpenAIError === 'string') {
+    actionRecord.lastOpenAIError = recordForAction.lastOpenAIError;
+  }
+
+  if (typeof recordForAction.lastRawUpvoteRatio === 'number') {
+    actionRecord.lastRawUpvoteRatio = recordForAction.lastRawUpvoteRatio;
+  }
+
+  if (typeof recordForAction.lastRawRatioPercent === 'string') {
+    actionRecord.lastRawRatioPercent = recordForAction.lastRawRatioPercent;
+  }
+
+  if (typeof recordForAction.lastRawJsonScore === 'number') {
+    actionRecord.lastRawJsonScore = recordForAction.lastRawJsonScore;
+  }
+
+  if (typeof recordForAction.lastRawJsonUps === 'number') {
+    actionRecord.lastRawJsonUps = recordForAction.lastRawJsonUps;
+  }
+
+  if (typeof recordForAction.lastRawJsonDowns === 'number') {
+    actionRecord.lastRawJsonDowns = recordForAction.lastRawJsonDowns;
+  }
+
+  if (typeof recordForAction.minimumTotalVotes === 'number') {
+    actionRecord.minimumTotalVotes = recordForAction.minimumTotalVotes;
+  }
+
+  if (typeof recordForAction.maximumTotalVotesCap === 'number') {
+    actionRecord.maximumTotalVotesCap = recordForAction.maximumTotalVotesCap;
+  }
+
+  actionRecord.guaranteedSpread = recordForAction.guaranteedSpread ?? null;
+
+  if (recordForAction.possibleStates) {
+    actionRecord.possibleStates = recordForAction.possibleStates;
+  }
+
+  if (typeof recordForAction.enteredAdvancedTrackingAt === 'number') {
+    actionRecord.enteredAdvancedTrackingAt =
+      recordForAction.enteredAdvancedTrackingAt;
+  }
+
+  if (typeof recordForAction.consecutiveNegativeChecks === 'number') {
+    actionRecord.consecutiveNegativeChecks =
+      recordForAction.consecutiveNegativeChecks;
+  }
+
+  if (recordForAction.lastRatioDecision) {
+    actionRecord.lastRatioDecision = recordForAction.lastRatioDecision;
+  }
+
+  if (recordForAction.lastRatioDecisionReason) {
+    actionRecord.lastRatioDecisionReason =
+      recordForAction.lastRatioDecisionReason;
+  }
+
+  return actionRecord;
 }
 
 function getRatioDecision(record: TrackedPost): RatioDecision | undefined {
@@ -618,11 +694,10 @@ async function actionTrackedPost(args: {
     return;
   }
 
-  const actionRecord: TrackedPost = {
-    ...latestRecord,
-    ...args.recordForAction,
-    status: latestRecord.status,
-  };
+  const actionRecord = mergeFreshActionFields(
+    latestRecord,
+    args.recordForAction
+  );
 
   await writeTrackedPost({
     ...applyScoreSignals(actionRecord, args.currentSnapshot, args.negativeDecision),
@@ -819,9 +894,21 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     });
 
     const fetched = await fetchPostSnapshot(postId);
-    const currentSnapshot = fetched
-      ? enrichSnapshotWithStoredVotes(fetched.snapshot, initialRecord)
-      : null;
+    if (!fetched) {
+      logWarn('Decision: retry because Reddit post fetch failed.', {
+        postId,
+        reason: 'fetch_failed_retrying',
+        checkCount: initialRecord.checkCount,
+      });
+      await markErrorAndReschedule(
+        initialRecord,
+        new Error('fetch_failed_retrying'),
+        now
+      );
+      return c.json<TaskResponse>({}, 200);
+    }
+
+    const currentSnapshot = fetched ? fetched.snapshot : null;
     const negativeDecision = currentSnapshot
       ? getNegativeDecisionScore(currentSnapshot)
       : undefined;
@@ -830,8 +917,6 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       logInfo('Computed negative decision score for scheduled check.', {
         postId,
         fetchedScore: currentSnapshot.score,
-        storedUpvotes: currentSnapshot.upvotes,
-        storedDownvotes: currentSnapshot.downvotes,
         calculatedVoteScore: negativeDecision.calculatedVoteScore,
         negativeDecisionScore: negativeDecision.score,
         negativeDecisionSource: negativeDecision.source,
@@ -855,10 +940,16 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     }
 
     if (decision.type === 'stop') {
+      const stopLogReason =
+        decision.status === 'stopped_invalid'
+          ? 'post_invalid_stopping'
+          : decision.status === 'stopped_removed'
+            ? 'post_removed_or_spam_stopping'
+            : decision.status;
       logInfo('Decision: stop tracking.', {
         postId,
         status: decision.status,
-        reason: decision.status,
+        reason: stopLogReason,
         score: currentSnapshot?.score,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
@@ -882,8 +973,6 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       logInfo('Decision: action post because score reached threshold.', {
         postId,
         score: currentSnapshot?.score,
-        upvotes: currentSnapshot?.upvotes,
-        downvotes: currentSnapshot?.downvotes,
         calculatedVoteScore: negativeDecision?.calculatedVoteScore,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
@@ -974,8 +1063,6 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     logInfo('Decision: reschedule because no terminal condition was met.', {
       postId,
       score: currentSnapshot?.score,
-      upvotes: currentSnapshot?.upvotes,
-      downvotes: currentSnapshot?.downvotes,
       calculatedVoteScore: negativeDecision?.calculatedVoteScore,
       negativeDecisionScore: negativeDecision?.score,
       negativeDecisionSource: negativeDecision?.source,
@@ -1013,10 +1100,6 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       nextRunAt,
       trackingMode: updatedRecord.trackingMode,
       score: updatedRecord.lastKnownScore,
-      upvotes: updatedRecord.lastKnownUpvotes,
-      downvotes: updatedRecord.lastKnownDownvotes,
-      triggerUpvoteRatio: updatedRecord.lastKnownUpvoteRatio,
-      calculatedVoteScore: updatedRecord.lastCalculatedVoteScore,
       rawUpvoteRatio: updatedRecord.lastRawUpvoteRatio,
       rawRatioPercent: updatedRecord.lastRawRatioPercent,
       openAIJsonReceived: updatedRecord.lastOpenAIJsonReceived,

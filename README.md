@@ -10,6 +10,7 @@ Downvote Delete can:
 
 - Watch new posts for 2, 4, or 6 hours.
 - Detect when a post reaches negative scores (-3, -5, or -10).
+- Use Reddit's reported voting signals to conservatively detect severe downvote pressure.
 - Stops watching posts that grow positively (+3, +5 or +10).
 - Ignore manually approved posts.
 - Stop tracking posts that are already removed, filtered, spammed, deleted, or unavailable.
@@ -28,6 +29,6 @@ Downvote Delete will not:
 
 ## Patch Notes
 
-1.2.1 - Use of Reddit API for upvote ratio tracking. Devvit 0.13.0
+1.2.1 - Adds conservative reported upvote-ratio tracking. Devvit 0.13.0
 1.1.1 - Default tracking now 4 hours. Tracking changed to 2, 4, 6 hours. Improved downvote tracking.
 1.0.5 - Initial Public Release. Devvit 0.12.24

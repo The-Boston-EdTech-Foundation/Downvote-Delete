@@ -19,8 +19,10 @@ import {
   parseOpenAIRedditJsonResponse,
 } from '../src/core/openaiRatio';
 import {
+  advancedTrackingMaxRatio,
   buildRatioLookup,
   evaluateRatioState,
+  severeDownvoteRatioThreshold,
   shouldRemoveByRatio,
   updateTrackedPostVoteState,
   type TrackedPostVoteState,
@@ -35,7 +37,6 @@ import {
   type DownvoteDeleteSettings,
 } from '../src/core/settings';
 import {
-  applyActiveTrackingVoteSignalUpdate,
   type TrackedPost,
 } from '../src/core/tracking';
 
@@ -296,6 +297,40 @@ describe('OpenAI Reddit JSON ratio parsing', () => {
 
 describe('vote ratio confidence model', () => {
   const lookup = buildRatioLookup(30);
+
+  test('exports named ratio thresholds', () => {
+    expect(severeDownvoteRatioThreshold).toBe(0.24);
+    expect(advancedTrackingMaxRatio).toBe(0.4);
+  });
+
+  test('invalid ratio does not remove', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: Number.NaN,
+        moderatorThreshold: -1,
+        minimumTotalVotes: 12,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: false,
+      reason: 'invalid_ratio',
+      guaranteedSpread: null,
+      updatedMinimumTotalVotes: 12,
+      possibleStates: [],
+    });
+
+    expect(
+      shouldRemoveByRatio({
+        ratio: Number.POSITIVE_INFINITY,
+        moderatorThreshold: -1,
+        minimumTotalVotes: 12,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: false,
+      reason: 'invalid_ratio',
+    });
+  });
 
   test('ratio <= 0.24 always removes', () => {
     expect(
@@ -713,6 +748,20 @@ describe('tracked post decisions', () => {
     ).toEqual({ type: 'stop', status: 'stopped_expired' });
   });
 
+  test('expired posts do not action even when score reaches threshold', () => {
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({
+          trackingExpiresAt: now,
+          negativeScoreThreshold: -3,
+        }),
+        settings: activeSettings,
+        post: postSnapshot({ score: -10 }),
+        now,
+      })
+    ).toEqual({ type: 'stop', status: 'stopped_expired' });
+  });
+
   test('approved posts stop without action', () => {
     expect(
       decideTrackedPostCheck({
@@ -792,77 +841,6 @@ describe('moderator handling', () => {
         isModeratorPost: true,
       })
     ).toBe(true);
-  });
-});
-
-describe('tracking vote signal updates', () => {
-  test('updates vote signal fields for active tracked posts', () => {
-    expect(
-      applyActiveTrackingVoteSignalUpdate(
-        trackedPost({
-          lastKnownScore: 0,
-          lastKnownUpvotes: 2,
-          lastKnownDownvotes: 1,
-          lastCalculatedVoteScore: 1,
-        }),
-        {
-          score: -1,
-          upvotes: 1,
-          downvotes: 4,
-          calculatedVoteScore: -3,
-        },
-        now + 1_000
-      )
-    ).toMatchObject({
-      status: 'active',
-      lastKnownScore: -1,
-      lastKnownUpvotes: 1,
-      lastKnownDownvotes: 4,
-      lastCalculatedVoteScore: -3,
-      updatedAt: now + 1_000,
-      negativeScoreThreshold: -3,
-      positiveScoreStopThreshold: 5,
-    });
-  });
-
-  test.each([
-    'actioning',
-    'actioned',
-    'stopped_positive',
-    'stopped_expired',
-    'stopped_approved',
-    'stopped_invalid',
-    'stopped_removed',
-    'stopped_inactive',
-    'error',
-  ] as const)('refuses to update %s tracked posts', (status) => {
-    expect(
-      applyActiveTrackingVoteSignalUpdate(
-        trackedPost({ status }),
-        {
-          score: -3,
-          upvotes: 1,
-          downvotes: 4,
-          calculatedVoteScore: -3,
-        },
-        now + 1_000
-      )
-    ).toBeNull();
-  });
-
-  test('refuses to update missing records', () => {
-    expect(
-      applyActiveTrackingVoteSignalUpdate(
-        null,
-        {
-          score: -3,
-          upvotes: 1,
-          downvotes: 4,
-          calculatedVoteScore: -3,
-        },
-        now + 1_000
-      )
-    ).toBeNull();
   });
 });
 

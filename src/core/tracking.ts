@@ -80,15 +80,6 @@ export type AuditRecord = TrackedPost & {
   auditedAt: number;
 };
 
-export type TrackingVoteSignalUpdate = {
-  score?: number;
-  upvotes?: number;
-  downvotes?: number;
-  upvoteRatio?: number;
-  postDataUps?: number;
-  calculatedVoteScore?: number;
-};
-
 export const watchKey = (postId: string): string =>
   `downvote-delete:watch:${postId}`;
 
@@ -119,45 +110,4 @@ export function createAuditRecord(record: TrackedPost, now: number): AuditRecord
     ...record,
     auditedAt: now,
   };
-}
-
-export function applyActiveTrackingVoteSignalUpdate(
-  record: TrackedPost | null,
-  update: TrackingVoteSignalUpdate,
-  now: number
-): TrackedPost | null {
-  if (!record || record.status !== 'active') {
-    return null;
-  }
-
-  const updatedRecord: TrackedPost = {
-    ...record,
-    updatedAt: now,
-  };
-
-  if (typeof update.score === 'number') {
-    updatedRecord.lastKnownScore = update.score;
-  }
-
-  if (typeof update.upvotes === 'number') {
-    updatedRecord.lastKnownUpvotes = update.upvotes;
-  }
-
-  if (typeof update.downvotes === 'number') {
-    updatedRecord.lastKnownDownvotes = update.downvotes;
-  }
-
-  if (typeof update.upvoteRatio === 'number') {
-    updatedRecord.lastKnownUpvoteRatio = update.upvoteRatio;
-  }
-
-  if (typeof update.postDataUps === 'number') {
-    updatedRecord.lastKnownPostDataUps = update.postDataUps;
-  }
-
-  if (typeof update.calculatedVoteScore === 'number') {
-    updatedRecord.lastCalculatedVoteScore = update.calculatedVoteScore;
-  }
-
-  return updatedRecord;
 }

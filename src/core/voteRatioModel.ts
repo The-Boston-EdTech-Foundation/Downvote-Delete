@@ -1,4 +1,6 @@
 export const confidenceModelMaxVotes = 30;
+export const severeDownvoteRatioThreshold = 0.24;
+export const advancedTrackingMaxRatio = 0.4;
 
 export type VoteState = {
   upvotes: number;
@@ -16,6 +18,7 @@ export type RatioEvaluation = {
 };
 
 export type RatioDecisionReason =
+  | 'invalid_ratio'
   | 'severe_downvote_ratio'
   | 'ratio_above_tracking_range'
   | 'guaranteed_spread_threshold_met'
@@ -100,6 +103,15 @@ export function evaluateRatioState(params: {
   minimumTotalVotes: number;
   lookup?: Map<number, VoteState[]>;
 }): RatioEvaluation {
+  if (!Number.isFinite(params.ratio)) {
+    return {
+      possibleStates: [],
+      updatedMinimumTotalVotes: params.minimumTotalVotes,
+      guaranteedSpread: null,
+      canAction: false,
+    };
+  }
+
   const lookup = params.lookup ?? defaultRatioLookup;
   const rawStates = getPossibleVoteStates(params.ratio, lookup);
   const possibleStates = rawStates.filter(
@@ -140,9 +152,19 @@ export function shouldRemoveByRatio(params: {
   minimumTotalVotes: number;
   lookup?: Map<number, VoteState[]>;
 }): RatioDecision {
+  if (!Number.isFinite(params.ratio)) {
+    return {
+      remove: false,
+      reason: 'invalid_ratio',
+      updatedMinimumTotalVotes: params.minimumTotalVotes,
+      guaranteedSpread: null,
+      possibleStates: [],
+    };
+  }
+
   const ratio = roundRatioToTwoDecimals(params.ratio);
 
-  if (ratio <= 0.24) {
+  if (ratio <= severeDownvoteRatioThreshold) {
     return {
       remove: true,
       reason: 'severe_downvote_ratio',
@@ -152,7 +174,7 @@ export function shouldRemoveByRatio(params: {
     };
   }
 
-  if (ratio > 0.4) {
+  if (ratio > advancedTrackingMaxRatio) {
     return {
       remove: false,
       reason: 'ratio_above_tracking_range',
@@ -206,7 +228,10 @@ export function updateTrackedPostVoteState(params: {
   });
   const normalizedRatio = roundRatioToTwoDecimals(params.ratio);
   const negativeCheck =
-    normalizedRatio <= 0.4 && decision.reason !== 'ratio_above_tracking_range';
+    Number.isFinite(params.ratio) &&
+    normalizedRatio <= advancedTrackingMaxRatio &&
+    decision.reason !== 'ratio_above_tracking_range' &&
+    decision.reason !== 'invalid_ratio';
 
   return {
     ...params.state,

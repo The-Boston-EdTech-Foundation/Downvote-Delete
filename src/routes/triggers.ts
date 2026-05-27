@@ -1,7 +1,6 @@
 import { Hono } from 'hono';
 import type {
   OnPostSubmitRequest,
-  OnPostUpdateRequest,
   TriggerResponse,
 } from '@devvit/web/shared';
 import {
@@ -16,14 +15,11 @@ import {
   normalizeSettings,
   type DownvoteDeleteSettings,
 } from '../core/settings';
-import { calculateVoteScore, shouldTrackNewPost } from '../core/decision';
+import { shouldTrackNewPost } from '../core/decision';
 import {
-  applyActiveTrackingVoteSignalUpdate,
-  parseTrackedPost,
   serializeTrackedPost,
   statsKey,
   type TrackedPost,
-  type TrackingVoteSignalUpdate,
   watchKey,
 } from '../core/tracking';
 
@@ -37,104 +33,6 @@ function getPostId(input: OnPostSubmitRequest): string | undefined {
 
 function getPostCreatedAt(input: OnPostSubmitRequest, now: number): number {
   return input.post?.createdAt ? input.post.createdAt * 1000 : now;
-}
-
-function getRuntimeNumberField(
-  source: object | undefined,
-  fieldName: string
-): number | undefined {
-  if (!source) {
-    return undefined;
-  }
-
-  const value = (source as Record<string, unknown>)[fieldName];
-  return typeof value === 'number' && Number.isFinite(value)
-    ? value
-    : undefined;
-}
-
-function getPostVoteCounts(post: { upvotes?: number; downvotes?: number }) {
-  const voteCounts: {
-    upvotes?: number;
-    downvotes?: number;
-    calculatedVoteScore?: number;
-  } = {};
-
-  if (typeof post.upvotes === 'number') {
-    voteCounts.upvotes = post.upvotes;
-  }
-
-  if (typeof post.downvotes === 'number') {
-    voteCounts.downvotes = post.downvotes;
-  }
-
-  const calculatedVoteScore = calculateVoteScore(voteCounts);
-  if (typeof calculatedVoteScore === 'number') {
-    voteCounts.calculatedVoteScore = calculatedVoteScore;
-  }
-
-  return voteCounts;
-}
-
-function getPostVoteSignalUpdate(post: {
-  score?: number;
-  upvotes?: number;
-  downvotes?: number;
-} & object): TrackingVoteSignalUpdate {
-  const voteCounts = getPostVoteCounts(post);
-  const update: TrackingVoteSignalUpdate = {
-    ...voteCounts,
-  };
-
-  if (typeof post.score === 'number') {
-    update.score = post.score;
-  }
-
-  const upvoteRatio = getRuntimeNumberField(post, 'upvoteRatio');
-  if (typeof upvoteRatio === 'number') {
-    update.upvoteRatio = upvoteRatio;
-  }
-
-  return update;
-}
-
-async function loadTrackedPostForTrigger(
-  postId: string
-): Promise<TrackedPost | null> {
-  const redisKey = watchKey(postId);
-  logInfo('Pulling tracking record from Redis for trigger update.', {
-    postId,
-    redisKey,
-  });
-
-  const rawRecord = await redis.get(redisKey);
-  const parsedRecord = parseTrackedPost(rawRecord);
-
-  if (!rawRecord) {
-    logInfo('No active tracking record found for trigger update.', {
-      postId,
-      redisKey,
-    });
-    return null;
-  }
-
-  if (!parsedRecord) {
-    logError('Tracking record for trigger update is malformed.', {
-      postId,
-      redisKey,
-      rawLength: rawRecord.length,
-    });
-    return null;
-  }
-
-  logInfo('Loaded tracking record for trigger update.', {
-    postId,
-    redisKey,
-    status: parsedRecord.status,
-    checkCount: parsedRecord.checkCount,
-  });
-
-  return parsedRecord;
 }
 
 async function isModeratorPost(args: {
@@ -201,10 +99,6 @@ triggers.post('/on-post-submit', async (c) => {
     const subredditId = input.subreddit?.id;
     const subredditName = input.subreddit?.name;
     const authorName = input.author?.name;
-    const initialUpvoteRatio = getRuntimeNumberField(
-      input.post,
-      'upvoteRatio'
-    );
 
     logInfo('Received new post submit trigger.', {
       postId,
@@ -212,9 +106,6 @@ triggers.post('/on-post-submit', async (c) => {
       subredditName,
       authorName,
       initialScore: input.post?.score,
-      upvotes: input.post?.upvotes,
-      downvotes: input.post?.downvotes,
-      upvoteRatio: initialUpvoteRatio,
     });
 
     const currentSettings = await readSettings();
@@ -289,26 +180,6 @@ triggers.post('/on-post-submit', async (c) => {
       record.lastKnownScore = input.post.score;
     }
 
-    if (input.post) {
-      const voteCounts = getPostVoteCounts(input.post);
-
-      if (typeof voteCounts.upvotes === 'number') {
-        record.lastKnownUpvotes = voteCounts.upvotes;
-      }
-
-      if (typeof voteCounts.downvotes === 'number') {
-        record.lastKnownDownvotes = voteCounts.downvotes;
-      }
-
-      if (typeof voteCounts.calculatedVoteScore === 'number') {
-        record.lastCalculatedVoteScore = voteCounts.calculatedVoteScore;
-      }
-
-      if (typeof initialUpvoteRatio === 'number') {
-        record.lastKnownUpvoteRatio = initialUpvoteRatio;
-      }
-    }
-
     const redisKey = watchKey(postId);
     logInfo('Writing initial tracking record to Redis.', {
       postId,
@@ -317,10 +188,6 @@ triggers.post('/on-post-submit', async (c) => {
       redisKey,
       checkCount: record.checkCount,
       initialScore: record.lastKnownScore,
-      upvotes: record.lastKnownUpvotes,
-      downvotes: record.lastKnownDownvotes,
-      upvoteRatio: record.lastKnownUpvoteRatio,
-      calculatedVoteScore: record.lastCalculatedVoteScore,
       expiresAt: new Date(record.trackingExpiresAt),
       negativeScoreThreshold: record.negativeScoreThreshold,
       positiveScoreStopThreshold: record.positiveScoreStopThreshold,
@@ -350,96 +217,10 @@ triggers.post('/on-post-submit', async (c) => {
       jobId,
       firstRunAt,
       initialScore: record.lastKnownScore,
-      upvotes: record.lastKnownUpvotes,
-      downvotes: record.lastKnownDownvotes,
-      upvoteRatio: record.lastKnownUpvoteRatio,
-      calculatedVoteScore: record.lastCalculatedVoteScore,
       expiresAt: new Date(record.trackingExpiresAt),
     });
   } catch (err: unknown) {
     logError('Failed to process post submit trigger.', undefined, err);
-  }
-
-  return c.json<TriggerResponse>({}, 200);
-});
-
-triggers.post('/on-post-update', async (c) => {
-  try {
-    const input = await c.req.json<OnPostUpdateRequest>();
-    const postId = input.post?.id;
-    const upvoteRatio = getRuntimeNumberField(input.post, 'upvoteRatio');
-
-    logInfo('Received post update trigger.', {
-      postId,
-      subredditId: input.subreddit?.id,
-      authorName: input.author?.name,
-      score: input.post?.score,
-      upvotes: input.post?.upvotes,
-      downvotes: input.post?.downvotes,
-      upvoteRatio,
-    });
-
-    if (!postId || !input.post) {
-      logWarn('Skipping post update because trigger data is incomplete.', {
-        postId,
-        reason: 'missing_update_data',
-      });
-      return c.json<TriggerResponse>({}, 200);
-    }
-
-    const existingRecord = await loadTrackedPostForTrigger(postId);
-    if (!existingRecord || existingRecord.status !== 'active') {
-      logInfo('Post update did not update tracking because no active record exists.', {
-        postId,
-        status: existingRecord?.status,
-        reason: existingRecord ? 'record_not_active' : 'record_missing',
-      });
-      return c.json<TriggerResponse>({}, 200);
-    }
-
-    const voteSignalUpdate = getPostVoteSignalUpdate(input.post);
-    const updatedRecord = applyActiveTrackingVoteSignalUpdate(
-      existingRecord,
-      voteSignalUpdate,
-      Date.now()
-    );
-
-    if (!updatedRecord) {
-      logInfo('Post update did not update tracking because record is no longer active.', {
-        postId,
-        status: existingRecord.status,
-        reason: 'record_not_active_before_write',
-      });
-      return c.json<TriggerResponse>({}, 200);
-    }
-
-    const writeResult = await redis.set(
-      watchKey(postId),
-      serializeTrackedPost(updatedRecord),
-      { xx: true }
-    );
-
-    if (writeResult !== 'OK') {
-      logWarn('Post update vote-count write skipped because watch key no longer exists.', {
-        postId,
-        redisKey: watchKey(postId),
-        writeResult,
-        reason: 'watch_key_missing_before_write',
-      });
-      return c.json<TriggerResponse>({}, 200);
-    }
-
-    logInfo('Updated tracked post vote counts from post update trigger.', {
-      postId,
-      redisKey: watchKey(postId),
-      score: updatedRecord.lastKnownScore,
-      upvotes: updatedRecord.lastKnownUpvotes,
-      downvotes: updatedRecord.lastKnownDownvotes,
-      upvoteRatio: updatedRecord.lastKnownUpvoteRatio,
-      calculatedVoteScore: updatedRecord.lastCalculatedVoteScore,
-    });
-  } catch (err: unknown) {
-    logError('Failed to process post update trigger.', undefined, err);
   }
 
   return c.json<TriggerResponse>({}, 200);

@@ -119,12 +119,12 @@ export function decideTrackedPostCheck(args: {
     return { type: 'stop', status: 'stopped_positive' };
   }
 
-  if (getNegativeDecisionScore(post).score <= tracking.negativeScoreThreshold) {
-    return { type: 'action' };
-  }
-
   if (now >= tracking.trackingExpiresAt) {
     return { type: 'stop', status: 'stopped_expired' };
+  }
+
+  if (getNegativeDecisionScore(post).score <= tracking.negativeScoreThreshold) {
+    return { type: 'action' };
   }
 
   return { type: 'reschedule' };
