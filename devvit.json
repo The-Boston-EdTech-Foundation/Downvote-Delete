@@ -90,7 +90,7 @@
     "dev": "vite build --watch"
   },
   "marketingAssets": {
-    "icon": "assets/icon.jpg"
+    "icon": "assets/icon.png"
   },
   "permissions": {
     "reddit": {
