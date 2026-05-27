@@ -1271,7 +1271,7 @@ Please review the [community rules](https://www.reddit.com/r/mySubreddit/about/r
     expect(result.modmailErrorMessage).toBeUndefined();
   });
 
-  test('uses ratio-safe wording when a custom removal reason is provided', async () => {
+  test('uses default modmail wording for ratio removal reasons', async () => {
     const redditClient = mockRedditClient();
     const post = mockPost();
 
@@ -1281,8 +1281,6 @@ Please review the [community rules](https://www.reddit.com/r/mySubreddit/about/r
       action: ACTION_REMOVE,
       threshold: -3,
       reason: 'Removed for downvote ratio threshold',
-      removalExplanation:
-        "Your post was removed because Reddit's reported upvote ratio indicated sustained negative community feedback.",
       authorName: 'someUser',
       subredditName: 'mySubreddit',
       postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
@@ -1293,12 +1291,17 @@ Please review the [community rules](https://www.reddit.com/r/mySubreddit/about/r
     ]);
     expect(redditClient.modmailConversations[0]).toMatchObject({
       body: expect.stringContaining(
-        "Reddit's reported upvote ratio indicated sustained negative community feedback"
+        'Your post was removed because it received too much negative community feedback.'
       ),
     });
     expect(redditClient.modmailConversations[0]).not.toEqual(
       expect.objectContaining({
-        body: expect.stringContaining('exactly'),
+        body: expect.stringContaining('reported upvote ratio'),
+      })
+    );
+    expect(redditClient.modmailConversations[0]).not.toEqual(
+      expect.objectContaining({
+        body: expect.stringContaining('estimated minimum vote spread'),
       })
     );
   });

@@ -605,20 +605,6 @@ function buildRatioActionReason(action: TrackedPost['actionToTake']): string {
   return 'Removed for downvote ratio threshold';
 }
 
-function buildRatioRemovalExplanation(record: TrackedPost): string {
-  const parts = [
-    "Your post was removed because Reddit's reported upvote ratio indicated sustained negative community feedback.",
-  ];
-
-  if (typeof record.guaranteedSpread === 'number') {
-    parts.push(
-      `The app uses a conservative estimated minimum vote spread; it does not know exact upvote or downvote counts.`
-    );
-  }
-
-  return parts.join(' ');
-}
-
 async function markErrorAndReschedule(
   record: TrackedPost,
   err: unknown,
@@ -713,7 +699,6 @@ async function actionTrackedPost(args: {
   now: number;
   actionReason: string;
   stopReason: string;
-  removalExplanation?: string;
 }): Promise<void> {
   logInfo('Attempting Redis action lock.', {
     postId: args.postId,
@@ -805,10 +790,6 @@ async function actionTrackedPost(args: {
 
     if (actionRecord.authorName) {
       moderationActionArgs.authorName = actionRecord.authorName;
-    }
-
-    if (args.removalExplanation) {
-      moderationActionArgs.removalExplanation = args.removalExplanation;
     }
 
     if (actionRecord.actionToTake === 'remove') {
@@ -1124,7 +1105,6 @@ scheduledJobs.post('/check-watched-post', async (c) => {
           now,
           actionReason,
           stopReason: recordForNextCheck.lastRatioDecisionReason ?? 'ratio_action',
-          removalExplanation: buildRatioRemovalExplanation(recordForNextCheck),
         });
         return c.json<TaskResponse>({}, 200);
       }
