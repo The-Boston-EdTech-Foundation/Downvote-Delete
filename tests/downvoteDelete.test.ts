@@ -189,6 +189,29 @@ describe('settings normalization', () => {
       ).toBe(4);
     }
   );
+
+  test.each([-1, -2, -3, -4, -5] as const)(
+    'accepts negative score threshold %s',
+    (negativeScoreThreshold) => {
+      expect(
+        normalizeSettings({ negativeScoreThreshold }).negativeScoreThreshold
+      ).toBe(negativeScoreThreshold);
+      expect(
+        normalizeSettings({
+          negativeScoreThreshold: String(negativeScoreThreshold),
+        }).negativeScoreThreshold
+      ).toBe(negativeScoreThreshold);
+    }
+  );
+
+  test.each([-10, 0, '', 'abc'] as const)(
+    'falls back to -3 for invalid negative score threshold %s',
+    (negativeScoreThreshold) => {
+      expect(
+        normalizeSettings({ negativeScoreThreshold }).negativeScoreThreshold
+      ).toBe(-3);
+    }
+  );
 });
 
 describe('backoff schedule', () => {
@@ -793,6 +816,28 @@ describe('tracked post decisions', () => {
         tracking: trackedPost({ negativeScoreThreshold: -5 }),
         settings: activeSettings,
         post: postSnapshot({ score: -5 }),
+        now,
+      })
+    ).toEqual({ type: 'action' });
+  });
+
+  test('actions at the -1 configured negative score threshold', () => {
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -1 }),
+        settings: activeSettings,
+        post: postSnapshot({ score: -1 }),
+        now,
+      })
+    ).toEqual({ type: 'action' });
+  });
+
+  test('actions at the -4 configured negative score threshold', () => {
+    expect(
+      decideTrackedPostCheck({
+        tracking: trackedPost({ negativeScoreThreshold: -4 }),
+        settings: activeSettings,
+        post: postSnapshot({ score: -4 }),
         now,
       })
     ).toEqual({ type: 'action' });
