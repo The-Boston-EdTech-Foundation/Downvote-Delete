@@ -15,7 +15,9 @@ import {
 import { formatLogContext } from '../src/core/logging';
 import {
   buildRedditByIdJsonUrl,
+  buildRedditPostJsonUrl,
   extractRawRedditVoteFields,
+  fetchRedditRatioViaOpenAI,
   parseOpenAIRedditJsonResponse,
 } from '../src/core/openaiRatio';
 import {
@@ -275,6 +277,8 @@ describe('backoff schedule', () => {
 describe('OpenAI Reddit JSON ratio parsing', () => {
   const jsonText =
     '[{"kind":"Listing","data":{"children":[{"kind":"t3","data":{"name":"t3_1tocgkf","id":"1tocgkf","title":"Downvotes","upvote_ratio":0.43,"ups":0,"downs":0,"score":0}}]}}]';
+  const cacheBustNow = Date.UTC(2026, 4, 27, 22, 0, 0);
+  const cacheBustValue = '2026-05-27T22-00-00.000Z';
 
   test('builds the by_id URL with the full post id', () => {
     expect(buildRedditByIdJsonUrl('t3_1tocgkf')).toBe(
@@ -282,6 +286,35 @@ describe('OpenAI Reddit JSON ratio parsing', () => {
     );
     expect(buildRedditByIdJsonUrl('1tocgkf')).toBe(
       'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1'
+    );
+  });
+
+  test('builds a cache-busted by_id URL with the full post id', () => {
+    expect(buildRedditByIdJsonUrl('1tocgkf', cacheBustNow)).toBe(
+      `https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`
+    );
+  });
+
+  test('builds a cache-busted permalink URL when available', () => {
+    expect(
+      buildRedditPostJsonUrl({
+        postId: 't3_1tocgkf',
+        permalink: '/r/HestiaListens/comments/1tocgkf/downvotes/',
+        now: cacheBustNow,
+      })
+    ).toBe(
+      `https://www.reddit.com/r/HestiaListens/comments/1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`
+    );
+  });
+
+  test('falls back to a cache-busted by_id URL when permalink is missing', () => {
+    expect(
+      buildRedditPostJsonUrl({
+        postId: '1tocgkf',
+        now: cacheBustNow,
+      })
+    ).toBe(
+      `https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`
     );
   });
 
@@ -313,7 +346,117 @@ describe('OpenAI Reddit JSON ratio parsing', () => {
     });
   });
 
-  test('returns a compact parsed OpenAI result without raw JSON text', () => {
+  test('returns a parsed OpenAI result with bounded response previews', () => {
+    const requestedUrl = `https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`;
+    const result = parseOpenAIRedditJsonResponse(
+      {
+        output_text: JSON.stringify({
+          ok: true,
+          requested_url: requestedUrl,
+          retrieved_url: requestedUrl,
+          json_text: jsonText,
+          error: '',
+        }),
+      },
+      requestedUrl
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      jsonReceived: true,
+      cacheBustMatched: true,
+      parserPath: 'structured_json_text',
+      extractionSource: 'parsed_json',
+      responseTextLength: expect.any(Number),
+      responseTextPreview: expect.stringContaining('requested_url'),
+      jsonTextLength: jsonText.length,
+      jsonTextPreview: expect.stringContaining('upvote_ratio'),
+      fields: {
+        upvoteRatio: 0.43,
+        ratioPercent: '43.0%',
+      },
+    });
+    expect(result.responseTextPreview?.length).toBeLessThanOrEqual(2000);
+    expect(result.jsonTextPreview?.length).toBeLessThanOrEqual(2000);
+  });
+
+  test('fails safely when OpenAI returns a stale retrieved URL without the cache bust', () => {
+    const requestedUrl = `https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`;
+    const result = parseOpenAIRedditJsonResponse(
+      {
+        output_text: JSON.stringify({
+          ok: true,
+          requested_url: requestedUrl,
+          retrieved_url:
+            'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
+          json_text: jsonText,
+          error: '',
+        }),
+      },
+      requestedUrl
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      jsonReceived: true,
+      requestedUrl,
+      retrievedUrl: 'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
+      cacheBustMatched: false,
+      parserPath: 'structured_json_text',
+      extractionSource: 'parsed_json',
+      error:
+        'OpenAI retrieved URL did not include the requested cache_bust value.',
+    });
+    expect(result.fields).toBeUndefined();
+  });
+
+  test('fetcher prompts OpenAI with the cache-busted permalink URL', async () => {
+    let requestBody = '';
+    const requestedUrl = `https://www.reddit.com/r/HestiaListens/comments/1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`;
+    const result = await fetchRedditRatioViaOpenAI({
+      apiKey: 'test-key',
+      postId: 't3_1tocgkf',
+      permalink: '/r/HestiaListens/comments/1tocgkf/downvotes/',
+      now: cacheBustNow,
+      fetchImpl: async (_url, init) => {
+        requestBody = init.body;
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          async json(): Promise<unknown> {
+            return {
+              output_text: JSON.stringify({
+                ok: true,
+                requested_url: requestedUrl,
+                retrieved_url: requestedUrl,
+                json_text:
+                  '[{"kind":"Listing","data":{"children":[{"kind":"t3","data":{"name":"t3_1tocgkf","id":"1tocgkf","upvote_ratio":0.25,"score":0}}]}}]',
+                error: '',
+              }),
+            };
+          },
+        };
+      },
+    });
+
+    expect(requestBody).toContain(requestedUrl);
+    expect(requestBody).toContain(`cache_bust=${cacheBustValue}`);
+    expect(result).toMatchObject({
+      ok: true,
+      requestedUrl,
+      retrievedUrl: requestedUrl,
+      cacheBustMatched: true,
+      parserPath: 'structured_json_text',
+      extractionSource: 'parsed_json',
+      fields: {
+        upvoteRatio: 0.25,
+        ratioPercent: '25.0%',
+      },
+    });
+  });
+
+  test('returns a clean failure with debug metadata for malformed json_text', () => {
     const result = parseOpenAIRedditJsonResponse(
       {
         output_text: JSON.stringify({
@@ -322,7 +465,7 @@ describe('OpenAI Reddit JSON ratio parsing', () => {
             'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
           retrieved_url:
             'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
-          json_text: jsonText,
+          json_text: '{"broken"',
           error: '',
         }),
       },
@@ -330,33 +473,14 @@ describe('OpenAI Reddit JSON ratio parsing', () => {
     );
 
     expect(result).toMatchObject({
-      ok: true,
-      jsonReceived: true,
-      fields: {
-        upvoteRatio: 0.43,
-        ratioPercent: '43.0%',
-      },
+      ok: false,
+      jsonReceived: false,
+      parserPath: 'salvage_json_text',
+      extractionSource: 'none',
+      jsonTextLength: '{"broken"'.length,
+      jsonTextPreview: '{"broken"',
     });
-    expect(JSON.stringify(result)).not.toContain('json_text');
-  });
-
-  test('returns a clean failure for malformed json_text', () => {
-    expect(
-      parseOpenAIRedditJsonResponse(
-        {
-          output_text: JSON.stringify({
-            ok: true,
-            requested_url:
-              'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
-            retrieved_url:
-              'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
-            json_text: '{"broken"',
-            error: '',
-          }),
-        },
-        'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1'
-      ).ok
-    ).toBe(false);
+    expect(result.fields).toBeUndefined();
   });
 
   test('salvages vote fields from malformed OpenAI wrapper text', () => {
@@ -375,6 +499,10 @@ describe('OpenAI Reddit JSON ratio parsing', () => {
         'https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1',
       retrievedUrl:
         'https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1',
+      parserPath: 'salvage_wrapper_text',
+      extractionSource: 'text_scan',
+      responseTextLength: expect.any(Number),
+      responseTextPreview: expect.stringContaining('upvote_ratio'),
       fields: {
         name: 't3_1tphv0v',
         id: '1tphv0v',
@@ -402,6 +530,8 @@ describe('OpenAI Reddit JSON ratio parsing', () => {
       jsonReceived: true,
       requestedUrl: 'https://www.reddit.com/by_id/t3_post.json?raw_json=1',
       retrievedUrl: 'https://www.reddit.com/by_id/t3_post.json?raw_json=1',
+      parserPath: 'salvage_wrapper_text',
+      extractionSource: 'text_scan',
       fields: {
         name: 't3_post',
         id: 'post',
@@ -427,6 +557,9 @@ describe('OpenAI Reddit JSON ratio parsing', () => {
       ok: false,
       jsonReceived: true,
       requestedUrl: 'https://www.reddit.com/by_id/t3_post.json?raw_json=1',
+      parserPath: 'structured_json',
+      extractionSource: 'none',
+      responseTextPreview: expect.stringContaining('score'),
     });
     expect(result.fields).toBeUndefined();
   });

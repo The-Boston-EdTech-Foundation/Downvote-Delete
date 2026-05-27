@@ -285,10 +285,14 @@ function clearFreshRatioDecision(
 async function fetchAndLogRawRatio(args: {
   postId: string;
   apiKey: string;
+  now: number;
+  permalink?: string | undefined;
 }): Promise<OpenAIRatioFetchResult> {
   const result = await fetchRedditRatioViaOpenAI({
     apiKey: args.apiKey,
     postId: args.postId,
+    now: args.now,
+    permalink: args.permalink,
   });
 
   if (result.ok) {
@@ -297,6 +301,13 @@ async function fetchAndLogRawRatio(args: {
       jsonReceived: result.jsonReceived,
       requestedUrl: result.requestedUrl,
       retrievedUrl: result.retrievedUrl,
+      cacheBustMatched: result.cacheBustMatched,
+      parserPath: result.parserPath,
+      extractionSource: result.extractionSource,
+      responseTextLength: result.responseTextLength,
+      responseTextPreview: result.responseTextPreview,
+      jsonTextLength: result.jsonTextLength,
+      jsonTextPreview: result.jsonTextPreview,
       rawName: result.fields?.name,
       rawId: result.fields?.id,
       rawUpvoteRatio: result.fields?.upvoteRatio,
@@ -311,9 +322,32 @@ async function fetchAndLogRawRatio(args: {
       jsonReceived: result.jsonReceived,
       requestedUrl: result.requestedUrl,
       retrievedUrl: result.retrievedUrl,
+      cacheBustMatched: result.cacheBustMatched,
+      parserPath: result.parserPath,
+      extractionSource: result.extractionSource,
+      responseTextLength: result.responseTextLength,
+      responseTextPreview: result.responseTextPreview,
+      jsonTextLength: result.jsonTextLength,
+      jsonTextPreview: result.jsonTextPreview,
       error: result.error,
     });
   }
+
+  logInfo('OpenAI ratio extraction result.', {
+    postId: args.postId,
+    parserPath: result.parserPath,
+    extractionSource: result.extractionSource,
+    extractedUpvoteRatio: result.fields?.upvoteRatio,
+    ratioPercent: result.fields?.ratioPercent,
+    rawName: result.fields?.name,
+    rawId: result.fields?.id,
+    rawScore: result.fields?.score,
+    rawUps: result.fields?.ups,
+    rawDowns: result.fields?.downs,
+    cacheBustMatched: result.cacheBustMatched,
+    error: result.error || undefined,
+    jsonReceived: result.jsonReceived,
+  });
 
   return result;
 }
@@ -348,7 +382,20 @@ function applyOpenAIRatioResult(
 
   if (!result.fields || typeof result.fields.upvoteRatio !== 'number') {
     clearFreshRatioDecision(updatedRecord, 'invalid_ratio');
+    logInfo('Advanced vote tracking did not use a fresh ratio.', {
+      postId: record.postId,
+      freshRatioUsed: false,
+      previousRawUpvoteRatio: record.lastRawUpvoteRatio,
+      newRawUpvoteRatio: undefined,
+      lastRatioDecision: updatedRecord.lastRatioDecision,
+      lastRatioDecisionReason: updatedRecord.lastRatioDecisionReason,
+      parserPath: result.parserPath,
+      extractionSource: result.extractionSource,
+      error: result.error,
+      note: 'Previous raw ratio is historical and was not used for this check.',
+    });
   } else {
+    const previousRawUpvoteRatio = record.lastRawUpvoteRatio;
     updatedRecord.lastRawUpvoteRatio = result.fields.upvoteRatio;
 
     const ratioDecision = shouldRemoveByRatio({
@@ -376,6 +423,9 @@ function applyOpenAIRatioResult(
 
     logInfo('Advanced vote tracking updated ratio confidence.', {
       postId: record.postId,
+      freshRatioUsed: true,
+      previousRawUpvoteRatio,
+      newRawUpvoteRatio: updatedRecord.lastRawUpvoteRatio,
       ratio: result.fields.upvoteRatio,
       latestScore,
       minimumTotalVotes: updatedRecord.minimumTotalVotes,
@@ -1038,6 +1088,8 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       const ratioResult = await fetchAndLogRawRatio({
         postId,
         apiKey: openAIApiKey,
+        now,
+        permalink: fetched.post.permalink,
       });
       recordForNextCheck = applyOpenAIRatioResult(
         recordForNextCheck,

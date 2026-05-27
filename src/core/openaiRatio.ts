@@ -1,3 +1,5 @@
+import { logInfo } from './logging';
+
 export type RawRedditVoteFields = {
   name: string | 'missing';
   id: string | 'missing';
@@ -8,11 +10,28 @@ export type RawRedditVoteFields = {
   score: number | 'missing';
 };
 
+export type OpenAIParserPath =
+  | 'structured_json'
+  | 'structured_json_text'
+  | 'salvage_wrapper_text'
+  | 'salvage_json_text'
+  | 'failed';
+
+export type OpenAIExtractionSource = 'parsed_json' | 'text_scan' | 'none';
+
 export type OpenAIRatioFetchResult = {
   ok: boolean;
   jsonReceived: boolean;
   requestedUrl: string;
   retrievedUrl: string;
+  cacheBustMatched?: boolean;
+  responseTextLength?: number | undefined;
+  responseTextPreview?: string | undefined;
+  jsonTextLength?: number | undefined;
+  jsonTextPreview?: string | undefined;
+  parserPath?: OpenAIParserPath;
+  extractionSource?: OpenAIExtractionSource;
+  openAIWrapperOk?: boolean;
   fields?: RawRedditVoteFields;
   error: string;
 };
@@ -39,9 +58,156 @@ type OpenAIResponsesFetch = (
   json(): Promise<unknown>;
 }>;
 
-export function buildRedditByIdJsonUrl(postId: string): string {
+const OPENAI_RATIO_MODEL = 'gpt-5.4-nano';
+const RESPONSE_PREVIEW_LENGTH = 2000;
+
+function normalizedPostId(postId: string): string {
+  return postId.startsWith('t3_') ? postId : `t3_${postId}`;
+}
+
+function cacheBustValue(now: number): string {
+  return new Date(now).toISOString().replace(/:/g, '-');
+}
+
+function withRawJsonAndCacheBust(baseUrl: string, now: number): string {
+  return `${baseUrl}?raw_json=1&cache_bust=${cacheBustValue(now)}`;
+}
+
+function previewText(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return value
+    .slice(0, RESPONSE_PREVIEW_LENGTH)
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\t/g, '\\t');
+}
+
+function normalizePermalink(permalink: string): string | undefined {
+  const trimmed = permalink.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const pathOnly = trimmed.startsWith('https://www.reddit.com')
+    ? trimmed.slice('https://www.reddit.com'.length)
+    : trimmed;
+  const withoutJson = pathOnly.replace(/\.json(?:\?.*)?$/, '');
+  const withoutQuery = withoutJson.split('?')[0] ?? withoutJson;
+  const withoutTrailingSlash = withoutQuery.replace(/\/+$/, '');
+  const normalizedPath = withoutTrailingSlash.startsWith('/')
+    ? withoutTrailingSlash
+    : `/${withoutTrailingSlash}`;
+  const commentsMatch = normalizedPath.match(
+    /^(\/r\/[^/]+\/comments\/[^/]+)(?:\/.*)?$/
+  );
+  return commentsMatch?.[1] ?? normalizedPath;
+}
+
+export function buildRedditByIdJsonUrl(postId: string, now?: number): string {
+  const postIdWithPrefix = normalizedPostId(postId);
+  const baseUrl = `https://www.reddit.com/by_id/${postIdWithPrefix}.json`;
+  if (typeof now !== 'number') {
+    return `${baseUrl}?raw_json=1`;
+  }
+
+  return withRawJsonAndCacheBust(baseUrl, now);
+}
+
+export function buildRedditPostJsonUrl(args: {
+  postId: string;
+  now: number;
+  permalink?: string | undefined;
+}): string {
+  const permalink = args.permalink
+    ? normalizePermalink(args.permalink)
+    : undefined;
+  if (permalink) {
+    return withRawJsonAndCacheBust(
+      `https://www.reddit.com${permalink}.json`,
+      args.now
+    );
+  }
+
+  return buildRedditByIdJsonUrl(args.postId, args.now);
+}
+
+export function buildRedditPostJsonRequest(args: {
+  postId: string;
+  now: number;
+  permalink?: string | undefined;
+}): {
+  url: string;
+  cacheBust: string | undefined;
+  permalinkSource: 'canonical' | 'by_id_fallback';
+} {
+  const permalink = args.permalink
+    ? normalizePermalink(args.permalink)
+    : undefined;
+  const url = permalink
+    ? withRawJsonAndCacheBust(`https://www.reddit.com${permalink}.json`, args.now)
+    : buildRedditByIdJsonUrl(args.postId, args.now);
+
+  return {
+    url,
+    cacheBust: readCacheBust(url),
+    permalinkSource: permalink ? 'canonical' : 'by_id_fallback',
+  };
+}
+
+function readCacheBust(url: string): string | undefined {
+  try {
+    return new URL(url).searchParams.get('cache_bust') ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function hasCacheBust(url: string, cacheBust: string): boolean {
+  try {
+    return new URL(url).searchParams.get('cache_bust') === cacheBust;
+  } catch {
+    return url.includes(`cache_bust=${cacheBust}`);
+  }
+}
+
+function cacheBustMatched(args: {
+  requestedUrl: string;
+  retrievedUrl: string;
+}): boolean | undefined {
+  const requestedCacheBust = readCacheBust(args.requestedUrl);
+  if (!requestedCacheBust) {
+    return undefined;
+  }
+
+  return hasCacheBust(args.retrievedUrl, requestedCacheBust);
+}
+
+function rejectCacheBustMismatch(
+  result: OpenAIRatioFetchResult
+): OpenAIRatioFetchResult {
+  const matched = cacheBustMatched({
+    requestedUrl: result.requestedUrl,
+    retrievedUrl: result.retrievedUrl,
+  });
+  if (matched !== false) {
+    return matched === undefined ? result : { ...result, cacheBustMatched: true };
+  }
+
+  const { fields: _fields, ...resultWithoutFields } = result;
+  return {
+    ...resultWithoutFields,
+    ok: false,
+    cacheBustMatched: false,
+    error: 'OpenAI retrieved URL did not include the requested cache_bust value.',
+  };
+}
+
+export function buildRedditJsonUrl(postId: string, now: number): string {
   const normalizedPostId = postId.startsWith('t3_') ? postId : `t3_${postId}`;
-  return `https://www.reddit.com/by_id/${normalizedPostId}.json?raw_json=1`;
+  return buildRedditByIdJsonUrl(normalizedPostId, now);
 }
 
 function readNumber(value: unknown): number | 'missing' {
@@ -207,12 +373,26 @@ function salvageRawRedditVoteFieldsFromText(
 function salvageOpenAIRedditJsonResponse(
   responseText: string,
   requestedUrl: string,
-  fallbackError: string
+  fallbackError: string,
+  parserPath: Extract<
+    OpenAIParserPath,
+    'salvage_wrapper_text' | 'salvage_json_text'
+  >,
+  jsonText?: string | undefined,
+  retrievedUrl?: string | undefined
 ): OpenAIRatioFetchResult {
   const fields = salvageRawRedditVoteFieldsFromText(responseText);
   const foundAnyVoteField =
     fields !== null ||
     /\\?"(?:upvote_ratio|ups|downs|score)\\?"\s*:/.test(responseText);
+  const diagnostics = {
+    responseTextLength: responseText.length,
+    responseTextPreview: previewText(responseText),
+    jsonTextLength: jsonText?.length,
+    jsonTextPreview: previewText(jsonText),
+    parserPath,
+    extractionSource: fields ? ('text_scan' as const) : ('none' as const),
+  };
 
   if (!fields) {
     return {
@@ -220,7 +400,10 @@ function salvageOpenAIRedditJsonResponse(
       jsonReceived: foundAnyVoteField || responseText.includes('Listing'),
       requestedUrl: extractUrlFromText(responseText, 'requested_url') ?? requestedUrl,
       retrievedUrl:
-        extractUrlFromText(responseText, 'retrieved_url') ?? requestedUrl,
+        extractUrlFromText(responseText, 'retrieved_url') ??
+        retrievedUrl ??
+        requestedUrl,
+      ...diagnostics,
       error: fallbackError,
     };
   }
@@ -229,7 +412,11 @@ function salvageOpenAIRedditJsonResponse(
     ok: true,
     jsonReceived: true,
     requestedUrl: extractUrlFromText(responseText, 'requested_url') ?? requestedUrl,
-    retrievedUrl: extractUrlFromText(responseText, 'retrieved_url') ?? requestedUrl,
+    retrievedUrl:
+      extractUrlFromText(responseText, 'retrieved_url') ??
+      retrievedUrl ??
+      requestedUrl,
+    ...diagnostics,
     fields,
     error: '',
   };
@@ -279,56 +466,85 @@ export function parseOpenAIRedditJsonResponse(
       jsonReceived: false,
       requestedUrl,
       retrievedUrl: 'missing',
+      parserPath: 'failed',
+      extractionSource: 'none',
       error: 'OpenAI response did not include structured text output.',
     };
   }
+  const responseDiagnostics = {
+    responseTextLength: responseText.length,
+    responseTextPreview: previewText(responseText),
+  };
 
   let structured: OpenAIRedditJsonFetch;
   try {
     structured = JSON.parse(responseText) as OpenAIRedditJsonFetch;
   } catch (err: unknown) {
-    return salvageOpenAIRedditJsonResponse(
-      responseText,
-      requestedUrl,
-      err instanceof Error ? err.message : String(err)
+    return rejectCacheBustMismatch(
+      salvageOpenAIRedditJsonResponse(
+        responseText,
+        requestedUrl,
+        err instanceof Error ? err.message : String(err),
+        'salvage_wrapper_text'
+      )
     );
   }
+  const structuredDiagnostics = {
+    ...responseDiagnostics,
+    jsonTextLength: structured.json_text?.length,
+    jsonTextPreview: previewText(structured.json_text),
+    openAIWrapperOk: structured.ok,
+  };
 
   if (!structured.ok || !structured.json_text) {
-    return {
+    return rejectCacheBustMismatch({
       ok: false,
       jsonReceived: Boolean(structured.json_text),
       requestedUrl: structured.requested_url || requestedUrl,
       retrievedUrl: structured.retrieved_url || 'missing',
+      ...structuredDiagnostics,
+      parserPath: 'structured_json',
+      extractionSource: 'none',
       error: structured.error || 'OpenAI did not retrieve Reddit JSON.',
-    };
+    });
   }
 
   try {
     const fields = extractRawRedditVoteFields(structured.json_text);
     if (!fields) {
-      return {
+      return rejectCacheBustMismatch({
         ok: false,
         jsonReceived: true,
         requestedUrl: structured.requested_url || requestedUrl,
         retrievedUrl: structured.retrieved_url || 'missing',
+        ...structuredDiagnostics,
+        parserPath: 'structured_json_text',
+        extractionSource: 'none',
         error: 'Reddit JSON did not contain a post listing.',
-      };
+      });
     }
 
-    return {
+    return rejectCacheBustMismatch({
       ok: true,
       jsonReceived: true,
       requestedUrl: structured.requested_url || requestedUrl,
       retrievedUrl: structured.retrieved_url || 'missing',
+      ...structuredDiagnostics,
+      parserPath: 'structured_json_text',
+      extractionSource: 'parsed_json',
       fields,
       error: '',
-    };
+    });
   } catch (err: unknown) {
-    return salvageOpenAIRedditJsonResponse(
-      structured.json_text,
-      structured.requested_url || requestedUrl,
-      err instanceof Error ? err.message : String(err)
+    return rejectCacheBustMismatch(
+      salvageOpenAIRedditJsonResponse(
+        structured.json_text,
+        structured.requested_url || requestedUrl,
+        err instanceof Error ? err.message : String(err),
+        'salvage_json_text',
+        structured.json_text,
+        structured.retrieved_url
+      )
     );
   }
 }
@@ -336,9 +552,18 @@ export function parseOpenAIRedditJsonResponse(
 export async function fetchRedditRatioViaOpenAI(args: {
   apiKey: string;
   postId: string;
+  now?: number | undefined;
+  permalink?: string | undefined;
   fetchImpl?: OpenAIResponsesFetch;
 }): Promise<OpenAIRatioFetchResult> {
-  const requestedUrl = buildRedditByIdJsonUrl(args.postId);
+  const now = args.now ?? Date.now();
+  const request = buildRedditPostJsonRequest({
+    postId: args.postId,
+    now,
+    permalink: args.permalink,
+  });
+  const requestedUrl = request.url;
+  const requestedCacheBust = request.cacheBust;
   const fetchImpl = args.fetchImpl ?? fetch;
 
   if (!args.apiKey) {
@@ -352,18 +577,22 @@ export async function fetchRedditRatioViaOpenAI(args: {
   }
 
   const body = {
-    model: 'gpt-5.4-nano',
+    model: OPENAI_RATIO_MODEL,
     tools: [{ type: 'web_search' }],
     tool_choice: 'required',
     input: [
       {
         role: 'system',
         content:
-          'You retrieve exact public JSON response bodies. Return only data that was retrieved from the requested URL. Do not summarize, transform, or infer JSON.',
+          'You retrieve exact public JSON response bodies. Open only the exact requested URL. Do not use cached pages, search snippets, summaries, or inferred JSON. If the retrieved URL does not include the same cache_bust query value, return ok=false.',
       },
       {
         role: 'user',
-        content: `Open this exact URL and copy the full raw response body into json_text: ${requestedUrl}`,
+        content: `Open this exact cache-busted URL and copy the full raw response body into json_text: ${requestedUrl}${
+          requestedCacheBust
+            ? ` The retrieved_url must include cache_bust=${requestedCacheBust}.`
+            : ''
+        }`,
       },
     ],
     text: {
@@ -394,6 +623,16 @@ export async function fetchRedditRatioViaOpenAI(args: {
   };
 
   try {
+    logInfo('Sending OpenAI Reddit ratio request.', {
+      postId: args.postId,
+      requestedUrl,
+      cacheBust: requestedCacheBust,
+      model: OPENAI_RATIO_MODEL,
+      usesWebSearch: true,
+      permalinkSource: request.permalinkSource,
+      prompt: body.input[1]?.content,
+    });
+
     const response = await fetchImpl('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
@@ -409,6 +648,8 @@ export async function fetchRedditRatioViaOpenAI(args: {
         jsonReceived: false,
         requestedUrl,
         retrievedUrl: 'missing',
+        parserPath: 'failed',
+        extractionSource: 'none',
         error: `OpenAI HTTP ${response.status} ${response.statusText}`,
       };
     }
@@ -420,6 +661,8 @@ export async function fetchRedditRatioViaOpenAI(args: {
       jsonReceived: false,
       requestedUrl,
       retrievedUrl: 'missing',
+      parserPath: 'failed',
+      extractionSource: 'none',
       error: err instanceof Error ? err.message : String(err),
     };
   }
