@@ -293,6 +293,78 @@ describe('OpenAI Reddit JSON ratio parsing', () => {
       ).ok
     ).toBe(false);
   });
+
+  test('salvages vote fields from malformed OpenAI wrapper text', () => {
+    const result = parseOpenAIRedditJsonResponse(
+      {
+        output_text:
+          '{"ok":true,"requested_url":"https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1","retrieved_url":"https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1","json_text":"[{\\"kind\\": \\"Listing\\", \\"data\\": {\\"children\\": [{\\"kind\\": \\"t3\\", \\"data\\": {\\"name\\": \\"t3_1tphv0v\\", \\"id\\": \\"1tphv0v\\", \\"selftext_html\\": "bad\ncontrol", \\"upvote_ratio\\": 0.33, \\"ups\\": 0, \\"downs\\": 0, \\"score\\": 0}}]}}]","error":""}',
+      },
+      'https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1'
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      jsonReceived: true,
+      requestedUrl:
+        'https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1',
+      retrievedUrl:
+        'https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1',
+      fields: {
+        name: 't3_1tphv0v',
+        id: '1tphv0v',
+        upvoteRatio: 0.33,
+        ratioPercent: '33.0%',
+        ups: 0,
+        downs: 0,
+        score: 0,
+      },
+      error: '',
+    });
+  });
+
+  test('salvages vote fields from escaped quote text', () => {
+    const result = parseOpenAIRedditJsonResponse(
+      {
+        output_text:
+          '\\"kind\\":\\"t3\\",\\"data\\":{\\"name\\":\\"t3_post\\",\\"id\\":\\"post\\",\\"upvote_ratio\\":0.25,\\"score\\":-1}',
+      },
+      'https://www.reddit.com/by_id/t3_post.json?raw_json=1'
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      jsonReceived: true,
+      requestedUrl: 'https://www.reddit.com/by_id/t3_post.json?raw_json=1',
+      retrievedUrl: 'https://www.reddit.com/by_id/t3_post.json?raw_json=1',
+      fields: {
+        name: 't3_post',
+        id: 'post',
+        upvoteRatio: 0.25,
+        ratioPercent: '25.0%',
+        ups: 'missing',
+        downs: 'missing',
+        score: -1,
+      },
+    });
+  });
+
+  test('does not salvage when upvote_ratio is missing', () => {
+    const result = parseOpenAIRedditJsonResponse(
+      {
+        output_text:
+          '{"json_text":"[{\\"kind\\":\\"Listing\\",\\"data\\":{\\"children\\":[{\\"kind\\":\\"t3\\",\\"data\\":{\\"name\\":\\"t3_post\\",\\"score\\":0}}]}}]"}',
+      },
+      'https://www.reddit.com/by_id/t3_post.json?raw_json=1'
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      jsonReceived: true,
+      requestedUrl: 'https://www.reddit.com/by_id/t3_post.json?raw_json=1',
+    });
+    expect(result.fields).toBeUndefined();
+  });
 });
 
 describe('vote ratio confidence model', () => {

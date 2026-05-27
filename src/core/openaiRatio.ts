@@ -54,6 +54,15 @@ function readString(value: unknown): string | 'missing' {
   return typeof value === 'string' && value ? value : 'missing';
 }
 
+function readNumberText(value: string | undefined): number | 'missing' {
+  if (value === undefined) {
+    return 'missing';
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 'missing';
+}
+
 function ratioPercent(upvoteRatio: number | 'missing'): string {
   return typeof upvoteRatio === 'number'
     ? `${(upvoteRatio * 100).toFixed(1)}%`
@@ -103,6 +112,126 @@ export function extractRawRedditVoteFields(
     ups: readNumber(postData.ups),
     downs: readNumber(postData.downs),
     score: readNumber(postData.score),
+  };
+}
+
+function quotePattern(): string {
+  return '\\\\?"';
+}
+
+function fieldPrefixPattern(fieldName: string): string {
+  const quote = quotePattern();
+  return `${quote}${fieldName}${quote}\\s*:\\s*`;
+}
+
+function readNumberFromText(
+  source: string,
+  fieldName: string
+): number | 'missing' {
+  const prefix = fieldPrefixPattern(fieldName);
+  const quoted = new RegExp(`${prefix}${quotePattern()}(-?\\d+(?:\\.\\d+)?)`);
+  const unquoted = new RegExp(`${prefix}(-?\\d+(?:\\.\\d+)?)`);
+  return readNumberText(quoted.exec(source)?.[1] ?? unquoted.exec(source)?.[1]);
+}
+
+function readStringFromText(
+  source: string,
+  fieldName: string
+): string | 'missing' {
+  const match = new RegExp(
+    `${fieldPrefixPattern(fieldName)}${quotePattern()}([^"\\\\]*)${quotePattern()}`
+  ).exec(source);
+  return readString(match?.[1]);
+}
+
+function firstPostTextBlock(source: string): string {
+  const t3Marker =
+    source.indexOf('"kind": "t3"') >= 0
+      ? '"kind": "t3"'
+      : source.indexOf('"kind":"t3"') >= 0
+        ? '"kind":"t3"'
+        : source.indexOf('\\"kind\\": \\"t3\\"') >= 0
+          ? '\\"kind\\": \\"t3\\"'
+          : source.indexOf('\\"kind\\":\\"t3\\"') >= 0
+            ? '\\"kind\\":\\"t3\\"'
+            : '';
+
+  if (!t3Marker) {
+    return source;
+  }
+
+  const start = source.indexOf(t3Marker);
+  const nextT1Candidates = [
+    source.indexOf('"kind": "t1"', start + t3Marker.length),
+    source.indexOf('"kind":"t1"', start + t3Marker.length),
+    source.indexOf('\\"kind\\": \\"t1\\"', start + t3Marker.length),
+    source.indexOf('\\"kind\\":\\"t1\\"', start + t3Marker.length),
+  ].filter((index) => index > start);
+  const end =
+    nextT1Candidates.length > 0
+      ? Math.min(...nextT1Candidates)
+      : source.length;
+
+  return source.slice(start, end);
+}
+
+function extractUrlFromText(
+  source: string,
+  fieldName: 'requested_url' | 'retrieved_url'
+): string | undefined {
+  const value = readStringFromText(source, fieldName);
+  return value === 'missing' ? undefined : value.replace(/\\\//g, '/');
+}
+
+function salvageRawRedditVoteFieldsFromText(
+  responseText: string
+): RawRedditVoteFields | null {
+  const postText = firstPostTextBlock(responseText);
+  const upvoteRatio = readNumberFromText(postText, 'upvote_ratio');
+
+  if (typeof upvoteRatio !== 'number') {
+    return null;
+  }
+
+  return {
+    name: readStringFromText(postText, 'name'),
+    id: readStringFromText(postText, 'id'),
+    upvoteRatio,
+    ratioPercent: ratioPercent(upvoteRatio),
+    ups: readNumberFromText(postText, 'ups'),
+    downs: readNumberFromText(postText, 'downs'),
+    score: readNumberFromText(postText, 'score'),
+  };
+}
+
+function salvageOpenAIRedditJsonResponse(
+  responseText: string,
+  requestedUrl: string,
+  fallbackError: string
+): OpenAIRatioFetchResult {
+  const fields = salvageRawRedditVoteFieldsFromText(responseText);
+  const foundAnyVoteField =
+    fields !== null ||
+    /\\?"(?:upvote_ratio|ups|downs|score)\\?"\s*:/.test(responseText);
+
+  if (!fields) {
+    return {
+      ok: false,
+      jsonReceived: foundAnyVoteField || responseText.includes('Listing'),
+      requestedUrl: extractUrlFromText(responseText, 'requested_url') ?? requestedUrl,
+      retrievedUrl:
+        extractUrlFromText(responseText, 'retrieved_url') ?? requestedUrl,
+      error: fallbackError,
+    };
+  }
+
+  return {
+    ok: true,
+    jsonReceived: true,
+    requestedUrl: extractUrlFromText(responseText, 'requested_url') ?? requestedUrl,
+    retrievedUrl: extractUrlFromText(responseText, 'retrieved_url') ?? requestedUrl,
+    fields,
+    error: '',
   };
 }
 
@@ -158,13 +287,11 @@ export function parseOpenAIRedditJsonResponse(
   try {
     structured = JSON.parse(responseText) as OpenAIRedditJsonFetch;
   } catch (err: unknown) {
-    return {
-      ok: false,
-      jsonReceived: false,
+    return salvageOpenAIRedditJsonResponse(
+      responseText,
       requestedUrl,
-      retrievedUrl: 'missing',
-      error: err instanceof Error ? err.message : String(err),
-    };
+      err instanceof Error ? err.message : String(err)
+    );
   }
 
   if (!structured.ok || !structured.json_text) {
@@ -198,13 +325,11 @@ export function parseOpenAIRedditJsonResponse(
       error: '',
     };
   } catch (err: unknown) {
-    return {
-      ok: false,
-      jsonReceived: true,
-      requestedUrl: structured.requested_url || requestedUrl,
-      retrievedUrl: structured.retrieved_url || 'missing',
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return salvageOpenAIRedditJsonResponse(
+      structured.json_text,
+      structured.requested_url || requestedUrl,
+      err instanceof Error ? err.message : String(err)
+    );
   }
 }
 
