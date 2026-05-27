@@ -1,5 +1,9 @@
 import { Hono } from 'hono';
-import type { TaskRequest, TaskResponse } from '@devvit/web/server';
+import type {
+  SettingsValues,
+  TaskRequest,
+  TaskResponse,
+} from '@devvit/web/server';
 import {
   reddit,
   redis,
@@ -22,6 +26,10 @@ import {
   type PostSnapshot,
 } from '../core/decision';
 import { logError, logInfo, logWarn } from '../core/logging';
+import {
+  fetchRedditRatioViaOpenAI,
+  type OpenAIRatioFetchResult,
+} from '../core/openaiRatio';
 import { postToSnapshot } from '../core/postStatus';
 import { normalizeSettings } from '../core/settings';
 import {
@@ -34,17 +42,20 @@ import {
   type TrackingStatus,
   watchKey,
 } from '../core/tracking';
+import {
+  confidenceModelMaxVotes,
+  shouldRemoveByRatio,
+  type RatioDecision,
+} from '../core/voteRatioModel';
 import { CHECK_WATCHED_POST_TASK } from './triggers';
 
 type CheckWatchedPostData = {
   postId?: string;
 };
 
-type PostDataVoteSignals = {
-  score?: number;
-  ups?: number;
-  upvoteRatio?: number;
-  viewCount?: number;
+type FetchedPostSnapshot = {
+  post: Awaited<ReturnType<typeof reddit.getPostById>>;
+  snapshot: PostSnapshot;
 };
 
 export const scheduledJobs = new Hono();
@@ -70,48 +81,6 @@ function buildPostLink(args: {
   }
 
   return buildFallbackPostLink(args.postId, args.subredditName);
-}
-
-function getNumberField(
-  source: Record<string, unknown> | undefined,
-  fieldName: string
-): number | undefined {
-  const value = source?.[fieldName];
-  return typeof value === 'number' && Number.isFinite(value)
-    ? value
-    : undefined;
-}
-
-function readPostDataVoteSignals(
-  postData: unknown
-): PostDataVoteSignals {
-  const source =
-    postData && typeof postData === 'object'
-      ? (postData as Record<string, unknown>)
-      : undefined;
-  const signals: PostDataVoteSignals = {};
-  const score = getNumberField(source, 'score');
-  const ups = getNumberField(source, 'ups');
-  const upvoteRatio = getNumberField(source, 'upvoteRatio');
-  const viewCount = getNumberField(source, 'viewCount');
-
-  if (typeof score === 'number') {
-    signals.score = score;
-  }
-
-  if (typeof ups === 'number') {
-    signals.ups = ups;
-  }
-
-  if (typeof upvoteRatio === 'number') {
-    signals.upvoteRatio = upvoteRatio;
-  }
-
-  if (typeof viewCount === 'number') {
-    signals.viewCount = viewCount;
-  }
-
-  return signals;
 }
 
 async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
@@ -140,13 +109,19 @@ async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
     redisKey,
     status: parsedRecord.status,
     checkCount: parsedRecord.checkCount,
+    trackingMode: parsedRecord.trackingMode,
     lastKnownScore: parsedRecord.lastKnownScore,
     lastKnownUpvotes: parsedRecord.lastKnownUpvotes,
     lastKnownDownvotes: parsedRecord.lastKnownDownvotes,
     lastKnownUpvoteRatio: parsedRecord.lastKnownUpvoteRatio,
-    lastKnownPostDataUps: parsedRecord.lastKnownPostDataUps,
     lastCalculatedVoteScore: parsedRecord.lastCalculatedVoteScore,
-    lastRatioEstimatedScore: parsedRecord.lastRatioEstimatedScore,
+    lastRawUpvoteRatio: parsedRecord.lastRawUpvoteRatio,
+    lastRawRatioPercent: parsedRecord.lastRawRatioPercent,
+    minimumTotalVotes: parsedRecord.minimumTotalVotes,
+    guaranteedSpread: parsedRecord.guaranteedSpread,
+    lastRatioDecision: parsedRecord.lastRatioDecision,
+    lastRatioDecisionReason: parsedRecord.lastRatioDecisionReason,
+    lastOpenAIError: parsedRecord.lastOpenAIError,
     negativeDecisionScore: parsedRecord.negativeDecisionScore,
     negativeDecisionSource: parsedRecord.negativeDecisionSource,
     negativeScoreThreshold: parsedRecord.negativeScoreThreshold,
@@ -164,13 +139,19 @@ async function writeTrackedPost(record: TrackedPost): Promise<void> {
     redisKey,
     status: record.status,
     checkCount: record.checkCount,
+    trackingMode: record.trackingMode,
     lastKnownScore: record.lastKnownScore,
     lastKnownUpvotes: record.lastKnownUpvotes,
     lastKnownDownvotes: record.lastKnownDownvotes,
     lastKnownUpvoteRatio: record.lastKnownUpvoteRatio,
-    lastKnownPostDataUps: record.lastKnownPostDataUps,
     lastCalculatedVoteScore: record.lastCalculatedVoteScore,
-    lastRatioEstimatedScore: record.lastRatioEstimatedScore,
+    lastRawUpvoteRatio: record.lastRawUpvoteRatio,
+    lastRawRatioPercent: record.lastRawRatioPercent,
+    minimumTotalVotes: record.minimumTotalVotes,
+    guaranteedSpread: record.guaranteedSpread,
+    lastRatioDecision: record.lastRatioDecision,
+    lastRatioDecisionReason: record.lastRatioDecisionReason,
+    lastOpenAIError: record.lastOpenAIError,
     negativeDecisionScore: record.negativeDecisionScore,
     negativeDecisionSource: record.negativeDecisionSource,
     lastJobId: record.lastJobId,
@@ -209,13 +190,19 @@ async function stopTracking(
     status,
     reason: stopReason ?? status,
     checkCount: record.checkCount,
+    trackingMode: record.trackingMode,
     lastKnownScore: record.lastKnownScore,
     lastKnownUpvotes: record.lastKnownUpvotes,
     lastKnownDownvotes: record.lastKnownDownvotes,
     lastKnownUpvoteRatio: record.lastKnownUpvoteRatio,
-    lastKnownPostDataUps: record.lastKnownPostDataUps,
     lastCalculatedVoteScore: record.lastCalculatedVoteScore,
-    lastRatioEstimatedScore: record.lastRatioEstimatedScore,
+    lastRawUpvoteRatio: record.lastRawUpvoteRatio,
+    lastRawRatioPercent: record.lastRawRatioPercent,
+    minimumTotalVotes: record.minimumTotalVotes,
+    guaranteedSpread: record.guaranteedSpread,
+    lastRatioDecision: record.lastRatioDecision,
+    lastRatioDecisionReason: record.lastRatioDecisionReason,
+    lastOpenAIError: record.lastOpenAIError,
     negativeDecisionScore: record.negativeDecisionScore,
     negativeDecisionSource: record.negativeDecisionSource,
     auditKey: auditKey(record.postId),
@@ -239,7 +226,7 @@ async function stopTracking(
 
 async function fetchPostSnapshot(
   postId: string
-): Promise<{ post: Awaited<ReturnType<typeof reddit.getPostById>>; snapshot: PostSnapshot } | null> {
+): Promise<FetchedPostSnapshot | null> {
   try {
     logInfo('Fetching current Reddit post state.', { postId });
     const post = await reddit.getPostById(postId as T3);
@@ -261,37 +248,9 @@ async function fetchPostSnapshot(
   }
 }
 
-async function fetchPostDataVoteSignals(
-  postId: string
-): Promise<PostDataVoteSignals> {
-  try {
-    logInfo('Fetching Reddit post data vote signals.', { postId });
-    const postData = await reddit.getPostData(postId as T3);
-    const signals = readPostDataVoteSignals(postData);
-
-    logInfo('Fetched Reddit post data vote signals.', {
-      postId,
-      postDataHasScore: typeof signals.score === 'number',
-      postDataScore: signals.score,
-      postDataHasUps: typeof signals.ups === 'number',
-      postDataUps: signals.ups,
-      postDataHasUpvoteRatio: typeof signals.upvoteRatio === 'number',
-      postDataUpvoteRatio: signals.upvoteRatio,
-      postDataHasViewCount: typeof signals.viewCount === 'number',
-      postDataViewCount: signals.viewCount,
-    });
-
-    return signals;
-  } catch (err: unknown) {
-    logError('Could not fetch Reddit post data vote signals.', { postId }, err);
-    return {};
-  }
-}
-
 function enrichSnapshotWithStoredVotes(
   snapshot: PostSnapshot,
-  record: TrackedPost,
-  postDataVoteSignals: PostDataVoteSignals = {}
+  record: TrackedPost
 ): PostSnapshot {
   const enrichedSnapshot: PostSnapshot = {
     ...snapshot,
@@ -303,18 +262,6 @@ function enrichSnapshotWithStoredVotes(
 
   if (typeof record.lastKnownDownvotes === 'number') {
     enrichedSnapshot.downvotes = record.lastKnownDownvotes;
-  }
-
-  if (typeof postDataVoteSignals.ups === 'number') {
-    enrichedSnapshot.postDataUps = postDataVoteSignals.ups;
-  } else if (typeof record.lastKnownPostDataUps === 'number') {
-    enrichedSnapshot.postDataUps = record.lastKnownPostDataUps;
-  }
-
-  if (typeof postDataVoteSignals.upvoteRatio === 'number') {
-    enrichedSnapshot.upvoteRatio = postDataVoteSignals.upvoteRatio;
-  } else if (typeof record.lastKnownUpvoteRatio === 'number') {
-    enrichedSnapshot.upvoteRatio = record.lastKnownUpvoteRatio;
   }
 
   if (typeof record.lastCalculatedVoteScore === 'number') {
@@ -342,23 +289,11 @@ function applyScoreSignals(
       updatedRecord.lastKnownDownvotes = snapshot.downvotes;
     }
 
-    if (typeof snapshot.postDataUps === 'number') {
-      updatedRecord.lastKnownPostDataUps = snapshot.postDataUps;
-    }
-
-    if (typeof snapshot.upvoteRatio === 'number') {
-      updatedRecord.lastKnownUpvoteRatio = snapshot.upvoteRatio;
-    }
   }
 
   if (typeof negativeDecision?.calculatedVoteScore === 'number') {
     updatedRecord.lastCalculatedVoteScore =
       negativeDecision.calculatedVoteScore;
-  }
-
-  if (typeof negativeDecision?.ratioEstimatedScore === 'number') {
-    updatedRecord.lastRatioEstimatedScore =
-      negativeDecision.ratioEstimatedScore;
   }
 
   if (typeof negativeDecision?.score === 'number') {
@@ -367,6 +302,182 @@ function applyScoreSignals(
   }
 
   return updatedRecord;
+}
+
+function readOpenAIApiKey(settingsValues: { openaiApiKey?: unknown }): string {
+  const value = settingsValues.openaiApiKey;
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function shouldUseAdvancedTracking(snapshot: PostSnapshot | null): boolean {
+  return Boolean(snapshot && snapshot.score <= 0);
+}
+
+async function fetchAndLogRawRatio(args: {
+  postId: string;
+  apiKey: string;
+}): Promise<OpenAIRatioFetchResult> {
+  const result = await fetchRedditRatioViaOpenAI({
+    apiKey: args.apiKey,
+    postId: args.postId,
+  });
+
+  if (result.ok) {
+    logInfo('Fetched OpenAI-proxied Reddit ratio.', {
+      postId: args.postId,
+      jsonReceived: result.jsonReceived,
+      requestedUrl: result.requestedUrl,
+      retrievedUrl: result.retrievedUrl,
+      rawName: result.fields?.name,
+      rawId: result.fields?.id,
+      rawUpvoteRatio: result.fields?.upvoteRatio,
+      rawRatioPercent: result.fields?.ratioPercent,
+      rawUps: result.fields?.ups,
+      rawDowns: result.fields?.downs,
+      rawScore: result.fields?.score,
+    });
+  } else {
+    logWarn('OpenAI-proxied Reddit ratio fetch failed.', {
+      postId: args.postId,
+      jsonReceived: result.jsonReceived,
+      requestedUrl: result.requestedUrl,
+      retrievedUrl: result.retrievedUrl,
+      error: result.error,
+    });
+  }
+
+  return result;
+}
+
+function applyOpenAIRatioResult(
+  record: TrackedPost,
+  result: OpenAIRatioFetchResult,
+  now: number,
+  moderatorThreshold: number,
+  latestScore: number
+): TrackedPost {
+  const updatedRecord: TrackedPost = {
+    ...record,
+    trackingMode: 'advanced',
+    lastOpenAIRatioCheckAt: now,
+    lastOpenAIRequestedUrl: result.requestedUrl,
+    lastOpenAIRetrievedUrl: result.retrievedUrl,
+    lastOpenAIJsonReceived: result.jsonReceived,
+  };
+
+  if (result.error) {
+    updatedRecord.lastOpenAIError = result.error;
+  }
+
+  if (!record.advancedTrackingStartedAt) {
+    updatedRecord.advancedTrackingStartedAt = now;
+  }
+
+  if (!record.enteredAdvancedTrackingAt) {
+    updatedRecord.enteredAdvancedTrackingAt = now;
+  }
+
+  if (result.fields) {
+    if (typeof result.fields.upvoteRatio === 'number') {
+      updatedRecord.lastRawUpvoteRatio = result.fields.upvoteRatio;
+
+      const ratioDecision = shouldRemoveByRatio({
+        ratio: result.fields.upvoteRatio,
+        moderatorThreshold,
+        minimumTotalVotes: record.minimumTotalVotes ?? 0,
+      });
+
+      updatedRecord.minimumTotalVotes =
+        ratioDecision.updatedMinimumTotalVotes;
+      updatedRecord.maximumTotalVotesCap = confidenceModelMaxVotes;
+      updatedRecord.guaranteedSpread = ratioDecision.guaranteedSpread;
+      updatedRecord.possibleStates = ratioDecision.possibleStates;
+      updatedRecord.consecutiveNegativeChecks =
+        result.fields.upvoteRatio <= 0.4
+          ? (record.consecutiveNegativeChecks ?? 0) + 1
+          : 0;
+      updatedRecord.lastRatioDecision = ratioDecision.remove
+        ? 'remove'
+        : result.fields.upvoteRatio <= 0.4
+          ? 'watch'
+          : 'none';
+      updatedRecord.lastRatioDecisionReason = ratioDecision.reason;
+
+      logInfo('Advanced vote tracking updated ratio confidence.', {
+        postId: record.postId,
+        ratio: result.fields.upvoteRatio,
+        latestScore,
+        minimumTotalVotes: updatedRecord.minimumTotalVotes,
+        guaranteedSpread: updatedRecord.guaranteedSpread,
+        threshold: moderatorThreshold,
+        decision: updatedRecord.lastRatioDecision,
+        reason: updatedRecord.lastRatioDecisionReason,
+        possibleStateCount: ratioDecision.possibleStates.length,
+      });
+    }
+
+    if (result.fields.ratioPercent !== 'missing') {
+      updatedRecord.lastRawRatioPercent = result.fields.ratioPercent;
+    }
+
+    if (typeof result.fields.score === 'number') {
+      updatedRecord.lastRawJsonScore = result.fields.score;
+    }
+
+    if (typeof result.fields.ups === 'number') {
+      updatedRecord.lastRawJsonUps = result.fields.ups;
+    }
+
+    if (typeof result.fields.downs === 'number') {
+      updatedRecord.lastRawJsonDowns = result.fields.downs;
+    }
+  }
+
+  return updatedRecord;
+}
+
+function getRatioDecision(record: TrackedPost): RatioDecision | undefined {
+  if (
+    record.lastRatioDecisionReason === undefined ||
+    record.minimumTotalVotes === undefined ||
+    record.possibleStates === undefined
+  ) {
+    return undefined;
+  }
+
+  return {
+    remove: record.lastRatioDecision === 'remove',
+    reason: record.lastRatioDecisionReason,
+    updatedMinimumTotalVotes: record.minimumTotalVotes,
+    guaranteedSpread: record.guaranteedSpread ?? null,
+    possibleStates: record.possibleStates,
+  };
+}
+
+function buildRatioActionReason(action: TrackedPost['actionToTake']): string {
+  if (action === 'report') {
+    return 'Reported for downvote ratio threshold';
+  }
+
+  if (action === 'filter') {
+    return 'Filtered for downvote ratio threshold';
+  }
+
+  return 'Removed for downvote ratio threshold';
+}
+
+function buildRatioRemovalExplanation(record: TrackedPost): string {
+  const parts = [
+    "Your post was removed because Reddit's reported upvote ratio indicated sustained negative community feedback.",
+  ];
+
+  if (typeof record.guaranteedSpread === 'number') {
+    parts.push(
+      `The app uses a conservative estimated minimum vote spread; it does not know exact upvote or downvote counts.`
+    );
+  }
+
+  return parts.join(' ');
 }
 
 async function markErrorAndReschedule(
@@ -394,8 +505,9 @@ async function markErrorAndReschedule(
   }
 
   const nextCheckCount = record.checkCount + 1;
-  const nextRunAt = getNextCheckRunAt(nextCheckCount, now);
-  const nextDelayMinutes = getNextCheckDelayMinutes(nextCheckCount);
+  const cadence = record.trackingMode === 'advanced' ? 'advanced' : 'normal';
+  const nextRunAt = getNextCheckRunAt(nextCheckCount, now, cadence);
+  const nextDelayMinutes = getNextCheckDelayMinutes(nextCheckCount, cadence);
   const jobId = await scheduler.runJob({
     name: CHECK_WATCHED_POST_TASK,
     data: { postId: record.postId },
@@ -433,8 +545,9 @@ async function scheduleRetryWithoutRecordWrite(
   }
 
   const nextCheckCount = record.checkCount + 1;
-  const nextRunAt = getNextCheckRunAt(nextCheckCount, now);
-  const nextDelayMinutes = getNextCheckDelayMinutes(nextCheckCount);
+  const cadence = record.trackingMode === 'advanced' ? 'advanced' : 'normal';
+  const nextRunAt = getNextCheckRunAt(nextCheckCount, now, cadence);
+  const nextDelayMinutes = getNextCheckDelayMinutes(nextCheckCount, cadence);
   const jobId = await scheduler.runJob({
     name: CHECK_WATCHED_POST_TASK,
     data: { postId: record.postId },
@@ -449,6 +562,216 @@ async function scheduleRetryWithoutRecordWrite(
     nextDelayMinutes,
     nextRunAt,
     jobId,
+  });
+}
+
+async function actionTrackedPost(args: {
+  postId: string;
+  fetched: FetchedPostSnapshot;
+  recordForAction: TrackedPost;
+  currentSnapshot: PostSnapshot | null;
+  negativeDecision: NegativeDecisionScore | undefined;
+  now: number;
+  actionReason: string;
+  stopReason: string;
+  removalExplanation?: string;
+}): Promise<void> {
+  logInfo('Attempting Redis action lock.', {
+    postId: args.postId,
+    actionLockKey: actionLockKey(args.postId),
+  });
+
+  const actionLockWasSet = await redis.set(actionLockKey(args.postId), '1', {
+    nx: true,
+    expiration: new Date(args.now + 60 * 60 * 1000),
+  });
+
+  if (actionLockWasSet !== 'OK') {
+    logWarn('Action skipped because another check already owns the action lock.', {
+      postId: args.postId,
+      actionLockResult: actionLockWasSet,
+    });
+    const latestRecord = await loadTrackedPost(args.postId);
+    if (latestRecord?.status === 'active') {
+      await scheduleRetryWithoutRecordWrite(
+        latestRecord,
+        Date.now(),
+        'action_lock_busy'
+      );
+    }
+    return;
+  }
+
+  logInfo('Redis action lock acquired.', {
+    postId: args.postId,
+    actionLockResult: actionLockWasSet,
+  });
+
+  const latestRecord = await loadTrackedPost(args.postId);
+  if (!latestRecord || latestRecord.status !== 'active') {
+    logWarn('Action skipped after lock because latest record is no longer actionable.', {
+      postId: args.postId,
+      latestStatus: latestRecord?.status,
+      hasFetchedPost: true,
+    });
+    await releaseActionLock(args.postId, 'latest_record_not_actionable');
+    return;
+  }
+
+  const actionRecord: TrackedPost = {
+    ...latestRecord,
+    ...args.recordForAction,
+    status: latestRecord.status,
+  };
+
+  await writeTrackedPost({
+    ...applyScoreSignals(actionRecord, args.currentSnapshot, args.negativeDecision),
+    status: 'actioning',
+    updatedAt: args.now,
+  });
+
+  logInfo('Applying selected moderation action.', {
+    postId: args.postId,
+    actionToTake: actionRecord.actionToTake,
+    score: args.currentSnapshot?.score,
+    calculatedVoteScore: args.negativeDecision?.calculatedVoteScore,
+    negativeDecisionScore: args.negativeDecision?.score,
+    negativeDecisionSource: args.negativeDecision?.source,
+    rawUpvoteRatio: actionRecord.lastRawUpvoteRatio,
+    minimumTotalVotes: actionRecord.minimumTotalVotes,
+    guaranteedSpread: actionRecord.guaranteedSpread,
+    threshold: actionRecord.negativeScoreThreshold,
+    ratioDecisionReason: actionRecord.lastRatioDecisionReason,
+    reason: args.actionReason,
+  });
+
+  let moderationActionResult: ModerationActionResult = {
+    modmailStatus: 'not_applicable',
+  };
+
+  try {
+    const postLink = buildPostLink({
+      postId: args.postId,
+      subredditName: actionRecord.subredditName,
+      permalink: args.fetched.post.permalink,
+    });
+    const moderationActionArgs: ModerationActionArgs = {
+      redditClient: reddit,
+      post: args.fetched.post,
+      action: actionRecord.actionToTake,
+      threshold: actionRecord.negativeScoreThreshold,
+      subredditName: actionRecord.subredditName,
+      postLink,
+      reason: args.actionReason,
+    };
+
+    if (actionRecord.authorName) {
+      moderationActionArgs.authorName = actionRecord.authorName;
+    }
+
+    if (args.removalExplanation) {
+      moderationActionArgs.removalExplanation = args.removalExplanation;
+    }
+
+    if (actionRecord.actionToTake === 'remove') {
+      logInfo('Preparing removal modmail notification.', {
+        postId: args.postId,
+        authorName: actionRecord.authorName,
+        subredditName: actionRecord.subredditName,
+        postLink,
+        subject: REMOVAL_MODMAIL_SUBJECT,
+      });
+    }
+
+    moderationActionResult = await applyModerationAction(moderationActionArgs);
+  } catch (err: unknown) {
+    await releaseActionLock(args.postId, 'moderation_action_failed');
+    await markErrorAndReschedule(
+      {
+        ...applyScoreSignals(actionRecord, args.currentSnapshot, args.negativeDecision),
+        status: 'active',
+      },
+      err,
+      Date.now()
+    );
+    return;
+  }
+
+  if (moderationActionResult.modmailStatus === 'sent') {
+    logInfo('Removal modmail notification sent.', {
+      postId: args.postId,
+      authorName: actionRecord.authorName,
+      subredditName: actionRecord.subredditName,
+      modmailSentAt: moderationActionResult.modmailSentAt,
+    });
+  } else if (moderationActionResult.modmailStatus === 'failed') {
+    logError(
+      'Removal modmail notification failed.',
+      {
+        postId: args.postId,
+        authorName: actionRecord.authorName,
+        subredditName: actionRecord.subredditName,
+        modmailErrorMessage: moderationActionResult.modmailErrorMessage,
+      },
+      moderationActionResult.modmailError
+    );
+  } else if (moderationActionResult.modmailStatus === 'skipped') {
+    logWarn('Removal modmail notification skipped.', {
+      postId: args.postId,
+      authorName: actionRecord.authorName,
+      subredditName: actionRecord.subredditName,
+      reason: moderationActionResult.modmailSkippedReason,
+    });
+  }
+
+  const actionedRecord: TrackedPost = {
+    ...applyScoreSignals(actionRecord, args.currentSnapshot, args.negativeDecision),
+    status: 'actioned',
+    actionedAt: Date.now(),
+  };
+
+  actionedRecord.modmailStatus = moderationActionResult.modmailStatus;
+
+  if (typeof moderationActionResult.modmailSentAt === 'number') {
+    actionedRecord.modmailSentAt = moderationActionResult.modmailSentAt;
+  }
+
+  if (typeof moderationActionResult.modmailSkippedReason === 'string') {
+    actionedRecord.modmailSkippedReason =
+      moderationActionResult.modmailSkippedReason;
+  }
+
+  if (typeof moderationActionResult.modmailErrorMessage === 'string') {
+    actionedRecord.modmailErrorMessage =
+      moderationActionResult.modmailErrorMessage;
+  }
+
+  await stopTracking(
+    actionedRecord,
+    'actioned',
+    Date.now(),
+    args.stopReason
+  );
+  await redis.hIncrBy(
+    statsKey(actionRecord.subredditId),
+    `action_${actionRecord.actionToTake}`,
+    1
+  );
+
+  logInfo('Post action complete and audit record written.', {
+    postId: args.postId,
+    actionToTake: actionRecord.actionToTake,
+    score: args.currentSnapshot?.score,
+    calculatedVoteScore: args.negativeDecision?.calculatedVoteScore,
+    negativeDecisionScore: args.negativeDecision?.score,
+    negativeDecisionSource: args.negativeDecision?.source,
+    rawUpvoteRatio: actionRecord.lastRawUpvoteRatio,
+    minimumTotalVotes: actionRecord.minimumTotalVotes,
+    guaranteedSpread: actionRecord.guaranteedSpread,
+    threshold: actionRecord.negativeScoreThreshold,
+    ratioDecisionReason: actionRecord.lastRatioDecisionReason,
+    auditKey: auditKey(args.postId),
+    status: 'actioned',
   });
 }
 
@@ -482,7 +805,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
 
   try {
     logInfo('Reading app installation settings for scheduled check.', { postId });
-    const currentSettings = normalizeSettings(await devvitSettings.getAll());
+    const settingsValues = await devvitSettings.getAll<SettingsValues>();
+    const currentSettings = normalizeSettings(settingsValues);
+    const openAIApiKey = readOpenAIApiKey(settingsValues);
     logInfo('Loaded app installation settings for scheduled check.', {
       postId,
       isActive: currentSettings.isActive,
@@ -494,15 +819,8 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     });
 
     const fetched = await fetchPostSnapshot(postId);
-    const postDataVoteSignals = fetched
-      ? await fetchPostDataVoteSignals(postId)
-      : {};
     const currentSnapshot = fetched
-      ? enrichSnapshotWithStoredVotes(
-          fetched.snapshot,
-          initialRecord,
-          postDataVoteSignals
-        )
+      ? enrichSnapshotWithStoredVotes(fetched.snapshot, initialRecord)
       : null;
     const negativeDecision = currentSnapshot
       ? getNegativeDecisionScore(currentSnapshot)
@@ -514,10 +832,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         fetchedScore: currentSnapshot.score,
         storedUpvotes: currentSnapshot.upvotes,
         storedDownvotes: currentSnapshot.downvotes,
-        postDataUps: currentSnapshot.postDataUps,
-        upvoteRatio: currentSnapshot.upvoteRatio,
         calculatedVoteScore: negativeDecision.calculatedVoteScore,
-        ratioEstimatedScore: negativeDecision.ratioEstimatedScore,
         negativeDecisionScore: negativeDecision.score,
         negativeDecisionSource: negativeDecision.source,
       });
@@ -547,7 +862,6 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         score: currentSnapshot?.score,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
-        ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
         checkCount: initialRecord.checkCount,
       });
       await stopTracking(
@@ -570,10 +884,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         score: currentSnapshot?.score,
         upvotes: currentSnapshot?.upvotes,
         downvotes: currentSnapshot?.downvotes,
-        postDataUps: currentSnapshot?.postDataUps,
-        upvoteRatio: currentSnapshot?.upvoteRatio,
         calculatedVoteScore: negativeDecision?.calculatedVoteScore,
-        ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
         negativeScoreThreshold: initialRecord.negativeScoreThreshold,
@@ -581,212 +892,98 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         reason: actionReason,
       });
 
-      logInfo('Attempting Redis action lock.', {
-        postId,
-        actionLockKey: actionLockKey(postId),
-      });
-
-      const actionLockWasSet = await redis.set(actionLockKey(postId), '1', {
-        nx: true,
-        expiration: new Date(now + 60 * 60 * 1000),
-      });
-
-      if (actionLockWasSet !== 'OK') {
-        logWarn('Action skipped because another check already owns the action lock.', {
+      if (fetched) {
+        await actionTrackedPost({
           postId,
-          actionLockResult: actionLockWasSet,
-        });
-        const latestRecord = await loadTrackedPost(postId);
-        if (latestRecord?.status === 'active') {
-          await scheduleRetryWithoutRecordWrite(
-            latestRecord,
-            Date.now(),
-            'action_lock_busy'
-          );
-        }
-        return c.json<TaskResponse>({}, 200);
-      }
-
-      logInfo('Redis action lock acquired.', {
-        postId,
-        actionLockResult: actionLockWasSet,
-      });
-
-      const latestRecord = await loadTrackedPost(postId);
-      if (!latestRecord || latestRecord.status !== 'active' || !fetched) {
-        logWarn('Action skipped after lock because latest record is no longer actionable.', {
-          postId,
-          latestStatus: latestRecord?.status,
-          hasFetchedPost: Boolean(fetched),
-        });
-        await releaseActionLock(postId, 'latest_record_not_actionable');
-        return c.json<TaskResponse>({}, 200);
-      }
-
-      await writeTrackedPost({
-        ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision),
-        status: 'actioning',
-        updatedAt: now,
-      });
-
-      logInfo('Applying selected moderation action.', {
-        postId,
-        actionToTake: latestRecord.actionToTake,
-        score: currentSnapshot?.score,
-        upvotes: currentSnapshot?.upvotes,
-        downvotes: currentSnapshot?.downvotes,
-        postDataUps: currentSnapshot?.postDataUps,
-        upvoteRatio: currentSnapshot?.upvoteRatio,
-        calculatedVoteScore: negativeDecision?.calculatedVoteScore,
-        ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
-        negativeDecisionScore: negativeDecision?.score,
-        negativeDecisionSource: negativeDecision?.source,
-        negativeScoreThreshold: latestRecord.negativeScoreThreshold,
-        reason: actionReason,
-      });
-
-      let moderationActionResult: ModerationActionResult = {
-        modmailStatus: 'not_applicable',
-      };
-
-      try {
-        const postLink = buildPostLink({
-          postId,
-          subredditName: latestRecord.subredditName,
-          permalink: fetched.post.permalink,
-        });
-        const moderationActionArgs: ModerationActionArgs = {
-          redditClient: reddit,
-          post: fetched.post,
-          action: latestRecord.actionToTake,
-          threshold: latestRecord.negativeScoreThreshold,
-          subredditName: latestRecord.subredditName,
-          postLink,
-        };
-
-        if (latestRecord.authorName) {
-          moderationActionArgs.authorName = latestRecord.authorName;
-        }
-
-        if (latestRecord.actionToTake === 'remove') {
-          logInfo('Preparing removal modmail notification.', {
-            postId,
-            authorName: latestRecord.authorName,
-            subredditName: latestRecord.subredditName,
-            postLink,
-            subject: REMOVAL_MODMAIL_SUBJECT,
-          });
-        }
-
-        moderationActionResult =
-          await applyModerationAction(moderationActionArgs);
-      } catch (err: unknown) {
-        await releaseActionLock(postId, 'moderation_action_failed');
-        await markErrorAndReschedule(
-          {
-            ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision),
-            status: 'active',
-          },
-          err,
-          Date.now()
-        );
-        return c.json<TaskResponse>({}, 200);
-      }
-
-      if (moderationActionResult.modmailStatus === 'sent') {
-        logInfo('Removal modmail notification sent.', {
-          postId,
-          authorName: latestRecord.authorName,
-          subredditName: latestRecord.subredditName,
-          modmailSentAt: moderationActionResult.modmailSentAt,
-        });
-      } else if (moderationActionResult.modmailStatus === 'failed') {
-        logError(
-          'Removal modmail notification failed.',
-          {
-            postId,
-            authorName: latestRecord.authorName,
-            subredditName: latestRecord.subredditName,
-            modmailErrorMessage: moderationActionResult.modmailErrorMessage,
-          },
-          moderationActionResult.modmailError
-        );
-      } else if (moderationActionResult.modmailStatus === 'skipped') {
-        logWarn('Removal modmail notification skipped.', {
-          postId,
-          authorName: latestRecord.authorName,
-          subredditName: latestRecord.subredditName,
-          reason: moderationActionResult.modmailSkippedReason,
+          fetched,
+          recordForAction: initialRecord,
+          currentSnapshot,
+          negativeDecision,
+          now,
+          actionReason,
+          stopReason: initialRecord.actionToTake,
         });
       }
-
-      const actionedRecord: TrackedPost = {
-        ...applyScoreSignals(latestRecord, currentSnapshot, negativeDecision),
-        status: 'actioned',
-        actionedAt: Date.now(),
-      };
-
-      actionedRecord.modmailStatus = moderationActionResult.modmailStatus;
-
-      if (typeof moderationActionResult.modmailSentAt === 'number') {
-        actionedRecord.modmailSentAt = moderationActionResult.modmailSentAt;
-      }
-
-      if (typeof moderationActionResult.modmailSkippedReason === 'string') {
-        actionedRecord.modmailSkippedReason =
-          moderationActionResult.modmailSkippedReason;
-      }
-
-      if (typeof moderationActionResult.modmailErrorMessage === 'string') {
-        actionedRecord.modmailErrorMessage =
-          moderationActionResult.modmailErrorMessage;
-      }
-
-      await stopTracking(
-        actionedRecord,
-        'actioned',
-        Date.now(),
-        latestRecord.actionToTake
-      );
-      await redis.hIncrBy(
-        statsKey(latestRecord.subredditId),
-        `action_${latestRecord.actionToTake}`,
-        1
-      );
-
-      logInfo('Post action complete and audit record written.', {
-        postId,
-        actionToTake: latestRecord.actionToTake,
-        score: currentSnapshot?.score,
-        upvotes: currentSnapshot?.upvotes,
-        downvotes: currentSnapshot?.downvotes,
-        postDataUps: currentSnapshot?.postDataUps,
-        upvoteRatio: currentSnapshot?.upvoteRatio,
-        calculatedVoteScore: negativeDecision?.calculatedVoteScore,
-        ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
-        negativeDecisionScore: negativeDecision?.score,
-        negativeDecisionSource: negativeDecision?.source,
-        auditKey: auditKey(postId),
-        status: 'actioned',
-      });
 
       return c.json<TaskResponse>({}, 200);
     }
 
     const nextCheckCount = initialRecord.checkCount + 1;
-    const nextDelayMinutes = getNextCheckDelayMinutes(nextCheckCount);
-    const nextRunAt = getNextCheckRunAt(nextCheckCount, now);
+    const advancedTracking = shouldUseAdvancedTracking(currentSnapshot);
+    let recordForNextCheck = applyScoreSignals(
+      initialRecord,
+      currentSnapshot,
+      negativeDecision
+    );
+
+    if (advancedTracking) {
+      const ratioResult = await fetchAndLogRawRatio({
+        postId,
+        apiKey: openAIApiKey,
+      });
+      recordForNextCheck = applyOpenAIRatioResult(
+        recordForNextCheck,
+        ratioResult,
+        now,
+        initialRecord.negativeScoreThreshold,
+        currentSnapshot?.score ?? 0
+      );
+
+      const ratioDecision = getRatioDecision(recordForNextCheck);
+      if (ratioDecision?.remove && fetched) {
+        const actionReason = buildRatioActionReason(
+          recordForNextCheck.actionToTake
+        );
+        logInfo('Decision: action post because ratio confidence threshold was met.', {
+          postId,
+          rawUpvoteRatio: recordForNextCheck.lastRawUpvoteRatio,
+          minimumTotalVotes: recordForNextCheck.minimumTotalVotes,
+          guaranteedSpread: recordForNextCheck.guaranteedSpread,
+          threshold: recordForNextCheck.negativeScoreThreshold,
+          ratioDecisionReason: recordForNextCheck.lastRatioDecisionReason,
+          possibleStateCount: recordForNextCheck.possibleStates?.length,
+          actionToTake: recordForNextCheck.actionToTake,
+          reason: actionReason,
+        });
+        await actionTrackedPost({
+          postId,
+          fetched,
+          recordForAction: recordForNextCheck,
+          currentSnapshot,
+          negativeDecision,
+          now,
+          actionReason,
+          stopReason: recordForNextCheck.lastRatioDecisionReason ?? 'ratio_action',
+          removalExplanation: buildRatioRemovalExplanation(recordForNextCheck),
+        });
+        return c.json<TaskResponse>({}, 200);
+      }
+    } else {
+      recordForNextCheck = {
+        ...recordForNextCheck,
+        trackingMode: 'normal',
+      };
+    }
+
+    const nextCadence = advancedTracking ? 'advanced' : 'normal';
+    const nextDelayMinutes = getNextCheckDelayMinutes(
+      nextCheckCount,
+      nextCadence
+    );
+    const nextRunAt = getNextCheckRunAt(nextCheckCount, now, nextCadence);
     logInfo('Decision: reschedule because no terminal condition was met.', {
       postId,
       score: currentSnapshot?.score,
       upvotes: currentSnapshot?.upvotes,
       downvotes: currentSnapshot?.downvotes,
-      postDataUps: currentSnapshot?.postDataUps,
-      upvoteRatio: currentSnapshot?.upvoteRatio,
       calculatedVoteScore: negativeDecision?.calculatedVoteScore,
-      ratioEstimatedScore: negativeDecision?.ratioEstimatedScore,
       negativeDecisionScore: negativeDecision?.score,
       negativeDecisionSource: negativeDecision?.source,
+      trackingMode: recordForNextCheck.trackingMode,
+      rawUpvoteRatio: recordForNextCheck.lastRawUpvoteRatio,
+      rawRatioPercent: recordForNextCheck.lastRawRatioPercent,
+      openAIJsonReceived: recordForNextCheck.lastOpenAIJsonReceived,
+      openAIError: recordForNextCheck.lastOpenAIError,
       previousCheckCount: initialRecord.checkCount,
       nextCheckCount,
       nextDelayMinutes,
@@ -800,7 +997,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     });
 
     const updatedRecord: TrackedPost = {
-      ...applyScoreSignals(initialRecord, currentSnapshot, negativeDecision),
+      ...recordForNextCheck,
       checkCount: nextCheckCount,
       lastJobId: jobId,
       updatedAt: now,
@@ -814,13 +1011,16 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       checkCount: nextCheckCount,
       nextDelayMinutes,
       nextRunAt,
+      trackingMode: updatedRecord.trackingMode,
       score: updatedRecord.lastKnownScore,
       upvotes: updatedRecord.lastKnownUpvotes,
       downvotes: updatedRecord.lastKnownDownvotes,
-      postDataUps: updatedRecord.lastKnownPostDataUps,
-      upvoteRatio: updatedRecord.lastKnownUpvoteRatio,
+      triggerUpvoteRatio: updatedRecord.lastKnownUpvoteRatio,
       calculatedVoteScore: updatedRecord.lastCalculatedVoteScore,
-      ratioEstimatedScore: updatedRecord.lastRatioEstimatedScore,
+      rawUpvoteRatio: updatedRecord.lastRawUpvoteRatio,
+      rawRatioPercent: updatedRecord.lastRawRatioPercent,
+      openAIJsonReceived: updatedRecord.lastOpenAIJsonReceived,
+      openAIError: updatedRecord.lastOpenAIError,
       negativeDecisionScore: updatedRecord.negativeDecisionScore,
       negativeDecisionSource: updatedRecord.negativeDecisionSource,
     });

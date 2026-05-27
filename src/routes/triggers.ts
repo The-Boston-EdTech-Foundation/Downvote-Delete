@@ -268,6 +268,7 @@ triggers.post('/on-post-submit', async (c) => {
       trackingStartedAt,
       trackingExpiresAt,
       checkCount: 0,
+      trackingMode: 'normal',
       negativeScoreThreshold: currentSettings.negativeScoreThreshold,
       positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
       actionToTake: currentSettings.actionToTake,

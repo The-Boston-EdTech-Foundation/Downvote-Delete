@@ -17,6 +17,13 @@
     }
   },
   "settings": {
+    "global": {
+      "openaiApiKey": {
+        "type": "string",
+        "label": "OpenAI API key",
+        "isSecret": true
+      }
+    },
     "subreddit": {
       "isActive": {
         "type": "boolean",
@@ -90,7 +97,11 @@
       "enable": true,
       "scope": "moderator"
     },
-    "redis": true
+    "redis": true,
+    "http": {
+      "enable": true,
+      "domains": ["api.openai.com"]
+    }
   },
   "dev": {
     "subreddit": "downvote_delete_dev"

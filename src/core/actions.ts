@@ -14,6 +14,7 @@ export type RemovalModmailInput = {
   username: string;
   subredditName: string;
   postLink: string;
+  explanation?: string;
 };
 
 export type ModerationActionResult = {
@@ -29,6 +30,8 @@ export type ModerationActionArgs = {
   post: Post;
   action: DownvoteDeleteAction;
   threshold: number;
+  reason?: string;
+  removalExplanation?: string;
   authorName?: string;
   subredditName?: string;
   postLink?: string;
@@ -54,7 +57,7 @@ export function buildRemovedForDownvotesModmailBody(
 ): string {
   return `Hi u/${input.username},
 
-Your post was removed because it received too much negative community feedback.
+${input.explanation ?? 'Your post was removed because it received too much negative community feedback.'}
 
 Posts may be downvoted for many reasons, including rule issues, content quality, or controversial opinions. This removal helps prevent your account from accumulating additional negative karma from the post.
 
@@ -69,15 +72,22 @@ export async function sendRemovalModmail(args: {
   username: string;
   subredditName: string;
   postLink: string;
+  explanation?: string;
 }): Promise<void> {
+  const bodyInput: RemovalModmailInput = {
+    username: args.username,
+    subredditName: args.subredditName,
+    postLink: args.postLink,
+  };
+
+  if (args.explanation) {
+    bodyInput.explanation = args.explanation;
+  }
+
   await args.redditClient.modMail.createConversation({
     subredditName: args.subredditName,
     subject: REMOVAL_MODMAIL_SUBJECT,
-    body: buildRemovedForDownvotesModmailBody({
-      username: args.username,
-      subredditName: args.subredditName,
-      postLink: args.postLink,
-    }),
+    body: buildRemovedForDownvotesModmailBody(bodyInput),
     to: `u/${args.username}`,
     isAuthorHidden: true,
   });
@@ -86,7 +96,7 @@ export async function sendRemovalModmail(args: {
 export async function applyModerationAction(
   args: ModerationActionArgs
 ): Promise<ModerationActionResult> {
-  const reason = buildActionReason(args.action, args.threshold);
+  const reason = args.reason ?? buildActionReason(args.action, args.threshold);
 
   if (args.action === ACTION_REPORT) {
     await args.redditClient.report(args.post, { reason });
@@ -124,12 +134,18 @@ export async function applyModerationAction(
     }
 
     try {
-      await sendRemovalModmail({
+      const modmailArgs: Parameters<typeof sendRemovalModmail>[0] = {
         redditClient: args.redditClient,
         username: args.authorName,
         subredditName: args.subredditName,
         postLink: args.postLink,
-      });
+      };
+
+      if (args.removalExplanation) {
+        modmailArgs.explanation = args.removalExplanation;
+      }
+
+      await sendRemovalModmail(modmailArgs);
 
       return {
         modmailStatus: 'sent',

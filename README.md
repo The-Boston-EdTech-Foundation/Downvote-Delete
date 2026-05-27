@@ -28,5 +28,6 @@ Downvote Delete will not:
 
 ## Patch Notes
 
+1.2.1 - Use of Reddit API for upvote ratio tracking. Devvit 0.13.0
 1.1.1 - Default tracking now 4 hours. Tracking changed to 2, 4, 6 hours. Improved downvote tracking.
 1.0.5 - Initial Public Release. Devvit 0.12.24

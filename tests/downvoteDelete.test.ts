@@ -8,12 +8,23 @@ import { getNextCheckDelayMinutes } from '../src/core/backoff';
 import {
   calculateVoteScore,
   decideTrackedPostCheck,
-  estimateScoreFromUpvoteRatio,
   getNegativeDecisionScore,
   shouldTrackNewPost,
   type PostSnapshot,
 } from '../src/core/decision';
 import { formatLogContext } from '../src/core/logging';
+import {
+  buildRedditByIdJsonUrl,
+  extractRawRedditVoteFields,
+  parseOpenAIRedditJsonResponse,
+} from '../src/core/openaiRatio';
+import {
+  buildRatioLookup,
+  evaluateRatioState,
+  shouldRemoveByRatio,
+  updateTrackedPostVoteState,
+  type TrackedPostVoteState,
+} from '../src/core/voteRatioModel';
 import {
   ACTION_FILTER,
   ACTION_REMOVE,
@@ -180,13 +191,377 @@ describe('settings normalization', () => {
 });
 
 describe('backoff schedule', () => {
-  test('uses incremental delays for post ages around 2, 5, 10, then every 10 minutes', () => {
+  test('uses incremental delays for post ages around 2, 5, 10, 20, then every 20 minutes', () => {
     expect(getNextCheckDelayMinutes(0)).toBe(2);
     expect(getNextCheckDelayMinutes(1)).toBe(3);
     expect(getNextCheckDelayMinutes(2)).toBe(5);
     expect(getNextCheckDelayMinutes(3)).toBe(10);
-    expect(getNextCheckDelayMinutes(4)).toBe(10);
-    expect(getNextCheckDelayMinutes(20)).toBe(10);
+    expect(getNextCheckDelayMinutes(4)).toBe(20);
+    expect(getNextCheckDelayMinutes(20)).toBe(20);
+  });
+
+  test('uses a 5 minute delay for advanced tracking checks', () => {
+    expect(getNextCheckDelayMinutes(0, 'advanced')).toBe(5);
+    expect(getNextCheckDelayMinutes(20, 'advanced')).toBe(5);
+  });
+});
+
+describe('OpenAI Reddit JSON ratio parsing', () => {
+  const jsonText =
+    '[{"kind":"Listing","data":{"children":[{"kind":"t3","data":{"name":"t3_1tocgkf","id":"1tocgkf","title":"Downvotes","upvote_ratio":0.43,"ups":0,"downs":0,"score":0}}]}}]';
+
+  test('builds the by_id URL with the full post id', () => {
+    expect(buildRedditByIdJsonUrl('t3_1tocgkf')).toBe(
+      'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1'
+    );
+    expect(buildRedditByIdJsonUrl('1tocgkf')).toBe(
+      'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1'
+    );
+  });
+
+  test('extracts raw vote fields from the array listing shape', () => {
+    expect(extractRawRedditVoteFields(jsonText)).toEqual({
+      name: 't3_1tocgkf',
+      id: '1tocgkf',
+      upvoteRatio: 0.43,
+      ratioPercent: '43.0%',
+      ups: 0,
+      downs: 0,
+      score: 0,
+    });
+  });
+
+  test('extracts raw vote fields from the object listing shape', () => {
+    expect(
+      extractRawRedditVoteFields(
+        '{"kind":"Listing","data":{"children":[{"kind":"t3","data":{"name":"t3_post","id":"post","upvote_ratio":0.25,"score":-1}}]}}'
+      )
+    ).toEqual({
+      name: 't3_post',
+      id: 'post',
+      upvoteRatio: 0.25,
+      ratioPercent: '25.0%',
+      ups: 'missing',
+      downs: 'missing',
+      score: -1,
+    });
+  });
+
+  test('returns a compact parsed OpenAI result without raw JSON text', () => {
+    const result = parseOpenAIRedditJsonResponse(
+      {
+        output_text: JSON.stringify({
+          ok: true,
+          requested_url:
+            'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
+          retrieved_url:
+            'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
+          json_text: jsonText,
+          error: '',
+        }),
+      },
+      'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1'
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      jsonReceived: true,
+      fields: {
+        upvoteRatio: 0.43,
+        ratioPercent: '43.0%',
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain('json_text');
+  });
+
+  test('returns a clean failure for malformed json_text', () => {
+    expect(
+      parseOpenAIRedditJsonResponse(
+        {
+          output_text: JSON.stringify({
+            ok: true,
+            requested_url:
+              'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
+            retrieved_url:
+              'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
+            json_text: '{"broken"',
+            error: '',
+          }),
+        },
+        'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1'
+      ).ok
+    ).toBe(false);
+  });
+});
+
+describe('vote ratio confidence model', () => {
+  const lookup = buildRatioLookup(30);
+
+  test('ratio <= 0.24 always removes', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.24,
+        moderatorThreshold: -30,
+        minimumTotalVotes: 0,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: true,
+      reason: 'severe_downvote_ratio',
+    });
+  });
+
+  test('ratio > 0.40 never removes from ratio alone', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.41,
+        moderatorThreshold: -1,
+        minimumTotalVotes: 0,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: false,
+      reason: 'ratio_above_tracking_range',
+    });
+  });
+
+  test('0.25 with minTotal 0 and threshold -2 removes', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.25,
+        moderatorThreshold: -2,
+        minimumTotalVotes: 0,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: true,
+      reason: 'guaranteed_spread_threshold_met',
+      guaranteedSpread: -2,
+      updatedMinimumTotalVotes: 4,
+    });
+  });
+
+  test('0.25 with minTotal 0 and threshold -3 does not remove', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.25,
+        moderatorThreshold: -3,
+        minimumTotalVotes: 0,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: false,
+      reason: 'continue_tracking',
+      guaranteedSpread: -2,
+    });
+  });
+
+  test('0.25 with minTotal 8 and threshold -4 removes', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.25,
+        moderatorThreshold: -4,
+        minimumTotalVotes: 8,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: true,
+      guaranteedSpread: -4,
+      updatedMinimumTotalVotes: 8,
+    });
+  });
+
+  test('0.33 with minTotal 0 and threshold -3 does not remove', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.33,
+        moderatorThreshold: -3,
+        minimumTotalVotes: 0,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: false,
+      guaranteedSpread: -1,
+      updatedMinimumTotalVotes: 3,
+    });
+  });
+
+  test('0.33 with minTotal 9 and threshold -3 removes', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.33,
+        moderatorThreshold: -3,
+        minimumTotalVotes: 9,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: true,
+      guaranteedSpread: -3,
+      updatedMinimumTotalVotes: 9,
+    });
+  });
+
+  test('0.33 with minTotal 15 and threshold -5 removes', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.33,
+        moderatorThreshold: -5,
+        minimumTotalVotes: 15,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: true,
+      guaranteedSpread: -5,
+      updatedMinimumTotalVotes: 15,
+    });
+  });
+
+  test('0.38 with minTotal 0 and threshold -3 does not remove', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.38,
+        moderatorThreshold: -3,
+        minimumTotalVotes: 0,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: false,
+      guaranteedSpread: -2,
+      updatedMinimumTotalVotes: 8,
+    });
+  });
+
+  test('0.38 with minTotal 13 and threshold -3 removes', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.38,
+        moderatorThreshold: -3,
+        minimumTotalVotes: 13,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: true,
+      guaranteedSpread: -3,
+      updatedMinimumTotalVotes: 13,
+    });
+  });
+
+  test('0.40 with minTotal 0 and threshold -3 does not remove', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.4,
+        moderatorThreshold: -3,
+        minimumTotalVotes: 0,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: false,
+      guaranteedSpread: -1,
+      updatedMinimumTotalVotes: 5,
+    });
+  });
+
+  test('0.40 with minTotal 15 and threshold -3 removes', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.4,
+        moderatorThreshold: -3,
+        minimumTotalVotes: 15,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: true,
+      guaranteedSpread: -3,
+      updatedMinimumTotalVotes: 15,
+    });
+  });
+
+  test('0.29 with minTotal 0 and threshold -3 removes', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.29,
+        moderatorThreshold: -3,
+        minimumTotalVotes: 0,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: true,
+      guaranteedSpread: -3,
+      updatedMinimumTotalVotes: 7,
+    });
+  });
+
+  test('0.30 with minTotal 0 and threshold -4 removes', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.3,
+        moderatorThreshold: -4,
+        minimumTotalVotes: 0,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: true,
+      guaranteedSpread: -4,
+      updatedMinimumTotalVotes: 10,
+    });
+  });
+
+  test('no exact state after filtering does not remove', () => {
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.25,
+        moderatorThreshold: -2,
+        minimumTotalVotes: 31,
+        lookup,
+      })
+    ).toMatchObject({
+      remove: false,
+      reason: 'no_possible_states_after_filter',
+      guaranteedSpread: null,
+      updatedMinimumTotalVotes: 31,
+      possibleStates: [],
+    });
+  });
+
+  test('minimumTotalVotes never decreases', () => {
+    const state: TrackedPostVoteState = {
+      postId: 't3_post',
+      createdAt: now,
+      lastCheckedAt: now,
+      latestScore: 0,
+      latestUpvoteRatio: null,
+      minimumTotalVotes: 15,
+      maximumTotalVotesCap: 30,
+      guaranteedSpread: null,
+      possibleStates: [],
+      consecutiveNegativeChecks: 0,
+      lastActionDecision: 'none',
+    };
+
+    expect(
+      updateTrackedPostVoteState({
+        state,
+        ratio: 0.33,
+        latestScore: 0,
+        moderatorThreshold: -3,
+        checkedAt: now + 1_000,
+        lookup,
+      }).minimumTotalVotes
+    ).toBe(15);
+  });
+
+  test('guaranteedSpread uses maximum spread among possible states', () => {
+    const evaluation = evaluateRatioState({
+      ratio: 0.33,
+      moderatorThreshold: -3,
+      minimumTotalVotes: 9,
+      lookup,
+    });
+
+    expect(evaluation.guaranteedSpread).toBe(-3);
+    expect(Math.min(...evaluation.possibleStates.map((state) => state.spread))).toBe(
+      -10
+    );
   });
 });
 
@@ -195,31 +570,12 @@ describe('tracked post decisions', () => {
     expect(calculateVoteScore({ upvotes: 1, downvotes: 2 })).toBe(-1);
   });
 
-  test('estimates a negative score from low upvote ratio and known upvotes', () => {
-    expect(
-      estimateScoreFromUpvoteRatio({ upvotes: 1, upvoteRatio: 0.25 })
-    ).toBe(-2);
-    expect(
-      estimateScoreFromUpvoteRatio({ upvotes: 2, upvoteRatio: 0.25 })
-    ).toBe(-4);
-  });
-
-  test('does not estimate a ratio score without a useful negative ratio signal', () => {
-    expect(estimateScoreFromUpvoteRatio({ upvotes: 1 })).toBeUndefined();
-    expect(
-      estimateScoreFromUpvoteRatio({ upvotes: 1, upvoteRatio: 0.5 })
-    ).toBeUndefined();
-    expect(
-      estimateScoreFromUpvoteRatio({ upvoteRatio: 0.25 })
-    ).toBeUndefined();
-  });
-
-  test('uses the lower calculated vote score for negative threshold decisions', () => {
+  test('keeps calculated vote score diagnostic but does not action from it', () => {
     const post = postSnapshot({ score: 0, upvotes: 1, downvotes: 4 });
 
     expect(getNegativeDecisionScore(post)).toEqual({
-      score: -3,
-      source: 'calculated_votes',
+      score: 0,
+      source: 'reddit_score',
       calculatedVoteScore: -3,
     });
 
@@ -230,7 +586,7 @@ describe('tracked post decisions', () => {
         post,
         now,
       })
-    ).toEqual({ type: 'action' });
+    ).toEqual({ type: 'reschedule' });
   });
 
   test('uses the normal Reddit score when it is lower than calculated votes', () => {
@@ -268,72 +624,23 @@ describe('tracked post decisions', () => {
     ).toEqual({ type: 'reschedule' });
   });
 
-  test('uses the ratio estimate for negative threshold decisions when it is lowest', () => {
-    const post = postSnapshot({ score: 0, upvotes: 2, upvoteRatio: 0.25 });
-
-    expect(getNegativeDecisionScore(post)).toEqual({
-      score: -4,
-      source: 'upvote_ratio_estimate',
-      ratioEstimatedScore: -4,
-    });
-
-    expect(
-      decideTrackedPostCheck({
-        tracking: trackedPost({ negativeScoreThreshold: -3 }),
-        settings: activeSettings,
-        post,
-        now,
-      })
-    ).toEqual({ type: 'action' });
-  });
-
-  test('actions when an explicit ratio estimate reaches the negative threshold', () => {
-    expect(
-      decideTrackedPostCheck({
-        tracking: trackedPost({ negativeScoreThreshold: -3 }),
-        settings: activeSettings,
-        post: postSnapshot({
-          score: 0,
-          ratioEstimatedScore: -3,
-        }),
-        now,
-      })
-    ).toEqual({ type: 'action' });
-  });
-
-  test('does not action from ratio estimate when it stays above the threshold', () => {
-    expect(
-      decideTrackedPostCheck({
-        tracking: trackedPost({ negativeScoreThreshold: -3 }),
-        settings: activeSettings,
-        post: postSnapshot({
-          score: 0,
-          ratioEstimatedScore: -2,
-        }),
-        now,
-      })
-    ).toEqual({ type: 'reschedule' });
-  });
-
-  test('uses the lowest available negative signal', () => {
+  test('uses normal score for decisions even when calculated votes are lower', () => {
     expect(
       getNegativeDecisionScore(
         postSnapshot({
           score: 0,
           upvotes: 2,
           downvotes: 4,
-          upvoteRatio: 0.25,
         })
       )
     ).toEqual({
-      score: -4,
-      source: 'upvote_ratio_estimate',
+      score: 0,
+      source: 'reddit_score',
       calculatedVoteScore: -2,
-      ratioEstimatedScore: -4,
     });
   });
 
-  test('positive stop still uses normal Reddit score instead of calculated votes or ratio estimates', () => {
+  test('positive stop still uses normal Reddit score instead of calculated votes', () => {
     expect(
       decideTrackedPostCheck({
         tracking: trackedPost({
@@ -345,7 +652,6 @@ describe('tracked post decisions', () => {
           score: 5,
           upvotes: 1,
           downvotes: 10,
-          upvoteRatio: 0.25,
         }),
         now,
       })
@@ -503,8 +809,6 @@ describe('tracking vote signal updates', () => {
           score: -1,
           upvotes: 1,
           downvotes: 4,
-          upvoteRatio: 0.25,
-          postDataUps: 1,
           calculatedVoteScore: -3,
         },
         now + 1_000
@@ -514,8 +818,6 @@ describe('tracking vote signal updates', () => {
       lastKnownScore: -1,
       lastKnownUpvotes: 1,
       lastKnownDownvotes: 4,
-      lastKnownUpvoteRatio: 0.25,
-      lastKnownPostDataUps: 1,
       lastCalculatedVoteScore: -3,
       updatedAt: now + 1_000,
       negativeScoreThreshold: -3,
@@ -628,6 +930,38 @@ Please review the [community rules](https://www.reddit.com/r/mySubreddit/about/r
     expect(result.modmailSentAt).toEqual(expect.any(Number));
     expect(result.modmailStatus).toBe('sent');
     expect(result.modmailErrorMessage).toBeUndefined();
+  });
+
+  test('uses ratio-safe wording when a custom removal reason is provided', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost();
+
+    await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      reason: 'Removed for downvote ratio threshold',
+      removalExplanation:
+        "Your post was removed because Reddit's reported upvote ratio indicated sustained negative community feedback.",
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.removalNotes).toEqual([
+      { reasonId: '', modNote: 'Removed for downvote ratio threshold' },
+    ]);
+    expect(redditClient.modmailConversations[0]).toMatchObject({
+      body: expect.stringContaining(
+        "Reddit's reported upvote ratio indicated sustained negative community feedback"
+      ),
+    });
+    expect(redditClient.modmailConversations[0]).not.toEqual(
+      expect.objectContaining({
+        body: expect.stringContaining('exactly'),
+      })
+    );
   });
 
   test('does not send modmail for report or filter actions', async () => {

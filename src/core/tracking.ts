@@ -2,6 +2,7 @@ import type {
   DownvoteDeleteAction,
   ModeratorPostHandling,
 } from './settings';
+import type { RatioDecisionReason, VoteState } from './voteRatioModel';
 
 export type TrackingStatus =
   | 'active'
@@ -17,8 +18,9 @@ export type TrackingStatus =
 
 export type NegativeDecisionSource =
   | 'reddit_score'
-  | 'calculated_votes'
-  | 'upvote_ratio_estimate';
+  | 'calculated_votes';
+
+export type TrackingMode = 'normal' | 'advanced';
 
 export type TrackedPost = {
   subredditId: string;
@@ -30,13 +32,32 @@ export type TrackedPost = {
   trackingStartedAt: number;
   trackingExpiresAt: number;
   checkCount: number;
+  trackingMode?: TrackingMode;
+  advancedTrackingStartedAt?: number;
+  lastOpenAIRatioCheckAt?: number;
+  lastOpenAIRequestedUrl?: string;
+  lastOpenAIRetrievedUrl?: string;
+  lastOpenAIJsonReceived?: boolean;
+  lastOpenAIError?: string;
+  lastRawUpvoteRatio?: number;
+  lastRawRatioPercent?: string;
+  lastRawJsonScore?: number;
+  lastRawJsonUps?: number;
+  lastRawJsonDowns?: number;
+  minimumTotalVotes?: number;
+  maximumTotalVotesCap?: number;
+  guaranteedSpread?: number | null;
+  possibleStates?: VoteState[];
+  enteredAdvancedTrackingAt?: number;
+  consecutiveNegativeChecks?: number;
+  lastRatioDecision?: 'none' | 'watch' | 'remove';
+  lastRatioDecisionReason?: RatioDecisionReason;
   lastKnownScore?: number;
   lastKnownUpvotes?: number;
   lastKnownDownvotes?: number;
   lastKnownUpvoteRatio?: number;
   lastKnownPostDataUps?: number;
   lastCalculatedVoteScore?: number;
-  lastRatioEstimatedScore?: number;
   negativeDecisionScore?: number;
   negativeDecisionSource?: NegativeDecisionSource;
   negativeScoreThreshold: number;
