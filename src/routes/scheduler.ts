@@ -36,6 +36,7 @@ import {
   auditKey,
   createAuditRecord,
   parseTrackedPost,
+  refreshTrackedPostActionSettings,
   serializeTrackedPost,
   statsKey,
   type TrackedPost,
@@ -147,6 +148,9 @@ async function writeTrackedPost(record: TrackedPost): Promise<void> {
     lastOpenAIError: record.lastOpenAIError,
     negativeDecisionScore: record.negativeDecisionScore,
     negativeDecisionSource: record.negativeDecisionSource,
+    negativeScoreThreshold: record.negativeScoreThreshold,
+    positiveScoreStopThreshold: record.positiveScoreStopThreshold,
+    actionToTake: record.actionToTake,
     lastJobId: record.lastJobId,
   });
   await redis.set(redisKey, serializeTrackedPost(record));
@@ -413,6 +417,12 @@ function mergeFreshActionFields(
   if (recordForAction.trackingMode) {
     actionRecord.trackingMode = recordForAction.trackingMode;
   }
+
+  actionRecord.negativeScoreThreshold = recordForAction.negativeScoreThreshold;
+  actionRecord.positiveScoreStopThreshold =
+    recordForAction.positiveScoreStopThreshold;
+  actionRecord.actionToTake = recordForAction.actionToTake;
+  actionRecord.moderatorPostHandling = recordForAction.moderatorPostHandling;
 
   if (typeof recordForAction.lastKnownScore === 'number') {
     actionRecord.lastKnownScore = recordForAction.lastKnownScore;
@@ -877,6 +887,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
   }
 
   const now = Date.now();
+  let activeRecord = initialRecord;
 
   try {
     logInfo('Reading app installation settings for scheduled check.', { postId });
@@ -892,16 +903,30 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       actionToTake: currentSettings.actionToTake,
       moderatorPostHandling: currentSettings.moderatorPostHandling,
     });
+    activeRecord = refreshTrackedPostActionSettings(
+      initialRecord,
+      currentSettings
+    );
+    logInfo('Refreshed active tracking record from current settings.', {
+      postId,
+      storedNegativeScoreThreshold: initialRecord.negativeScoreThreshold,
+      activeNegativeScoreThreshold: activeRecord.negativeScoreThreshold,
+      storedPositiveScoreStopThreshold: initialRecord.positiveScoreStopThreshold,
+      activePositiveScoreStopThreshold: activeRecord.positiveScoreStopThreshold,
+      storedActionToTake: initialRecord.actionToTake,
+      activeActionToTake: activeRecord.actionToTake,
+      trackingExpiresAt: new Date(activeRecord.trackingExpiresAt),
+    });
 
     const fetched = await fetchPostSnapshot(postId);
     if (!fetched) {
       logWarn('Decision: retry because Reddit post fetch failed.', {
         postId,
         reason: 'fetch_failed_retrying',
-        checkCount: initialRecord.checkCount,
+        checkCount: activeRecord.checkCount,
       });
       await markErrorAndReschedule(
-        initialRecord,
+        activeRecord,
         new Error('fetch_failed_retrying'),
         now
       );
@@ -924,7 +949,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     }
 
     const decision = decideTrackedPostCheck({
-      tracking: initialRecord,
+      tracking: activeRecord,
       settings: currentSettings,
       post: currentSnapshot,
       now,
@@ -933,7 +958,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     if (decision.type === 'exit') {
       logInfo('Decision: exit without action.', {
         postId,
-        status: initialRecord.status,
+        status: activeRecord.status,
         reason: 'decision_exit',
       });
       return c.json<TaskResponse>({}, 200);
@@ -953,10 +978,10 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         score: currentSnapshot?.score,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
-        checkCount: initialRecord.checkCount,
+        checkCount: activeRecord.checkCount,
       });
       await stopTracking(
-        applyScoreSignals(initialRecord, currentSnapshot, negativeDecision),
+        applyScoreSignals(activeRecord, currentSnapshot, negativeDecision),
         decision.status,
         now,
         decision.status
@@ -966,8 +991,8 @@ scheduledJobs.post('/check-watched-post', async (c) => {
 
     if (decision.type === 'action') {
       const actionReason = buildActionReason(
-        initialRecord.actionToTake,
-        initialRecord.negativeScoreThreshold
+        activeRecord.actionToTake,
+        activeRecord.negativeScoreThreshold
       );
 
       logInfo('Decision: action post because score reached threshold.', {
@@ -976,8 +1001,8 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         calculatedVoteScore: negativeDecision?.calculatedVoteScore,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
-        negativeScoreThreshold: initialRecord.negativeScoreThreshold,
-        actionToTake: initialRecord.actionToTake,
+        negativeScoreThreshold: activeRecord.negativeScoreThreshold,
+        actionToTake: activeRecord.actionToTake,
         reason: actionReason,
       });
 
@@ -985,22 +1010,22 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         await actionTrackedPost({
           postId,
           fetched,
-          recordForAction: initialRecord,
+          recordForAction: activeRecord,
           currentSnapshot,
           negativeDecision,
           now,
           actionReason,
-          stopReason: initialRecord.actionToTake,
+          stopReason: activeRecord.actionToTake,
         });
       }
 
       return c.json<TaskResponse>({}, 200);
     }
 
-    const nextCheckCount = initialRecord.checkCount + 1;
+    const nextCheckCount = activeRecord.checkCount + 1;
     const advancedTracking = shouldUseAdvancedTracking(currentSnapshot);
     let recordForNextCheck = applyScoreSignals(
-      initialRecord,
+      activeRecord,
       currentSnapshot,
       negativeDecision
     );
@@ -1014,7 +1039,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         recordForNextCheck,
         ratioResult,
         now,
-        initialRecord.negativeScoreThreshold,
+        activeRecord.negativeScoreThreshold,
         currentSnapshot?.score ?? 0
       );
 
@@ -1071,7 +1096,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       rawRatioPercent: recordForNextCheck.lastRawRatioPercent,
       openAIJsonReceived: recordForNextCheck.lastOpenAIJsonReceived,
       openAIError: recordForNextCheck.lastOpenAIError,
-      previousCheckCount: initialRecord.checkCount,
+      previousCheckCount: activeRecord.checkCount,
       nextCheckCount,
       nextDelayMinutes,
       nextRunAt,
@@ -1108,7 +1133,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       negativeDecisionSource: updatedRecord.negativeDecisionSource,
     });
   } catch (err: unknown) {
-    await markErrorAndReschedule(initialRecord, err, Date.now());
+    await markErrorAndReschedule(activeRecord, err, Date.now());
   }
 
   return c.json<TaskResponse>({}, 200);

@@ -37,6 +37,7 @@ import {
   type DownvoteDeleteSettings,
 } from '../src/core/settings';
 import {
+  refreshTrackedPostActionSettings,
   type TrackedPost,
 } from '../src/core/tracking';
 
@@ -841,6 +842,75 @@ describe('tracked post decisions', () => {
         now,
       })
     ).toEqual({ type: 'action' });
+  });
+
+  test('scheduled score decisions use refreshed current settings instead of stale stored thresholds', () => {
+    const staleRecord = trackedPost({ negativeScoreThreshold: -3 });
+    const currentSettings: DownvoteDeleteSettings = {
+      ...activeSettings,
+      negativeScoreThreshold: -1,
+    };
+    const refreshedRecord = refreshTrackedPostActionSettings(
+      staleRecord,
+      currentSettings
+    );
+
+    expect(
+      decideTrackedPostCheck({
+        tracking: refreshedRecord,
+        settings: currentSettings,
+        post: postSnapshot({ score: -1 }),
+        now,
+      })
+    ).toEqual({ type: 'action' });
+    expect(refreshedRecord.negativeScoreThreshold).toBe(-1);
+  });
+
+  test('scheduled ratio decisions use refreshed current settings instead of stale stored thresholds', () => {
+    const staleRecord = trackedPost({
+      negativeScoreThreshold: -3,
+      minimumTotalVotes: 3,
+    });
+    const currentSettings: DownvoteDeleteSettings = {
+      ...activeSettings,
+      negativeScoreThreshold: -1,
+    };
+    const refreshedRecord = refreshTrackedPostActionSettings(
+      staleRecord,
+      currentSettings
+    );
+
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0.33,
+        moderatorThreshold: refreshedRecord.negativeScoreThreshold,
+        minimumTotalVotes: refreshedRecord.minimumTotalVotes ?? 0,
+      })
+    ).toMatchObject({
+      remove: true,
+      reason: 'guaranteed_spread_threshold_met',
+      guaranteedSpread: -1,
+      updatedMinimumTotalVotes: 3,
+    });
+  });
+
+  test('refreshing current settings does not recalculate tracking expiration', () => {
+    const staleRecord = trackedPost({
+      trackingExpiresAt: now + 2 * 60 * 60 * 1000,
+      negativeScoreThreshold: -3,
+    });
+    const currentSettings: DownvoteDeleteSettings = {
+      ...activeSettings,
+      trackingDurationHours: 6,
+      negativeScoreThreshold: -1,
+    };
+
+    expect(
+      refreshTrackedPostActionSettings(staleRecord, currentSettings)
+    ).toMatchObject({
+      negativeScoreThreshold: -1,
+      trackingExpiresAt: staleRecord.trackingExpiresAt,
+    });
   });
 
   test('stops at the positive score threshold', () => {

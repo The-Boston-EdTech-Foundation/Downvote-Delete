@@ -1,5 +1,6 @@
 import type {
   DownvoteDeleteAction,
+  DownvoteDeleteSettings,
   ModeratorPostHandling,
 } from './settings';
 import type { RatioDecisionReason, VoteState } from './voteRatioModel';
@@ -109,5 +110,18 @@ export function createAuditRecord(record: TrackedPost, now: number): AuditRecord
   return {
     ...record,
     auditedAt: now,
+  };
+}
+
+export function refreshTrackedPostActionSettings(
+  record: TrackedPost,
+  settings: DownvoteDeleteSettings
+): TrackedPost {
+  return {
+    ...record,
+    negativeScoreThreshold: settings.negativeScoreThreshold,
+    positiveScoreStopThreshold: settings.positiveScoreStopThreshold,
+    actionToTake: settings.actionToTake,
+    moderatorPostHandling: settings.moderatorPostHandling,
   };
 }

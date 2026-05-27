@@ -28,6 +28,7 @@ Downvote Delete will not:
 - Continue watching posts that were already moderated or deleted.
 
 ## Patch Notes
+1.3.7 - Fixed threshold settings using stale data.
 1.3.5 - Removal thresholds are units from -1 to -5 downvotes.
 1.3.3 - Fixed malformed JSON handling.
 1.3.1 - Adds conservative reported upvote-ratio tracking. Devvit 0.13.0
