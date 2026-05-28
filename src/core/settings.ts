@@ -28,7 +28,7 @@ export type DownvoteDeleteSettings = {
 export const defaultSettings: DownvoteDeleteSettings = {
   isActive: true,
   trackingDurationHours: 4,
-  negativeScoreThreshold: -3,
+  negativeScoreThreshold: -2,
   positiveScoreStopThreshold: 5,
   actionToTake: ACTION_REMOVE,
   moderatorPostHandling: MODERATOR_IGNORE,

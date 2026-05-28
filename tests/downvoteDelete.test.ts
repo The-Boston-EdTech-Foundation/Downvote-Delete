@@ -224,11 +224,11 @@ describe('settings normalization', () => {
   );
 
   test.each([-10, 0, '', 'abc'] as const)(
-    'falls back to -3 for invalid negative score threshold %s',
+    'falls back to -2 for invalid negative score threshold %s',
     (negativeScoreThreshold) => {
       expect(
         normalizeSettings({ negativeScoreThreshold }).negativeScoreThreshold
-      ).toBe(-3);
+      ).toBe(-2);
     }
   );
 
@@ -243,18 +243,18 @@ describe('settings normalization', () => {
     ).toBe(MODERATOR_IGNORE);
   });
 
-  test('falls back to -3 for empty negative score threshold arrays', () => {
+  test('falls back to -2 for empty negative score threshold arrays', () => {
     expect(
       normalizeSettings({ negativeScoreThreshold: [] }).negativeScoreThreshold
-    ).toBe(-3);
+    ).toBe(-2);
   });
 
-  test('falls back to -3 for invalid negative score threshold arrays', () => {
+  test('falls back to -2 for invalid negative score threshold arrays', () => {
     expect(
       normalizeSettings({
         negativeScoreThreshold: ['abc'],
       }).negativeScoreThreshold
-    ).toBe(-3);
+    ).toBe(-2);
   });
 });
 
