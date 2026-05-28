@@ -27,9 +27,11 @@ import {
 } from '../core/decision';
 import { logError, logInfo, logWarn } from '../core/logging';
 import {
-  fetchRedditRatioViaOpenAI,
-  type OpenAIRatioFetchResult,
-} from '../core/openaiRatio';
+  fetchAuthenticatedRedditVoteSnapshot,
+  readRedditOAuthConfigFromSettings,
+  type AuthenticatedRedditVoteSnapshot,
+  type RedditOAuthConfig,
+} from '../core/redditOAuthRatio';
 import { postToSnapshot } from '../core/postStatus';
 import {
   normalizeSettings,
@@ -122,7 +124,8 @@ async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
     guaranteedSpread: parsedRecord.guaranteedSpread,
     lastRatioDecision: parsedRecord.lastRatioDecision,
     lastRatioDecisionReason: parsedRecord.lastRatioDecisionReason,
-    lastOpenAIError: parsedRecord.lastOpenAIError,
+    lastAuthenticatedRatioError: parsedRecord.lastAuthenticatedRatioError,
+    lastAuthenticatedRatioSource: parsedRecord.lastAuthenticatedRatioSource,
     negativeDecisionScore: parsedRecord.negativeDecisionScore,
     negativeDecisionSource: parsedRecord.negativeDecisionSource,
     negativeScoreThreshold: parsedRecord.negativeScoreThreshold,
@@ -148,7 +151,8 @@ async function writeTrackedPost(record: TrackedPost): Promise<void> {
     guaranteedSpread: record.guaranteedSpread,
     lastRatioDecision: record.lastRatioDecision,
     lastRatioDecisionReason: record.lastRatioDecisionReason,
-    lastOpenAIError: record.lastOpenAIError,
+    lastAuthenticatedRatioError: record.lastAuthenticatedRatioError,
+    lastAuthenticatedRatioSource: record.lastAuthenticatedRatioSource,
     negativeDecisionScore: record.negativeDecisionScore,
     negativeDecisionSource: record.negativeDecisionSource,
     negativeScoreThreshold: record.negativeScoreThreshold,
@@ -198,7 +202,8 @@ async function stopTracking(
     guaranteedSpread: record.guaranteedSpread,
     lastRatioDecision: record.lastRatioDecision,
     lastRatioDecisionReason: record.lastRatioDecisionReason,
-    lastOpenAIError: record.lastOpenAIError,
+    lastAuthenticatedRatioError: record.lastAuthenticatedRatioError,
+    lastAuthenticatedRatioSource: record.lastAuthenticatedRatioSource,
     negativeDecisionScore: record.negativeDecisionScore,
     negativeDecisionSource: record.negativeDecisionSource,
     auditKey: auditKey(record.postId),
@@ -263,11 +268,6 @@ function applyScoreSignals(
   return updatedRecord;
 }
 
-function readOpenAIApiKey(settingsValues: { openaiApiKey?: unknown }): string {
-  const value = settingsValues.openaiApiKey;
-  return typeof value === 'string' ? value.trim() : '';
-}
-
 function shouldUseAdvancedTracking(snapshot: PostSnapshot | null): boolean {
   return Boolean(snapshot && snapshot.score <= 0);
 }
@@ -284,77 +284,59 @@ function clearFreshRatioDecision(
 
 async function fetchAndLogRawRatio(args: {
   postId: string;
-  apiKey: string;
-  now: number;
-  permalink?: string | undefined;
-}): Promise<OpenAIRatioFetchResult> {
-  const result = await fetchRedditRatioViaOpenAI({
-    apiKey: args.apiKey,
+  config: RedditOAuthConfig | null;
+}): Promise<AuthenticatedRedditVoteSnapshot> {
+  logInfo('Fetching authenticated Reddit ratio.', {
     postId: args.postId,
-    now: args.now,
-    permalink: args.permalink,
+    source: 'authenticated_reddit_api',
+    endpoint: 'oauth_by_id',
+  });
+
+  const result = await fetchAuthenticatedRedditVoteSnapshot(args.postId, {
+    config: args.config,
   });
 
   if (result.ok) {
-    logInfo('Fetched OpenAI-proxied Reddit ratio.', {
+    logInfo('Authenticated Reddit ratio fetched.', {
       postId: args.postId,
-      jsonReceived: result.jsonReceived,
-      requestedUrl: result.requestedUrl,
-      retrievedUrl: result.retrievedUrl,
-      cacheBustMatched: result.cacheBustMatched,
-      parserPath: result.parserPath,
-      extractionSource: result.extractionSource,
-      responseTextLength: result.responseTextLength,
-      responseTextPreview: result.responseTextPreview,
-      jsonTextLength: result.jsonTextLength,
-      jsonTextPreview: result.jsonTextPreview,
-      rawName: result.fields?.name,
-      rawId: result.fields?.id,
-      rawUpvoteRatio: result.fields?.upvoteRatio,
-      rawRatioPercent: result.fields?.ratioPercent,
-      rawUps: result.fields?.ups,
-      rawDowns: result.fields?.downs,
-      rawScore: result.fields?.score,
+      ok: true,
+      source: result.source,
+      rawName: result.rawName,
+      rawId: result.rawId,
+      rawScore: result.score,
+      rawUpvoteRatio: result.upvoteRatio,
+      rawRatioPercent: result.ratioPercent,
+      rawHideScore: result.hideScore,
+      rawUps: result.ups,
+      rawDowns: result.downs,
     });
   } else {
-    logWarn('OpenAI-proxied Reddit ratio fetch failed.', {
+    logWarn('Authenticated Reddit ratio fetch failed.', {
       postId: args.postId,
-      jsonReceived: result.jsonReceived,
-      requestedUrl: result.requestedUrl,
-      retrievedUrl: result.retrievedUrl,
-      cacheBustMatched: result.cacheBustMatched,
-      parserPath: result.parserPath,
-      extractionSource: result.extractionSource,
-      responseTextLength: result.responseTextLength,
-      responseTextPreview: result.responseTextPreview,
-      jsonTextLength: result.jsonTextLength,
-      jsonTextPreview: result.jsonTextPreview,
+      ok: false,
+      source: result.source,
+      httpStatus: result.httpStatus,
       error: result.error,
+      fallback: 'reddit_score_only',
     });
   }
 
-  logInfo('OpenAI ratio extraction result.', {
-    postId: args.postId,
-    parserPath: result.parserPath,
-    extractionSource: result.extractionSource,
-    extractedUpvoteRatio: result.fields?.upvoteRatio,
-    ratioPercent: result.fields?.ratioPercent,
-    rawName: result.fields?.name,
-    rawId: result.fields?.id,
-    rawScore: result.fields?.score,
-    rawUps: result.fields?.ups,
-    rawDowns: result.fields?.downs,
-    cacheBustMatched: result.cacheBustMatched,
-    error: result.error || undefined,
-    jsonReceived: result.jsonReceived,
-  });
+  if (result.ok && result.upvoteRatio === null) {
+    logInfo('Authenticated Reddit ratio unavailable.', {
+      postId: args.postId,
+      ok: true,
+      source: result.source,
+      reason: 'missing_upvote_ratio',
+      fallback: 'reddit_score_only',
+    });
+  }
 
   return result;
 }
 
-function applyOpenAIRatioResult(
+function applyAuthenticatedRatioResult(
   record: TrackedPost,
-  result: OpenAIRatioFetchResult,
+  result: AuthenticatedRedditVoteSnapshot,
   now: number,
   moderatorThreshold: number,
   latestScore: number
@@ -362,14 +344,29 @@ function applyOpenAIRatioResult(
   const updatedRecord: TrackedPost = {
     ...record,
     trackingMode: 'advanced',
-    lastOpenAIRatioCheckAt: now,
-    lastOpenAIRequestedUrl: result.requestedUrl,
-    lastOpenAIRetrievedUrl: result.retrievedUrl,
-    lastOpenAIJsonReceived: result.jsonReceived,
+    lastAuthenticatedRatioCheckAt: now,
+    lastAuthenticatedRatioReceived: result.ok,
+    lastAuthenticatedRatioSource: result.source,
   };
 
   if (result.error) {
-    updatedRecord.lastOpenAIError = result.error;
+    updatedRecord.lastAuthenticatedRatioError = result.error;
+  }
+
+  if (typeof result.httpStatus === 'number') {
+    updatedRecord.lastAuthenticatedRatioHttpStatus = result.httpStatus;
+  }
+
+  if (result.rawName) {
+    updatedRecord.lastAuthenticatedRatioRawName = result.rawName;
+  }
+
+  if (result.rawId) {
+    updatedRecord.lastAuthenticatedRatioRawId = result.rawId;
+  }
+
+  if (typeof result.hideScore === 'boolean') {
+    updatedRecord.lastAuthenticatedRatioHideScore = result.hideScore;
   }
 
   if (!record.advancedTrackingStartedAt) {
@@ -380,7 +377,7 @@ function applyOpenAIRatioResult(
     updatedRecord.enteredAdvancedTrackingAt = now;
   }
 
-  if (!result.fields || typeof result.fields.upvoteRatio !== 'number') {
+  if (!result.ok || typeof result.upvoteRatio !== 'number') {
     clearFreshRatioDecision(updatedRecord, 'invalid_ratio');
     logInfo('Advanced vote tracking did not use a fresh ratio.', {
       postId: record.postId,
@@ -389,17 +386,17 @@ function applyOpenAIRatioResult(
       newRawUpvoteRatio: undefined,
       lastRatioDecision: updatedRecord.lastRatioDecision,
       lastRatioDecisionReason: updatedRecord.lastRatioDecisionReason,
-      parserPath: result.parserPath,
-      extractionSource: result.extractionSource,
       error: result.error,
+      httpStatus: result.httpStatus,
+      ratioSource: result.source,
       note: 'Previous raw ratio is historical and was not used for this check.',
     });
   } else {
     const previousRawUpvoteRatio = record.lastRawUpvoteRatio;
-    updatedRecord.lastRawUpvoteRatio = result.fields.upvoteRatio;
+    updatedRecord.lastRawUpvoteRatio = result.upvoteRatio;
 
     const ratioDecision = shouldRemoveByRatio({
-      ratio: result.fields.upvoteRatio,
+      ratio: result.upvoteRatio,
       moderatorThreshold,
       minimumTotalVotes: record.minimumTotalVotes ?? 0,
     });
@@ -409,14 +406,14 @@ function applyOpenAIRatioResult(
     updatedRecord.guaranteedSpread = ratioDecision.guaranteedSpread;
     updatedRecord.possibleStates = ratioDecision.possibleStates;
     updatedRecord.consecutiveNegativeChecks =
-      Number.isFinite(result.fields.upvoteRatio) &&
-      result.fields.upvoteRatio <= advancedTrackingMaxRatio
+      Number.isFinite(result.upvoteRatio) &&
+      result.upvoteRatio <= advancedTrackingMaxRatio
         ? (record.consecutiveNegativeChecks ?? 0) + 1
         : 0;
     updatedRecord.lastRatioDecision = ratioDecision.remove
       ? 'remove'
-      : Number.isFinite(result.fields.upvoteRatio) &&
-          result.fields.upvoteRatio <= advancedTrackingMaxRatio
+      : Number.isFinite(result.upvoteRatio) &&
+          result.upvoteRatio <= advancedTrackingMaxRatio
         ? 'watch'
         : 'none';
     updatedRecord.lastRatioDecisionReason = ratioDecision.reason;
@@ -426,7 +423,8 @@ function applyOpenAIRatioResult(
       freshRatioUsed: true,
       previousRawUpvoteRatio,
       newRawUpvoteRatio: updatedRecord.lastRawUpvoteRatio,
-      ratio: result.fields.upvoteRatio,
+      ratio: result.upvoteRatio,
+      ratioSource: result.source,
       latestScore,
       minimumTotalVotes: updatedRecord.minimumTotalVotes,
       guaranteedSpread: updatedRecord.guaranteedSpread,
@@ -437,22 +435,20 @@ function applyOpenAIRatioResult(
     });
   }
 
-  if (result.fields) {
-    if (result.fields.ratioPercent !== 'missing') {
-      updatedRecord.lastRawRatioPercent = result.fields.ratioPercent;
-    }
+  if (typeof result.ratioPercent === 'string') {
+    updatedRecord.lastRawRatioPercent = result.ratioPercent;
+  }
 
-    if (typeof result.fields.score === 'number') {
-      updatedRecord.lastRawJsonScore = result.fields.score;
-    }
+  if (typeof result.score === 'number') {
+    updatedRecord.lastRawAuthenticatedScore = result.score;
+  }
 
-    if (typeof result.fields.ups === 'number') {
-      updatedRecord.lastRawJsonUps = result.fields.ups;
-    }
+  if (typeof result.ups === 'number') {
+    updatedRecord.lastRawAuthenticatedUps = result.ups;
+  }
 
-    if (typeof result.fields.downs === 'number') {
-      updatedRecord.lastRawJsonDowns = result.fields.downs;
-    }
+  if (typeof result.downs === 'number') {
+    updatedRecord.lastRawAuthenticatedDowns = result.downs;
   }
 
   return updatedRecord;
@@ -495,28 +491,44 @@ function mergeFreshActionFields(
       recordForAction.advancedTrackingStartedAt;
   }
 
-  if (typeof recordForAction.lastOpenAIRatioCheckAt === 'number') {
-    actionRecord.lastOpenAIRatioCheckAt =
-      recordForAction.lastOpenAIRatioCheckAt;
+  if (typeof recordForAction.lastAuthenticatedRatioCheckAt === 'number') {
+    actionRecord.lastAuthenticatedRatioCheckAt =
+      recordForAction.lastAuthenticatedRatioCheckAt;
   }
 
-  if (typeof recordForAction.lastOpenAIRequestedUrl === 'string') {
-    actionRecord.lastOpenAIRequestedUrl =
-      recordForAction.lastOpenAIRequestedUrl;
+  if (typeof recordForAction.lastAuthenticatedRatioReceived === 'boolean') {
+    actionRecord.lastAuthenticatedRatioReceived =
+      recordForAction.lastAuthenticatedRatioReceived;
   }
 
-  if (typeof recordForAction.lastOpenAIRetrievedUrl === 'string') {
-    actionRecord.lastOpenAIRetrievedUrl =
-      recordForAction.lastOpenAIRetrievedUrl;
+  if (recordForAction.lastAuthenticatedRatioSource) {
+    actionRecord.lastAuthenticatedRatioSource =
+      recordForAction.lastAuthenticatedRatioSource;
   }
 
-  if (typeof recordForAction.lastOpenAIJsonReceived === 'boolean') {
-    actionRecord.lastOpenAIJsonReceived =
-      recordForAction.lastOpenAIJsonReceived;
+  if (typeof recordForAction.lastAuthenticatedRatioError === 'string') {
+    actionRecord.lastAuthenticatedRatioError =
+      recordForAction.lastAuthenticatedRatioError;
   }
 
-  if (typeof recordForAction.lastOpenAIError === 'string') {
-    actionRecord.lastOpenAIError = recordForAction.lastOpenAIError;
+  if (typeof recordForAction.lastAuthenticatedRatioHttpStatus === 'number') {
+    actionRecord.lastAuthenticatedRatioHttpStatus =
+      recordForAction.lastAuthenticatedRatioHttpStatus;
+  }
+
+  if (typeof recordForAction.lastAuthenticatedRatioRawName === 'string') {
+    actionRecord.lastAuthenticatedRatioRawName =
+      recordForAction.lastAuthenticatedRatioRawName;
+  }
+
+  if (typeof recordForAction.lastAuthenticatedRatioRawId === 'string') {
+    actionRecord.lastAuthenticatedRatioRawId =
+      recordForAction.lastAuthenticatedRatioRawId;
+  }
+
+  if (typeof recordForAction.lastAuthenticatedRatioHideScore === 'boolean') {
+    actionRecord.lastAuthenticatedRatioHideScore =
+      recordForAction.lastAuthenticatedRatioHideScore;
   }
 
   if (typeof recordForAction.lastRawUpvoteRatio === 'number') {
@@ -527,16 +539,18 @@ function mergeFreshActionFields(
     actionRecord.lastRawRatioPercent = recordForAction.lastRawRatioPercent;
   }
 
-  if (typeof recordForAction.lastRawJsonScore === 'number') {
-    actionRecord.lastRawJsonScore = recordForAction.lastRawJsonScore;
+  if (typeof recordForAction.lastRawAuthenticatedScore === 'number') {
+    actionRecord.lastRawAuthenticatedScore =
+      recordForAction.lastRawAuthenticatedScore;
   }
 
-  if (typeof recordForAction.lastRawJsonUps === 'number') {
-    actionRecord.lastRawJsonUps = recordForAction.lastRawJsonUps;
+  if (typeof recordForAction.lastRawAuthenticatedUps === 'number') {
+    actionRecord.lastRawAuthenticatedUps = recordForAction.lastRawAuthenticatedUps;
   }
 
-  if (typeof recordForAction.lastRawJsonDowns === 'number') {
-    actionRecord.lastRawJsonDowns = recordForAction.lastRawJsonDowns;
+  if (typeof recordForAction.lastRawAuthenticatedDowns === 'number') {
+    actionRecord.lastRawAuthenticatedDowns =
+      recordForAction.lastRawAuthenticatedDowns;
   }
 
   if (typeof recordForAction.minimumTotalVotes === 'number') {
@@ -927,7 +941,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     logInfo('Reading app installation settings for scheduled check.', { postId });
     const settingsValues = await devvitSettings.getAll<SettingsValues>();
     const currentSettings = normalizeSettings(settingsValues);
-    const openAIApiKey = readOpenAIApiKey(settingsValues);
+    const redditOAuthConfig = readRedditOAuthConfigFromSettings(
+      settingsValues as Record<string, unknown>
+    );
     logInfo('Loaded app installation settings for scheduled check.', {
       postId,
       isActive: currentSettings.isActive,
@@ -936,8 +952,19 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
       actionToTake: currentSettings.actionToTake,
       moderatorPostHandling: currentSettings.moderatorPostHandling,
+      authenticatedRatioConfigured: redditOAuthConfig !== null,
       rawSettingShapes: summarizeSubredditSettingsShapes(settingsValues),
     });
+    if (!redditOAuthConfig) {
+      logWarn(
+        'Authenticated Reddit ratio disabled because required secrets are missing.',
+        {
+          postId,
+          source: 'authenticated_reddit_api',
+          fallback: 'reddit_score_only',
+        }
+      );
+    }
     activeRecord = refreshTrackedPostActionSettings(
       initialRecord,
       currentSettings
@@ -1068,11 +1095,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     if (advancedTracking) {
       const ratioResult = await fetchAndLogRawRatio({
         postId,
-        apiKey: openAIApiKey,
-        now,
-        permalink: fetched.post.permalink,
+        config: redditOAuthConfig,
       });
-      recordForNextCheck = applyOpenAIRatioResult(
+      recordForNextCheck = applyAuthenticatedRatioResult(
         recordForNextCheck,
         ratioResult,
         now,
@@ -1092,6 +1117,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
           guaranteedSpread: recordForNextCheck.guaranteedSpread,
           threshold: recordForNextCheck.negativeScoreThreshold,
           ratioDecisionReason: recordForNextCheck.lastRatioDecisionReason,
+          ratioSource: recordForNextCheck.lastAuthenticatedRatioSource,
           possibleStateCount: recordForNextCheck.possibleStates?.length,
           actionToTake: recordForNextCheck.actionToTake,
           reason: actionReason,
@@ -1130,8 +1156,10 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       trackingMode: recordForNextCheck.trackingMode,
       rawUpvoteRatio: recordForNextCheck.lastRawUpvoteRatio,
       rawRatioPercent: recordForNextCheck.lastRawRatioPercent,
-      openAIJsonReceived: recordForNextCheck.lastOpenAIJsonReceived,
-      openAIError: recordForNextCheck.lastOpenAIError,
+      authenticatedRatioReceived:
+        recordForNextCheck.lastAuthenticatedRatioReceived,
+      authenticatedRatioSource: recordForNextCheck.lastAuthenticatedRatioSource,
+      authenticatedRatioError: recordForNextCheck.lastAuthenticatedRatioError,
       previousCheckCount: activeRecord.checkCount,
       nextCheckCount,
       nextDelayMinutes,
@@ -1163,8 +1191,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       score: updatedRecord.lastKnownScore,
       rawUpvoteRatio: updatedRecord.lastRawUpvoteRatio,
       rawRatioPercent: updatedRecord.lastRawRatioPercent,
-      openAIJsonReceived: updatedRecord.lastOpenAIJsonReceived,
-      openAIError: updatedRecord.lastOpenAIError,
+      authenticatedRatioReceived: updatedRecord.lastAuthenticatedRatioReceived,
+      authenticatedRatioSource: updatedRecord.lastAuthenticatedRatioSource,
+      authenticatedRatioError: updatedRecord.lastAuthenticatedRatioError,
       negativeDecisionScore: updatedRecord.negativeDecisionScore,
       negativeDecisionSource: updatedRecord.negativeDecisionSource,
     });

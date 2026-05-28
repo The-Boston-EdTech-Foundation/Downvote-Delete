@@ -17,10 +17,25 @@
   },
   "settings": {
     "global": {
-      "openaiApiKey": {
+      "REDDIT_CLIENT_ID": {
         "type": "string",
-        "label": "OpenAI API key",
+        "label": "Reddit OAuth client ID",
         "isSecret": true
+      },
+      "REDDIT_CLIENT_SECRET": {
+        "type": "string",
+        "label": "Reddit OAuth client secret",
+        "isSecret": true
+      },
+      "REDDIT_REFRESH_TOKEN": {
+        "type": "string",
+        "label": "Reddit OAuth refresh token",
+        "isSecret": true
+      },
+      "REDDIT_USER_AGENT": {
+        "type": "string",
+        "label": "Reddit API user agent",
+        "defaultValue": "Downvote-Delete/1.4.1 by Alan-Foster"
       }
     },
     "subreddit": {
@@ -101,7 +116,7 @@
     "redis": true,
     "http": {
       "enable": true,
-      "domains": ["api.openai.com"]
+      "domains": ["oauth.reddit.com"]
     }
   },
   "dev": {

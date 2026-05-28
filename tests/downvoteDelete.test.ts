@@ -14,12 +14,12 @@ import {
 } from '../src/core/decision';
 import { formatLogContext } from '../src/core/logging';
 import {
-  buildRedditByIdJsonUrl,
-  buildRedditPostJsonUrl,
-  extractRawRedditVoteFields,
-  fetchRedditRatioViaOpenAI,
-  parseOpenAIRedditJsonResponse,
-} from '../src/core/openaiRatio';
+  fetchAuthenticatedRedditVoteSnapshot,
+  readRedditOAuthConfigFromSettings,
+  resetRedditOAuthTokenCacheForTests,
+  type RedditOAuthConfig,
+  type RedditOAuthFetch,
+} from '../src/core/redditOAuthRatio';
 import {
   advancedTrackingMaxRatio,
   buildRatioLookup,
@@ -274,294 +274,262 @@ describe('backoff schedule', () => {
   });
 });
 
-describe('OpenAI Reddit JSON ratio parsing', () => {
-  const jsonText =
-    '[{"kind":"Listing","data":{"children":[{"kind":"t3","data":{"name":"t3_1tocgkf","id":"1tocgkf","title":"Downvotes","upvote_ratio":0.43,"ups":0,"downs":0,"score":0}}]}}]';
-  const cacheBustNow = Date.UTC(2026, 4, 27, 22, 0, 0);
-  const cacheBustValue = '2026-05-27T22-00-00.000Z';
+describe('authenticated Reddit ratio fetch', () => {
+  const config: RedditOAuthConfig = {
+    clientId: 'client-id',
+    clientSecret: 'client-secret',
+    refreshToken: 'refresh-token',
+    userAgent: 'Downvote-Delete/1.4.1 by Alan-Foster',
+  };
 
-  test('builds the by_id URL with the full post id', () => {
-    expect(buildRedditByIdJsonUrl('t3_1tocgkf')).toBe(
-      'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1'
-    );
-    expect(buildRedditByIdJsonUrl('1tocgkf')).toBe(
-      'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1'
-    );
-  });
-
-  test('builds a cache-busted by_id URL with the full post id', () => {
-    expect(buildRedditByIdJsonUrl('1tocgkf', cacheBustNow)).toBe(
-      `https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`
-    );
-  });
-
-  test('builds a cache-busted permalink URL when available', () => {
-    expect(
-      buildRedditPostJsonUrl({
-        postId: 't3_1tocgkf',
-        permalink: '/r/HestiaListens/comments/1tocgkf/downvotes/',
-        now: cacheBustNow,
-      })
-    ).toBe(
-      `https://www.reddit.com/r/HestiaListens/comments/1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`
-    );
-  });
-
-  test('falls back to a cache-busted by_id URL when permalink is missing', () => {
-    expect(
-      buildRedditPostJsonUrl({
-        postId: '1tocgkf',
-        now: cacheBustNow,
-      })
-    ).toBe(
-      `https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`
-    );
-  });
-
-  test('extracts raw vote fields from the array listing shape', () => {
-    expect(extractRawRedditVoteFields(jsonText)).toEqual({
-      name: 't3_1tocgkf',
-      id: '1tocgkf',
-      upvoteRatio: 0.43,
-      ratioPercent: '43.0%',
-      ups: 0,
-      downs: 0,
-      score: 0,
-    });
-  });
-
-  test('extracts raw vote fields from the object listing shape', () => {
-    expect(
-      extractRawRedditVoteFields(
-        '{"kind":"Listing","data":{"children":[{"kind":"t3","data":{"name":"t3_post","id":"post","upvote_ratio":0.25,"score":-1}}]}}'
-      )
-    ).toEqual({
-      name: 't3_post',
-      id: 'post',
-      upvoteRatio: 0.25,
-      ratioPercent: '25.0%',
-      ups: 'missing',
-      downs: 'missing',
-      score: -1,
-    });
-  });
-
-  test('returns a parsed OpenAI result with bounded response previews', () => {
-    const requestedUrl = `https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`;
-    const result = parseOpenAIRedditJsonResponse(
-      {
-        output_text: JSON.stringify({
-          ok: true,
-          requested_url: requestedUrl,
-          retrieved_url: requestedUrl,
-          json_text: jsonText,
-          error: '',
-        }),
-      },
-      requestedUrl
-    );
-
-    expect(result).toMatchObject({
-      ok: true,
-      jsonReceived: true,
-      cacheBustMatched: true,
-      parserPath: 'structured_json_text',
-      extractionSource: 'parsed_json',
-      responseTextLength: expect.any(Number),
-      responseTextPreview: expect.stringContaining('requested_url'),
-      jsonTextLength: jsonText.length,
-      jsonTextPreview: expect.stringContaining('upvote_ratio'),
-      fields: {
-        upvoteRatio: 0.43,
-        ratioPercent: '43.0%',
+  function listing(args: {
+    name?: string;
+    upvoteRatio?: number;
+    score?: number;
+    hideScore?: boolean;
+  } = {}): string {
+    return JSON.stringify({
+      kind: 'Listing',
+      data: {
+        children: [
+          {
+            kind: 't3',
+            data: {
+              name: args.name ?? 't3_post',
+              id: (args.name ?? 't3_post').replace(/^t3_/, ''),
+              score: args.score ?? 0,
+              upvote_ratio: args.upvoteRatio,
+              ups: 1,
+              downs: 2,
+              hide_score: args.hideScore ?? false,
+            },
+          },
+        ],
       },
     });
-    expect(result.responseTextPreview?.length).toBeLessThanOrEqual(2000);
-    expect(result.jsonTextPreview?.length).toBeLessThanOrEqual(2000);
-  });
+  }
 
-  test('fails safely when OpenAI returns a stale retrieved URL without the cache bust', () => {
-    const requestedUrl = `https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`;
-    const result = parseOpenAIRedditJsonResponse(
-      {
-        output_text: JSON.stringify({
-          ok: true,
-          requested_url: requestedUrl,
-          retrieved_url:
-            'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
-          json_text: jsonText,
-          error: '',
-        }),
-      },
-      requestedUrl
-    );
+  function mockOAuthFetch(args: {
+    tokenOk?: boolean;
+    listingOk?: boolean;
+    listingStatus?: number;
+    listingBody?: string;
+  } = {}): {
+    calls: string[];
+    fetchImpl: RedditOAuthFetch;
+  } {
+    const calls: string[] = [];
+    return {
+      calls,
+      fetchImpl: async (url) => {
+        calls.push(url);
+        if (url.includes('/api/v1/access_token')) {
+          return {
+            ok: args.tokenOk ?? true,
+            status: args.tokenOk === false ? 401 : 200,
+            statusText: args.tokenOk === false ? 'Unauthorized' : 'OK',
+            async text(): Promise<string> {
+              return args.tokenOk === false
+                ? '{"error":"invalid_grant"}'
+                : '{"access_token":"access-token","expires_in":3600}';
+            },
+          };
+        }
 
-    expect(result).toMatchObject({
-      ok: false,
-      jsonReceived: true,
-      requestedUrl,
-      retrievedUrl: 'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
-      cacheBustMatched: false,
-      parserPath: 'structured_json_text',
-      extractionSource: 'parsed_json',
-      error:
-        'OpenAI retrieved URL did not include the requested cache_bust value.',
-    });
-    expect(result.fields).toBeUndefined();
-  });
-
-  test('fetcher prompts OpenAI with the cache-busted permalink URL', async () => {
-    let requestBody = '';
-    const requestedUrl = `https://www.reddit.com/r/HestiaListens/comments/1tocgkf.json?raw_json=1&cache_bust=${cacheBustValue}`;
-    const result = await fetchRedditRatioViaOpenAI({
-      apiKey: 'test-key',
-      postId: 't3_1tocgkf',
-      permalink: '/r/HestiaListens/comments/1tocgkf/downvotes/',
-      now: cacheBustNow,
-      fetchImpl: async (_url, init) => {
-        requestBody = init.body;
         return {
-          ok: true,
-          status: 200,
-          statusText: 'OK',
-          async json(): Promise<unknown> {
-            return {
-              output_text: JSON.stringify({
-                ok: true,
-                requested_url: requestedUrl,
-                retrieved_url: requestedUrl,
-                json_text:
-                  '[{"kind":"Listing","data":{"children":[{"kind":"t3","data":{"name":"t3_1tocgkf","id":"1tocgkf","upvote_ratio":0.25,"score":0}}]}}]',
-                error: '',
-              }),
-            };
+          ok: args.listingOk ?? true,
+          status: args.listingStatus ?? 200,
+          statusText: args.listingOk === false ? 'Too Many Requests' : 'OK',
+          async text(): Promise<string> {
+            return args.listingBody ?? listing({ upvoteRatio: 0.33 });
           },
         };
       },
-    });
+    };
+  }
 
-    expect(requestBody).toContain(requestedUrl);
-    expect(requestBody).toContain(`cache_bust=${cacheBustValue}`);
-    expect(result).toMatchObject({
-      ok: true,
-      requestedUrl,
-      retrievedUrl: requestedUrl,
-      cacheBustMatched: true,
-      parserPath: 'structured_json_text',
-      extractionSource: 'parsed_json',
-      fields: {
-        upvoteRatio: 0.25,
-        ratioPercent: '25.0%',
-      },
+  test('reads configured Reddit OAuth settings', () => {
+    expect(
+      readRedditOAuthConfigFromSettings({
+        REDDIT_CLIENT_ID: 'configured-client',
+        REDDIT_CLIENT_SECRET: 'configured-secret',
+        REDDIT_REFRESH_TOKEN: 'configured-refresh',
+        REDDIT_USER_AGENT: 'configured-agent',
+      })
+    ).toEqual({
+      clientId: 'configured-client',
+      clientSecret: 'configured-secret',
+      refreshToken: 'configured-refresh',
+      userAgent: 'configured-agent',
     });
   });
 
-  test('returns a clean failure with debug metadata for malformed json_text', () => {
-    const result = parseOpenAIRedditJsonResponse(
-      {
-        output_text: JSON.stringify({
-          ok: true,
-          requested_url:
-            'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
-          retrieved_url:
-            'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1',
-          json_text: '{"broken"',
-          error: '',
-        }),
-      },
-      'https://www.reddit.com/by_id/t3_1tocgkf.json?raw_json=1'
-    );
+  test('returns null when required Reddit OAuth secrets are missing', () => {
+    expect(readRedditOAuthConfigFromSettings({})).toBeNull();
+    expect(
+      readRedditOAuthConfigFromSettings({
+        REDDIT_CLIENT_ID: 'configured-client',
+        REDDIT_CLIENT_SECRET: 'configured-secret',
+      })
+    ).toBeNull();
+  });
+
+  test('uses default user agent when setting is missing', () => {
+    expect(
+      readRedditOAuthConfigFromSettings({
+        REDDIT_CLIENT_ID: 'configured-client',
+        REDDIT_CLIENT_SECRET: 'configured-secret',
+        REDDIT_REFRESH_TOKEN: 'configured-refresh',
+      })
+    ).toEqual({
+      clientId: 'configured-client',
+      clientSecret: 'configured-secret',
+      refreshToken: 'configured-refresh',
+      userAgent: 'Downvote-Delete/1.4.1 by Alan-Foster',
+    });
+  });
+
+  test('returns structured failure when credentials are missing', async () => {
+    resetRedditOAuthTokenCacheForTests();
+    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+      config: readRedditOAuthConfigFromSettings({}),
+      fetchImpl: mockOAuthFetch().fetchImpl,
+    });
 
     expect(result).toMatchObject({
       ok: false,
-      jsonReceived: false,
-      parserPath: 'salvage_json_text',
-      extractionSource: 'none',
-      jsonTextLength: '{"broken"'.length,
-      jsonTextPreview: '{"broken"',
+      source: 'authenticated_reddit_api',
+      upvoteRatio: null,
+      error: 'Missing required Reddit OAuth credentials.',
     });
-    expect(result.fields).toBeUndefined();
   });
 
-  test('salvages vote fields from malformed OpenAI wrapper text', () => {
-    const result = parseOpenAIRedditJsonResponse(
-      {
-        output_text:
-          '{"ok":true,"requested_url":"https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1","retrieved_url":"https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1","json_text":"[{\\"kind\\": \\"Listing\\", \\"data\\": {\\"children\\": [{\\"kind\\": \\"t3\\", \\"data\\": {\\"name\\": \\"t3_1tphv0v\\", \\"id\\": \\"1tphv0v\\", \\"selftext_html\\": "bad\ncontrol", \\"upvote_ratio\\": 0.33, \\"ups\\": 0, \\"downs\\": 0, \\"score\\": 0}}]}}]","error":""}',
-      },
-      'https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1'
-    );
+  test('fetches and reuses an access token for matching post snapshots', async () => {
+    resetRedditOAuthTokenCacheForTests();
+    const oauth = mockOAuthFetch({
+      listingBody: listing({ upvoteRatio: 0.25, hideScore: true }),
+    });
 
-    expect(result).toMatchObject({
+    const first = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+      config,
+      fetchImpl: oauth.fetchImpl,
+      now,
+    });
+    const second = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+      config,
+      fetchImpl: oauth.fetchImpl,
+      now: now + 1_000,
+    });
+
+    expect(first).toMatchObject({
       ok: true,
-      jsonReceived: true,
-      requestedUrl:
-        'https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1',
-      retrievedUrl:
-        'https://www.reddit.com/by_id/t3_1tphv0v.json?raw_json=1',
-      parserPath: 'salvage_wrapper_text',
-      extractionSource: 'text_scan',
-      responseTextLength: expect.any(Number),
-      responseTextPreview: expect.stringContaining('upvote_ratio'),
-      fields: {
-        name: 't3_1tphv0v',
-        id: '1tphv0v',
-        upvoteRatio: 0.33,
-        ratioPercent: '33.0%',
-        ups: 0,
-        downs: 0,
-        score: 0,
-      },
-      error: '',
+      postId: 't3_post',
+      source: 'authenticated_reddit_api',
+      endpoint: 'oauth_by_id',
+      upvoteRatio: 0.25,
+      ratioPercent: '25.0%',
+      hideScore: true,
+      rawName: 't3_post',
+      rawId: 'post',
+      ups: 1,
+      downs: 2,
+      score: 0,
     });
+    expect(second.ok).toBe(true);
+    expect(
+      oauth.calls.filter((url) => url.includes('/api/v1/access_token'))
+    ).toHaveLength(1);
+    expect(oauth.calls).toContain(
+      'https://oauth.reddit.com/api/v1/access_token'
+    );
+    expect(oauth.calls.filter((url) => url.includes('/by_id/t3_post'))).toEqual(
+      ['https://oauth.reddit.com/by_id/t3_post', 'https://oauth.reddit.com/by_id/t3_post']
+    );
+    expect(new Set(oauth.calls.map((url) => new URL(url).hostname))).toEqual(
+      new Set(['oauth.reddit.com'])
+    );
   });
 
-  test('salvages vote fields from escaped quote text', () => {
-    const result = parseOpenAIRedditJsonResponse(
-      {
-        output_text:
-          '\\"kind\\":\\"t3\\",\\"data\\":{\\"name\\":\\"t3_post\\",\\"id\\":\\"post\\",\\"upvote_ratio\\":0.25,\\"score\\":-1}',
-      },
-      'https://www.reddit.com/by_id/t3_post.json?raw_json=1'
-    );
-
-    expect(result).toMatchObject({
-      ok: true,
-      jsonReceived: true,
-      requestedUrl: 'https://www.reddit.com/by_id/t3_post.json?raw_json=1',
-      retrievedUrl: 'https://www.reddit.com/by_id/t3_post.json?raw_json=1',
-      parserPath: 'salvage_wrapper_text',
-      extractionSource: 'text_scan',
-      fields: {
-        name: 't3_post',
-        id: 'post',
-        upvoteRatio: 0.25,
-        ratioPercent: '25.0%',
-        ups: 'missing',
-        downs: 'missing',
-        score: -1,
-      },
+  test('returns auth failure without exposing request credentials', async () => {
+    resetRedditOAuthTokenCacheForTests();
+    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+      config,
+      fetchImpl: mockOAuthFetch({ tokenOk: false }).fetchImpl,
     });
-  });
-
-  test('does not salvage when upvote_ratio is missing', () => {
-    const result = parseOpenAIRedditJsonResponse(
-      {
-        output_text:
-          '{"json_text":"[{\\"kind\\":\\"Listing\\",\\"data\\":{\\"children\\":[{\\"kind\\":\\"t3\\",\\"data\\":{\\"name\\":\\"t3_post\\",\\"score\\":0}}]}}]"}',
-      },
-      'https://www.reddit.com/by_id/t3_post.json?raw_json=1'
-    );
 
     expect(result).toMatchObject({
       ok: false,
-      jsonReceived: true,
-      requestedUrl: 'https://www.reddit.com/by_id/t3_post.json?raw_json=1',
-      parserPath: 'structured_json',
-      extractionSource: 'none',
-      responseTextPreview: expect.stringContaining('score'),
+      upvoteRatio: null,
+      error: expect.stringContaining('Reddit token HTTP 401'),
     });
-    expect(result.fields).toBeUndefined();
+    expect(result.error).not.toContain(config.clientSecret);
+    expect(result.error).not.toContain(config.refreshToken);
+  });
+
+  test('treats matching post with missing ratio as non-actionable success', async () => {
+    resetRedditOAuthTokenCacheForTests();
+    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+      config,
+      fetchImpl: mockOAuthFetch({ listingBody: listing() }).fetchImpl,
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      upvoteRatio: null,
+      ratioPercent: null,
+      rawName: 't3_post',
+    });
+  });
+
+  test('discards wrong post responses', async () => {
+    resetRedditOAuthTokenCacheForTests();
+    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+      config,
+      fetchImpl: mockOAuthFetch({
+        listingBody: listing({ name: 't3_other', upvoteRatio: 0.1 }),
+      }).fetchImpl,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      upvoteRatio: null,
+      rawName: 't3_other',
+      rawId: 'other',
+      error: 'Wrong post returned from Reddit OAuth by_id response.',
+    });
+  });
+
+  test('returns HTTP 429 as a structured score-only fallback', async () => {
+    resetRedditOAuthTokenCacheForTests();
+    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+      config,
+      fetchImpl: mockOAuthFetch({
+        listingOk: false,
+        listingStatus: 429,
+        listingBody: '{"message":"rate limited"}',
+      }).fetchImpl,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      httpStatus: 429,
+      upvoteRatio: null,
+      error: expect.stringContaining('Reddit OAuth HTTP 429'),
+    });
+  });
+
+  test('returns malformed OAuth JSON as a structured failure', async () => {
+    resetRedditOAuthTokenCacheForTests();
+    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+      config,
+      fetchImpl: mockOAuthFetch({ listingBody: '{"broken"' }).fetchImpl,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      upvoteRatio: null,
+    });
+    expect(result.error).toEqual(expect.any(String));
   });
 });
 
@@ -1218,7 +1186,7 @@ describe('removal modmail notifications', () => {
       'Your post was removed because it received too much negative community feedback.'
     );
     expect(body).toContain(
-      'https://www.reddit.com/r/mySubreddit/about/rules'
+      'https://reddit.com/r/mySubreddit/about/rules'
     );
     expect(body).toContain(
       '*Removed post: https://reddit.com/r/mySubreddit/comments/abc123*'
@@ -1229,7 +1197,7 @@ Your post was removed because it received too much negative community feedback.
 
 Posts may be downvoted for many reasons, including rule issues, content quality, or controversial opinions. This removal helps prevent your account from accumulating additional negative karma from the post.
 
-Please review the [community rules](https://www.reddit.com/r/mySubreddit/about/rules) before posting again.
+Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules) before posting again.
 
 
 *Removed post: https://reddit.com/r/mySubreddit/comments/abc123*`);

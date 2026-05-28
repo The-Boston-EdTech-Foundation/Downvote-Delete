@@ -61,7 +61,7 @@ ${input.explanation ?? 'Your post was removed because it received too much negat
 
 Posts may be downvoted for many reasons, including rule issues, content quality, or controversial opinions. This removal helps prevent your account from accumulating additional negative karma from the post.
 
-Please review the [community rules](https://www.reddit.com/r/${input.subredditName}/about/rules) before posting again.
+Please review the [community rules](https://reddit.com/r/${input.subredditName}/about/rules) before posting again.
 
 
 *Removed post: ${input.postLink}*`;
