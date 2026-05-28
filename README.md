@@ -30,10 +30,11 @@ Downvote Delete will not:
 - Continue watching posts that were already moderated or deleted.
 
 ## Patch Notes
-1.4.1 - Official Public Launch and Hackathon Submission.
+1.5.1 - Moving to registered Oauth data fetch as required by May 28 2026 Reddit announcement. 
+1.4.1 - Official Public Launch and Hackathon Submission. 
 1.3.9 - Fixed threshold settings using stale data. 
 1.3.5 - Removal thresholds are units from -1 to -5 downvotes. 
 1.3.3 - Fixed malformed JSON handling. 
-1.3.1 - Adds conservative reported upvote-ratio tracking. Devvit 0.13.0 
+1.3.1 - Adds conservative reported upvote-ratio tracking. Devvit 0.13.0. 
 1.1.1 - Default tracking now 4 hours. Tracking changed to 2, 4, 6 hours. Improved downvote tracking. 
-1.0.5 - Initial Public Release. Devvit 0.12.24 
+1.0.5 - Initial Public Release. Devvit 0.12.24. 
