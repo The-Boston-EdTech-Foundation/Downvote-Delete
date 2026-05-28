@@ -27,6 +27,7 @@ Downvote Delete will not:
 - Continue watching posts that were already moderated or deleted.
 
 ## Patch Notes
+1.4.1 - Official Public Launch and Hackathon Submission.
 1.3.9 - Fixed threshold settings using stale data. 
 1.3.5 - Removal thresholds are units from -1 to -5 downvotes. 
 1.3.3 - Fixed malformed JSON handling. 
