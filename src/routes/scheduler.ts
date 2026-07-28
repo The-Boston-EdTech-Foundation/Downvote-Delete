@@ -27,11 +27,11 @@ import {
 } from '../core/decision';
 import { logError, logInfo, logWarn } from '../core/logging';
 import {
-  fetchAuthenticatedRedditVoteSnapshot,
-  readRedditOAuthConfigFromSettings,
-  type AuthenticatedRedditVoteSnapshot,
-  type RedditOAuthConfig,
-} from '../core/redditOAuthRatio';
+  fetchPrawRouterVoteSnapshot,
+  readPrawRouterConfigFromSettings,
+  type PrawRouterConfig,
+  type PrawRouterVoteSnapshot,
+} from '../core/prawRatioRouter';
 import { postToSnapshot } from '../core/postStatus';
 import {
   normalizeSettings,
@@ -163,7 +163,10 @@ async function writeTrackedPost(record: TrackedPost): Promise<void> {
   await redis.set(redisKey, serializeTrackedPost(record));
 }
 
-async function releaseActionLock(postId: string, reason: string): Promise<void> {
+async function releaseActionLock(
+  postId: string,
+  reason: string
+): Promise<void> {
   logInfo('Releasing Redis action lock.', {
     postId,
     actionLockKey: actionLockKey(postId),
@@ -284,20 +287,20 @@ function clearFreshRatioDecision(
 
 async function fetchAndLogRawRatio(args: {
   postId: string;
-  config: RedditOAuthConfig | null;
-}): Promise<AuthenticatedRedditVoteSnapshot> {
-  logInfo('Fetching authenticated Reddit ratio.', {
+  config: PrawRouterConfig | null;
+}): Promise<PrawRouterVoteSnapshot> {
+  logInfo('Fetching Reddit ratio from PRAW router.', {
     postId: args.postId,
-    source: 'authenticated_reddit_api',
-    endpoint: 'oauth_by_id',
+    source: 'praw_router',
+    endpoint: 'post_ratio',
   });
 
-  const result = await fetchAuthenticatedRedditVoteSnapshot(args.postId, {
+  const result = await fetchPrawRouterVoteSnapshot(args.postId, {
     config: args.config,
   });
 
   if (result.ok) {
-    logInfo('Authenticated Reddit ratio fetched.', {
+    logInfo('PRAW router ratio fetched.', {
       postId: args.postId,
       ok: true,
       source: result.source,
@@ -311,7 +314,7 @@ async function fetchAndLogRawRatio(args: {
       rawDowns: result.downs,
     });
   } else {
-    logWarn('Authenticated Reddit ratio fetch failed.', {
+    logWarn('PRAW router ratio fetch failed.', {
       postId: args.postId,
       ok: false,
       source: result.source,
@@ -322,7 +325,7 @@ async function fetchAndLogRawRatio(args: {
   }
 
   if (result.ok && result.upvoteRatio === null) {
-    logInfo('Authenticated Reddit ratio unavailable.', {
+    logInfo('PRAW router ratio unavailable.', {
       postId: args.postId,
       ok: true,
       source: result.source,
@@ -334,9 +337,9 @@ async function fetchAndLogRawRatio(args: {
   return result;
 }
 
-function applyAuthenticatedRatioResult(
+function applyPrawRouterRatioResult(
   record: TrackedPost,
-  result: AuthenticatedRedditVoteSnapshot,
+  result: PrawRouterVoteSnapshot,
   now: number,
   moderatorThreshold: number,
   latestScore: number
@@ -348,6 +351,9 @@ function applyAuthenticatedRatioResult(
     lastAuthenticatedRatioReceived: result.ok,
     lastAuthenticatedRatioSource: result.source,
   };
+
+  delete updatedRecord.lastAuthenticatedRatioError;
+  delete updatedRecord.lastAuthenticatedRatioHttpStatus;
 
   if (result.error) {
     updatedRecord.lastAuthenticatedRatioError = result.error;
@@ -545,7 +551,8 @@ function mergeFreshActionFields(
   }
 
   if (typeof recordForAction.lastRawAuthenticatedUps === 'number') {
-    actionRecord.lastRawAuthenticatedUps = recordForAction.lastRawAuthenticatedUps;
+    actionRecord.lastRawAuthenticatedUps =
+      recordForAction.lastRawAuthenticatedUps;
   }
 
   if (typeof recordForAction.lastRawAuthenticatedDowns === 'number') {
@@ -725,10 +732,13 @@ async function actionTrackedPost(args: {
   });
 
   if (actionLockWasSet !== 'OK') {
-    logWarn('Action skipped because another check already owns the action lock.', {
-      postId: args.postId,
-      actionLockResult: actionLockWasSet,
-    });
+    logWarn(
+      'Action skipped because another check already owns the action lock.',
+      {
+        postId: args.postId,
+        actionLockResult: actionLockWasSet,
+      }
+    );
     const latestRecord = await loadTrackedPost(args.postId);
     if (latestRecord?.status === 'active') {
       await scheduleRetryWithoutRecordWrite(
@@ -747,11 +757,14 @@ async function actionTrackedPost(args: {
 
   const latestRecord = await loadTrackedPost(args.postId);
   if (!latestRecord || latestRecord.status !== 'active') {
-    logWarn('Action skipped after lock because latest record is no longer actionable.', {
-      postId: args.postId,
-      latestStatus: latestRecord?.status,
-      hasFetchedPost: true,
-    });
+    logWarn(
+      'Action skipped after lock because latest record is no longer actionable.',
+      {
+        postId: args.postId,
+        latestStatus: latestRecord?.status,
+        hasFetchedPost: true,
+      }
+    );
     await releaseActionLock(args.postId, 'latest_record_not_actionable');
     return;
   }
@@ -762,7 +775,11 @@ async function actionTrackedPost(args: {
   );
 
   await writeTrackedPost({
-    ...applyScoreSignals(actionRecord, args.currentSnapshot, args.negativeDecision),
+    ...applyScoreSignals(
+      actionRecord,
+      args.currentSnapshot,
+      args.negativeDecision
+    ),
     status: 'actioning',
     updatedAt: args.now,
   });
@@ -821,7 +838,11 @@ async function actionTrackedPost(args: {
     await releaseActionLock(args.postId, 'moderation_action_failed');
     await markErrorAndReschedule(
       {
-        ...applyScoreSignals(actionRecord, args.currentSnapshot, args.negativeDecision),
+        ...applyScoreSignals(
+          actionRecord,
+          args.currentSnapshot,
+          args.negativeDecision
+        ),
         status: 'active',
       },
       err,
@@ -858,7 +879,11 @@ async function actionTrackedPost(args: {
   }
 
   const actionedRecord: TrackedPost = {
-    ...applyScoreSignals(actionRecord, args.currentSnapshot, args.negativeDecision),
+    ...applyScoreSignals(
+      actionRecord,
+      args.currentSnapshot,
+      args.negativeDecision
+    ),
     status: 'actioned',
     actionedAt: Date.now(),
   };
@@ -879,12 +904,7 @@ async function actionTrackedPost(args: {
       moderationActionResult.modmailErrorMessage;
   }
 
-  await stopTracking(
-    actionedRecord,
-    'actioned',
-    Date.now(),
-    args.stopReason
-  );
+  await stopTracking(actionedRecord, 'actioned', Date.now(), args.stopReason);
   await redis.hIncrBy(
     statsKey(actionRecord.subredditId),
     `action_${actionRecord.actionToTake}`,
@@ -926,11 +946,14 @@ scheduledJobs.post('/check-watched-post', async (c) => {
 
   const initialRecord = await loadTrackedPost(postId);
   if (!initialRecord || initialRecord.status !== 'active') {
-    logInfo('Scheduled check exited without action because no active record exists.', {
-      postId,
-      status: initialRecord?.status,
-      reason: initialRecord ? 'record_not_active' : 'record_missing',
-    });
+    logInfo(
+      'Scheduled check exited without action because no active record exists.',
+      {
+        postId,
+        status: initialRecord?.status,
+        reason: initialRecord ? 'record_not_active' : 'record_missing',
+      }
+    );
     return c.json<TaskResponse>({}, 200);
   }
 
@@ -938,10 +961,12 @@ scheduledJobs.post('/check-watched-post', async (c) => {
   let activeRecord = initialRecord;
 
   try {
-    logInfo('Reading app installation settings for scheduled check.', { postId });
+    logInfo('Reading app installation settings for scheduled check.', {
+      postId,
+    });
     const settingsValues = await devvitSettings.getAll<SettingsValues>();
     const currentSettings = normalizeSettings(settingsValues);
-    const redditOAuthConfig = readRedditOAuthConfigFromSettings(
+    const prawRouterConfig = readPrawRouterConfigFromSettings(
       settingsValues as Record<string, unknown>
     );
     logInfo('Loaded app installation settings for scheduled check.', {
@@ -952,15 +977,15 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
       actionToTake: currentSettings.actionToTake,
       moderatorPostHandling: currentSettings.moderatorPostHandling,
-      authenticatedRatioConfigured: redditOAuthConfig !== null,
+      prawRouterConfigured: prawRouterConfig !== null,
       rawSettingShapes: summarizeSubredditSettingsShapes(settingsValues),
     });
-    if (!redditOAuthConfig) {
+    if (!prawRouterConfig) {
       logWarn(
-        'Authenticated Reddit ratio disabled because required secrets are missing.',
+        'PRAW router ratio disabled because its URL or secret is missing.',
         {
           postId,
-          source: 'authenticated_reddit_api',
+          source: 'praw_router',
           fallback: 'reddit_score_only',
         }
       );
@@ -973,7 +998,8 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       postId,
       storedNegativeScoreThreshold: initialRecord.negativeScoreThreshold,
       activeNegativeScoreThreshold: activeRecord.negativeScoreThreshold,
-      storedPositiveScoreStopThreshold: initialRecord.positiveScoreStopThreshold,
+      storedPositiveScoreStopThreshold:
+        initialRecord.positiveScoreStopThreshold,
       activePositiveScoreStopThreshold: activeRecord.positiveScoreStopThreshold,
       storedActionToTake: initialRecord.actionToTake,
       activeActionToTake: activeRecord.actionToTake,
@@ -1095,9 +1121,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     if (advancedTracking) {
       const ratioResult = await fetchAndLogRawRatio({
         postId,
-        config: redditOAuthConfig,
+        config: prawRouterConfig,
       });
-      recordForNextCheck = applyAuthenticatedRatioResult(
+      recordForNextCheck = applyPrawRouterRatioResult(
         recordForNextCheck,
         ratioResult,
         now,
@@ -1110,18 +1136,21 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         const actionReason = buildRatioActionReason(
           recordForNextCheck.actionToTake
         );
-        logInfo('Decision: action post because ratio confidence threshold was met.', {
-          postId,
-          rawUpvoteRatio: recordForNextCheck.lastRawUpvoteRatio,
-          minimumTotalVotes: recordForNextCheck.minimumTotalVotes,
-          guaranteedSpread: recordForNextCheck.guaranteedSpread,
-          threshold: recordForNextCheck.negativeScoreThreshold,
-          ratioDecisionReason: recordForNextCheck.lastRatioDecisionReason,
-          ratioSource: recordForNextCheck.lastAuthenticatedRatioSource,
-          possibleStateCount: recordForNextCheck.possibleStates?.length,
-          actionToTake: recordForNextCheck.actionToTake,
-          reason: actionReason,
-        });
+        logInfo(
+          'Decision: action post because ratio confidence threshold was met.',
+          {
+            postId,
+            rawUpvoteRatio: recordForNextCheck.lastRawUpvoteRatio,
+            minimumTotalVotes: recordForNextCheck.minimumTotalVotes,
+            guaranteedSpread: recordForNextCheck.guaranteedSpread,
+            threshold: recordForNextCheck.negativeScoreThreshold,
+            ratioDecisionReason: recordForNextCheck.lastRatioDecisionReason,
+            ratioSource: recordForNextCheck.lastAuthenticatedRatioSource,
+            possibleStateCount: recordForNextCheck.possibleStates?.length,
+            actionToTake: recordForNextCheck.actionToTake,
+            reason: actionReason,
+          }
+        );
         await actionTrackedPost({
           postId,
           fetched,
@@ -1130,7 +1159,8 @@ scheduledJobs.post('/check-watched-post', async (c) => {
           negativeDecision,
           now,
           actionReason,
-          stopReason: recordForNextCheck.lastRatioDecisionReason ?? 'ratio_action',
+          stopReason:
+            recordForNextCheck.lastRatioDecisionReason ?? 'ratio_action',
         });
         return c.json<TaskResponse>({}, 200);
       }

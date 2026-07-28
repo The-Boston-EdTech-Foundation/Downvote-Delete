@@ -101,14 +101,10 @@ export function summarizeSubredditSettingsShapes(
     moderatorPostHandling: summarizeSettingsValueShape(
       values.moderatorPostHandling
     ),
-    REDDIT_CLIENT_ID: summarizeSettingsValueShape(values.REDDIT_CLIENT_ID),
-    REDDIT_CLIENT_SECRET: summarizeSettingsValueShape(
-      values.REDDIT_CLIENT_SECRET
+    PRAW_ROUTER_URL: summarizeSettingsValueShape(values.PRAW_ROUTER_URL),
+    PRAW_ROUTER_HMAC_SECRET: summarizeSettingsValueShape(
+      values.PRAW_ROUTER_HMAC_SECRET
     ),
-    REDDIT_REFRESH_TOKEN: summarizeSettingsValueShape(
-      values.REDDIT_REFRESH_TOKEN
-    ),
-    REDDIT_USER_AGENT: summarizeSettingsValueShape(values.REDDIT_USER_AGENT),
   };
 }
 

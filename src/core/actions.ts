@@ -104,7 +104,7 @@ export async function applyModerationAction(
   }
 
   if (args.action === ACTION_FILTER) {
-    await args.post.filter(reason, false);
+    await args.post.filter({ reason, keep: false });
     return { modmailStatus: 'not_applicable' };
   }
 

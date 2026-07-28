@@ -14,18 +14,12 @@ import {
 } from '../src/core/decision';
 import { formatLogContext } from '../src/core/logging';
 import {
-  buildRedditProbeTargets,
-  parseProbeVoteFields,
-  previewProbeText,
-  sanitizeProbeText,
-} from '../src/core/redditDomainProbe';
-import {
-  fetchAuthenticatedRedditVoteSnapshot,
-  readRedditOAuthConfigFromSettings,
-  resetRedditOAuthTokenCacheForTests,
-  type RedditOAuthConfig,
-  type RedditOAuthFetch,
-} from '../src/core/redditOAuthRatio';
+  fetchPrawRouterVoteSnapshot,
+  readPrawRouterConfigFromSettings,
+  signPrawRouterRequest,
+  type PrawRouterConfig,
+  type PrawRouterFetch,
+} from '../src/core/prawRatioRouter';
 import {
   advancedTrackingMaxRatio,
   buildRatioLookup,
@@ -62,11 +56,13 @@ const activeSettings: DownvoteDeleteSettings = {
 
 type ApplyModerationActionArgs = Parameters<typeof applyModerationAction>[0];
 
-function mockPost(overrides: Partial<{
-  filterCalls: string[];
-  removalNotes: unknown[];
-  removeCalls: boolean[];
-}> = {}): ApplyModerationActionArgs['post'] & {
+function mockPost(
+  overrides: Partial<{
+    filterCalls: string[];
+    removalNotes: unknown[];
+    removeCalls: boolean[];
+  }> = {}
+): ApplyModerationActionArgs['post'] & {
   filterCalls: string[];
   removalNotes: unknown[];
   removeCalls: boolean[];
@@ -78,8 +74,8 @@ function mockPost(overrides: Partial<{
     filterCalls,
     removalNotes,
     removeCalls,
-    async filter(reason: string, keep: boolean): Promise<void> {
-      filterCalls.push(`${reason}|${keep}`);
+    async filter(options: { reason?: string; keep?: boolean }): Promise<void> {
+      filterCalls.push(`${options.reason}|${options.keep}`);
     },
     async remove(isSpam: boolean): Promise<void> {
       removeCalls.push(isSpam);
@@ -96,9 +92,11 @@ function mockPost(overrides: Partial<{
   };
 }
 
-function mockRedditClient(args: {
-  failModmail?: boolean;
-} = {}): ApplyModerationActionArgs['redditClient'] & {
+function mockRedditClient(
+  args: {
+    failModmail?: boolean;
+  } = {}
+): ApplyModerationActionArgs['redditClient'] & {
   reports: unknown[];
   modmailConversations: unknown[];
 } {
@@ -280,331 +278,232 @@ describe('backoff schedule', () => {
   });
 });
 
-describe('temporary Reddit domain probe helpers', () => {
-  test('redacts token-like values and caps previews at 300 characters', () => {
-    const raw = `${'x'.repeat(350)} access_token":"abc123" Bearer live-token Basic basic-token`;
-    const preview = previewProbeText(raw);
-
-    expect(preview.length).toBeLessThanOrEqual(300);
-    expect(sanitizeProbeText(raw)).not.toContain('abc123');
-    expect(sanitizeProbeText(raw)).not.toContain('live-token');
-    expect(sanitizeProbeText(raw)).not.toContain('basic-token');
-  });
-
-  test('recursively finds vote fields in Reddit listing shapes', () => {
-    expect(
-      parseProbeVoteFields(
-        JSON.stringify({
-          kind: 'Listing',
-          data: {
-            children: [
-              {
-                kind: 't3',
-                data: {
-                  name: 't3_1tqgga7',
-                  upvote_ratio: 0.42,
-                  score: 0,
-                },
-              },
-            ],
-          },
-        })
-      )
-    ).toEqual({
-      parsedUpvoteRatio: 0.42,
-      parsedScore: 0,
-      parsedName: 't3_1tqgga7',
-    });
-  });
-
-  test('builds hardcoded probe targets without user-controlled URLs', () => {
-    const targets = buildRedditProbeTargets({
-      config: {
-        clientId: 'client-id',
-        clientSecret: 'client-secret',
-        refreshToken: 'refresh-token',
-        userAgent: 'agent',
-      },
-      accessToken: 'access-token',
-    });
-
-    expect(targets.some((target) => target.url.includes('1tqgga7'))).toBe(true);
-    expect(targets.some((target) => target.auth === 'basic')).toBe(true);
-    expect(targets.some((target) => target.auth === 'bearer')).toBe(true);
-    expect(
-      new Set(targets.map((target) => new URL(target.url).hostname))
-    ).toEqual(
-      new Set([
-        'www.reddit.com',
-        'old.reddit.com',
-        'new.reddit.com',
-        'sh.reddit.com',
-        'np.reddit.com',
-        'i.reddit.com',
-        'amp.reddit.com',
-        'ssl.reddit.com',
-        'oauth.reddit.com',
-      ])
-    );
-  });
-});
-
-describe('authenticated Reddit ratio fetch', () => {
-  const config: RedditOAuthConfig = {
-    clientId: 'client-id',
-    clientSecret: 'client-secret',
-    refreshToken: 'refresh-token',
-    userAgent: 'Downvote-Delete/1.4.1 by Alan-Foster',
+describe('PRAW ratio router client', () => {
+  const config: PrawRouterConfig = {
+    url: 'https://api-id.execute-api.us-east-1.amazonaws.com/prod/v1/post-ratio',
+    hmacSecret: 'router-secret',
   };
 
-  function listing(args: {
-    name?: string;
-    upvoteRatio?: number;
-    score?: number;
-    hideScore?: boolean;
-  } = {}): string {
+  function successBody(
+    overrides: Partial<{
+      apiVersion: string;
+      postId: string;
+      upvoteRatio: number | null;
+      score: number | null;
+      rawName: string;
+      rawId: string;
+    }> = {}
+  ): string {
     return JSON.stringify({
-      kind: 'Listing',
-      data: {
-        children: [
-          {
-            kind: 't3',
-            data: {
-              name: args.name ?? 't3_post',
-              id: (args.name ?? 't3_post').replace(/^t3_/, ''),
-              score: args.score ?? 0,
-              upvote_ratio: args.upvoteRatio,
-              ups: 1,
-              downs: 2,
-              hide_score: args.hideScore ?? false,
-            },
-          },
-        ],
-      },
+      apiVersion: overrides.apiVersion ?? '1',
+      ok: true,
+      postId: overrides.postId ?? 't3_post',
+      upvoteRatio:
+        overrides.upvoteRatio === undefined ? 0.33 : overrides.upvoteRatio,
+      score: overrides.score === undefined ? -1 : overrides.score,
+      rawName: overrides.rawName ?? 't3_post',
+      rawId: overrides.rawId ?? 'post',
     });
   }
 
-  function mockOAuthFetch(args: {
-    tokenOk?: boolean;
-    listingOk?: boolean;
-    listingStatus?: number;
-    listingBody?: string;
-  } = {}): {
-    calls: string[];
-    fetchImpl: RedditOAuthFetch;
+  function mockRouterFetch(
+    args: {
+      ok?: boolean;
+      status?: number;
+      body?: string;
+    } = {}
+  ): {
+    calls: Array<{
+      url: string;
+      init: Parameters<PrawRouterFetch>[1];
+    }>;
+    fetchImpl: PrawRouterFetch;
   } {
-    const calls: string[] = [];
+    const calls: Array<{
+      url: string;
+      init: Parameters<PrawRouterFetch>[1];
+    }> = [];
+
     return {
       calls,
-      fetchImpl: async (url) => {
-        calls.push(url);
-        if (url.includes('/api/v1/access_token')) {
-          return {
-            ok: args.tokenOk ?? true,
-            status: args.tokenOk === false ? 401 : 200,
-            statusText: args.tokenOk === false ? 'Unauthorized' : 'OK',
-            async text(): Promise<string> {
-              return args.tokenOk === false
-                ? '{"error":"invalid_grant"}'
-                : '{"access_token":"access-token","expires_in":3600}';
-            },
-          };
-        }
-
+      fetchImpl: async (url, init) => {
+        calls.push({ url, init });
         return {
-          ok: args.listingOk ?? true,
-          status: args.listingStatus ?? 200,
-          statusText: args.listingOk === false ? 'Too Many Requests' : 'OK',
+          ok: args.ok ?? true,
+          status: args.status ?? 200,
+          statusText: args.ok === false ? 'Too Many Requests' : 'OK',
           async text(): Promise<string> {
-            return args.listingBody ?? listing({ upvoteRatio: 0.33 });
+            return args.body ?? successBody();
           },
         };
       },
     };
   }
 
-  test('reads configured Reddit OAuth settings', () => {
+  test('reads only a valid HTTPS router configuration', () => {
     expect(
-      readRedditOAuthConfigFromSettings({
-        REDDIT_CLIENT_ID: 'configured-client',
-        REDDIT_CLIENT_SECRET: 'configured-secret',
-        REDDIT_REFRESH_TOKEN: 'configured-refresh',
-        REDDIT_USER_AGENT: 'configured-agent',
+      readPrawRouterConfigFromSettings({
+        PRAW_ROUTER_URL: config.url,
+        PRAW_ROUTER_HMAC_SECRET: config.hmacSecret,
       })
-    ).toEqual({
-      clientId: 'configured-client',
-      clientSecret: 'configured-secret',
-      refreshToken: 'configured-refresh',
-      userAgent: 'configured-agent',
-    });
-  });
-
-  test('returns null when required Reddit OAuth secrets are missing', () => {
-    expect(readRedditOAuthConfigFromSettings({})).toBeNull();
+    ).toEqual(config);
+    expect(readPrawRouterConfigFromSettings({})).toBeNull();
     expect(
-      readRedditOAuthConfigFromSettings({
-        REDDIT_CLIENT_ID: 'configured-client',
-        REDDIT_CLIENT_SECRET: 'configured-secret',
+      readPrawRouterConfigFromSettings({
+        PRAW_ROUTER_URL: 'http://router.example.com/v1/post-ratio',
+        PRAW_ROUTER_HMAC_SECRET: config.hmacSecret,
       })
     ).toBeNull();
   });
 
-  test('uses default user agent when setting is missing', () => {
+  test('generates the expected deterministic HMAC signature', () => {
     expect(
-      readRedditOAuthConfigFromSettings({
-        REDDIT_CLIENT_ID: 'configured-client',
-        REDDIT_CLIENT_SECRET: 'configured-secret',
-        REDDIT_REFRESH_TOKEN: 'configured-refresh',
+      signPrawRouterRequest({
+        timestamp: 1_700_000_000,
+        body: '{"postId":"t3_post"}',
+        hmacSecret: config.hmacSecret,
       })
-    ).toEqual({
-      clientId: 'configured-client',
-      clientSecret: 'configured-secret',
-      refreshToken: 'configured-refresh',
-      userAgent: 'Downvote-Delete/1.4.1 by Alan-Foster',
-    });
+    ).toBe('bbd4656ee2a587cd89acef08bb89fae75c5eefeb59325cb8c8ced35218e23d3a');
   });
 
-  test('returns structured failure when credentials are missing', async () => {
-    resetRedditOAuthTokenCacheForTests();
-    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
-      config: readRedditOAuthConfigFromSettings({}),
-      fetchImpl: mockOAuthFetch().fetchImpl,
-    });
-
-    expect(result).toMatchObject({
-      ok: false,
-      source: 'authenticated_reddit_api',
-      upvoteRatio: null,
-      error: 'Missing required Reddit OAuth credentials.',
-    });
-  });
-
-  test('fetches and reuses an access token for matching post snapshots', async () => {
-    resetRedditOAuthTokenCacheForTests();
-    const oauth = mockOAuthFetch({
-      listingBody: listing({ upvoteRatio: 0.25, hideScore: true }),
-    });
-
-    const first = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+  test('posts a signed request and parses the ratio snapshot', async () => {
+    const router = mockRouterFetch();
+    const result = await fetchPrawRouterVoteSnapshot('t3_post', {
       config,
-      fetchImpl: oauth.fetchImpl,
+      fetchImpl: router.fetchImpl,
       now,
     });
-    const second = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
-      config,
-      fetchImpl: oauth.fetchImpl,
-      now: now + 1_000,
-    });
 
-    expect(first).toMatchObject({
+    expect(result).toMatchObject({
       ok: true,
       postId: 't3_post',
-      source: 'authenticated_reddit_api',
-      endpoint: 'oauth_by_id',
-      upvoteRatio: 0.25,
-      ratioPercent: '25.0%',
-      hideScore: true,
+      source: 'praw_router',
+      endpoint: 'post_ratio',
+      upvoteRatio: 0.33,
+      ratioPercent: '33.0%',
+      score: -1,
       rawName: 't3_post',
       rawId: 'post',
-      ups: 1,
-      downs: 2,
-      score: 0,
     });
-    expect(second.ok).toBe(true);
-    expect(
-      oauth.calls.filter((url) => url.includes('/api/v1/access_token'))
-    ).toHaveLength(1);
-    expect(oauth.calls).toContain(
-      'https://oauth.reddit.com/api/v1/access_token'
-    );
-    expect(oauth.calls.filter((url) => url.includes('/by_id/t3_post'))).toEqual(
-      ['https://oauth.reddit.com/by_id/t3_post', 'https://oauth.reddit.com/by_id/t3_post']
-    );
-    expect(new Set(oauth.calls.map((url) => new URL(url).hostname))).toEqual(
-      new Set(['oauth.reddit.com'])
-    );
+    expect(router.calls).toHaveLength(1);
+    expect(router.calls[0]?.url).toBe(config.url);
+    expect(router.calls[0]?.init).toMatchObject({
+      method: 'POST',
+      body: '{"postId":"t3_post"}',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Request-Timestamp': '1700000000',
+        'X-Request-Signature':
+          'v1=bbd4656ee2a587cd89acef08bb89fae75c5eefeb59325cb8c8ced35218e23d3a',
+      },
+    });
   });
 
-  test('returns auth failure without exposing request credentials', async () => {
-    resetRedditOAuthTokenCacheForTests();
-    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
-      config,
-      fetchImpl: mockOAuthFetch({ tokenOk: false }).fetchImpl,
+  test('returns structured failure when router configuration is missing', async () => {
+    const result = await fetchPrawRouterVoteSnapshot('t3_post', {
+      config: readPrawRouterConfigFromSettings({}),
+      fetchImpl: mockRouterFetch().fetchImpl,
     });
 
     expect(result).toMatchObject({
       ok: false,
+      source: 'praw_router',
       upvoteRatio: null,
-      error: expect.stringContaining('Reddit token HTTP 401'),
+      error: 'Missing or invalid PRAW router configuration.',
     });
-    expect(result.error).not.toContain(config.clientSecret);
-    expect(result.error).not.toContain(config.refreshToken);
   });
 
-  test('treats matching post with missing ratio as non-actionable success', async () => {
-    resetRedditOAuthTokenCacheForTests();
-    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+  test('accepts a matching post with no reported ratio', async () => {
+    const result = await fetchPrawRouterVoteSnapshot('t3_post', {
       config,
-      fetchImpl: mockOAuthFetch({ listingBody: listing() }).fetchImpl,
+      fetchImpl: mockRouterFetch({
+        body: successBody({ upvoteRatio: null }),
+      }).fetchImpl,
     });
 
     expect(result).toMatchObject({
       ok: true,
       upvoteRatio: null,
       ratioPercent: null,
-      rawName: 't3_post',
     });
   });
 
-  test('discards wrong post responses', async () => {
-    resetRedditOAuthTokenCacheForTests();
-    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+  test('rejects mismatched posts and invalid ratios', async () => {
+    const mismatch = await fetchPrawRouterVoteSnapshot('t3_post', {
       config,
-      fetchImpl: mockOAuthFetch({
-        listingBody: listing({ name: 't3_other', upvoteRatio: 0.1 }),
+      fetchImpl: mockRouterFetch({
+        body: successBody({
+          postId: 't3_other',
+          rawName: 't3_other',
+          rawId: 'other',
+        }),
+      }).fetchImpl,
+    });
+    const invalidRatio = await fetchPrawRouterVoteSnapshot('t3_post', {
+      config,
+      fetchImpl: mockRouterFetch({
+        body: successBody({ upvoteRatio: 1.1 }),
       }).fetchImpl,
     });
 
-    expect(result).toMatchObject({
+    expect(mismatch).toMatchObject({
       ok: false,
-      upvoteRatio: null,
+      error: 'PRAW router returned a different post.',
       rawName: 't3_other',
       rawId: 'other',
-      error: 'Wrong post returned from Reddit OAuth by_id response.',
+    });
+    expect(invalidRatio).toMatchObject({
+      ok: false,
+      error: 'PRAW router returned an invalid success response.',
     });
   });
 
-  test('returns HTTP 429 as a structured score-only fallback', async () => {
-    resetRedditOAuthTokenCacheForTests();
-    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+  test('returns non-2xx and malformed responses as score-only failures', async () => {
+    const limited = await fetchPrawRouterVoteSnapshot('t3_post', {
       config,
-      fetchImpl: mockOAuthFetch({
-        listingOk: false,
-        listingStatus: 429,
-        listingBody: '{"message":"rate limited"}',
+      fetchImpl: mockRouterFetch({
+        ok: false,
+        status: 429,
+        body: '{"apiVersion":"1","ok":false}',
       }).fetchImpl,
     });
+    const malformed = await fetchPrawRouterVoteSnapshot('t3_post', {
+      config,
+      fetchImpl: mockRouterFetch({ body: '{"broken"' }).fetchImpl,
+    });
 
-    expect(result).toMatchObject({
+    expect(limited).toMatchObject({
       ok: false,
       httpStatus: 429,
       upvoteRatio: null,
-      error: expect.stringContaining('Reddit OAuth HTTP 429'),
+      error: expect.stringContaining('PRAW router HTTP 429'),
+    });
+    expect(malformed).toMatchObject({
+      ok: false,
+      upvoteRatio: null,
     });
   });
 
-  test('returns malformed OAuth JSON as a structured failure', async () => {
-    resetRedditOAuthTokenCacheForTests();
-    const result = await fetchAuthenticatedRedditVoteSnapshot('t3_post', {
+  test('aborts router calls that exceed the configured timeout', async () => {
+    const fetchImpl: PrawRouterFetch = async (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => {
+          const error = new Error('aborted');
+          error.name = 'AbortError';
+          reject(error);
+        });
+      });
+
+    const result = await fetchPrawRouterVoteSnapshot('t3_post', {
       config,
-      fetchImpl: mockOAuthFetch({ listingBody: '{"broken"' }).fetchImpl,
+      fetchImpl,
+      timeoutMs: 1,
     });
 
     expect(result).toMatchObject({
       ok: false,
-      upvoteRatio: null,
+      error: 'PRAW router request timed out.',
     });
-    expect(result.error).toEqual(expect.any(String));
   });
 });
 
@@ -907,9 +806,9 @@ describe('vote ratio confidence model', () => {
     });
 
     expect(evaluation.guaranteedSpread).toBe(-3);
-    expect(Math.min(...evaluation.possibleStates.map((state) => state.spread))).toBe(
-      -10
-    );
+    expect(
+      Math.min(...evaluation.possibleStates.map((state) => state.spread))
+    ).toBe(-10);
   });
 });
 
@@ -1260,9 +1159,7 @@ describe('removal modmail notifications', () => {
     expect(body).toContain(
       'Your post was removed because it received too much negative community feedback.'
     );
-    expect(body).toContain(
-      'https://reddit.com/r/mySubreddit/about/rules'
-    );
+    expect(body).toContain('https://reddit.com/r/mySubreddit/about/rules');
     expect(body).toContain(
       '*Removed post: https://reddit.com/r/mySubreddit/comments/abc123*'
     );

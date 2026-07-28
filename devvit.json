@@ -17,25 +17,16 @@
   },
   "settings": {
     "global": {
-      "REDDIT_CLIENT_ID": {
+      "PRAW_ROUTER_URL": {
         "type": "string",
-        "label": "Reddit OAuth client ID",
-        "isSecret": true
+        "label": "PRAW router endpoint URL",
+        "helpText": "Full HTTPS URL ending in /v1/post-ratio."
       },
-      "REDDIT_CLIENT_SECRET": {
+      "PRAW_ROUTER_HMAC_SECRET": {
         "type": "string",
-        "label": "Reddit OAuth client secret",
+        "label": "PRAW router HMAC secret",
+        "helpText": "Must match router_hmac_secret in AWS Secrets Manager.",
         "isSecret": true
-      },
-      "REDDIT_REFRESH_TOKEN": {
-        "type": "string",
-        "label": "Reddit OAuth refresh token",
-        "isSecret": true
-      },
-      "REDDIT_USER_AGENT": {
-        "type": "string",
-        "label": "Reddit API user agent",
-        "defaultValue": "Downvote-Delete/1.4.1 by Alan-Foster"
       }
     },
     "subreddit": {
@@ -101,18 +92,6 @@
       }
     }
   },
-  "menu": {
-    "items": [
-      {
-        "label": "Run Reddit domain probe",
-        "description": "Temporary diagnostic probe for Reddit API access.",
-        "forUserType": "moderator",
-        "location": "subreddit",
-        "endpoint": "/internal/menu/reddit-domain-probe",
-        "postFilter": "none"
-      }
-    ]
-  },
   "scripts": {
     "build": "vite build",
     "dev": "vite build --watch"
@@ -128,17 +107,7 @@
     "redis": true,
     "http": {
       "enable": true,
-      "domains": [
-        "www.reddit.com",
-        "old.reddit.com",
-        "new.reddit.com",
-        "sh.reddit.com",
-        "np.reddit.com",
-        "i.reddit.com",
-        "amp.reddit.com",
-        "oauth.reddit.com",
-        "ssl.reddit.com"
-      ]
+      "domains": []
     }
   },
   "dev": {

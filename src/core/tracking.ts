@@ -17,9 +17,7 @@ export type TrackingStatus =
   | 'stopped_inactive'
   | 'error';
 
-export type NegativeDecisionSource =
-  | 'reddit_score'
-  | 'calculated_votes';
+export type NegativeDecisionSource = 'reddit_score' | 'calculated_votes';
 
 export type TrackingMode = 'normal' | 'advanced';
 
@@ -35,9 +33,10 @@ export type TrackedPost = {
   checkCount: number;
   trackingMode?: TrackingMode;
   advancedTrackingStartedAt?: number;
+  // Retained names keep existing Redis records compatible after the PRAW cutover.
   lastAuthenticatedRatioCheckAt?: number;
   lastAuthenticatedRatioReceived?: boolean;
-  lastAuthenticatedRatioSource?: 'authenticated_reddit_api';
+  lastAuthenticatedRatioSource?: 'authenticated_reddit_api' | 'praw_router';
   lastAuthenticatedRatioError?: string;
   lastAuthenticatedRatioHttpStatus?: number;
   lastAuthenticatedRatioRawName?: string;
@@ -97,7 +96,9 @@ export function serializeTrackedPost(record: TrackedPost): string {
   return JSON.stringify(record);
 }
 
-export function parseTrackedPost(value: string | undefined): TrackedPost | null {
+export function parseTrackedPost(
+  value: string | undefined
+): TrackedPost | null {
   if (!value) {
     return null;
   }
@@ -109,7 +110,10 @@ export function parseTrackedPost(value: string | undefined): TrackedPost | null 
   }
 }
 
-export function createAuditRecord(record: TrackedPost, now: number): AuditRecord {
+export function createAuditRecord(
+  record: TrackedPost,
+  now: number
+): AuditRecord {
   return {
     ...record,
     auditedAt: now,

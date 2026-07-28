@@ -10,32 +10,36 @@ Downvote Delete can:
 
 - Watch new posts for 2, 4, or 6 hours.
 - Detect when a post reaches configured negative scores (-1 through -5).
-- Use authenticated Reddit API access for conservative advanced ratio tracking when configured.
+- Use an AWS-hosted PRAW router for conservative advanced ratio tracking when configured.
 - Stops watching posts that grow positively (+3, +5 or +10).
 - Ignore manually approved posts.
 - Stop tracking posts that are already removed, filtered, spammed, deleted, or unavailable.
 
 Downvote Delete watches posts only. It does not track comments or scan older posts. Use Crowd Control to automatically filter downvoted comments.
 
-Advanced ratio tracking uses authenticated Reddit API access when configured. If unavailable, the app falls back to conservative score-only tracking.
+Advanced ratio tracking calls the HMAC-authenticated PRAW router when
+configured. If the router is unavailable, rejects a request, or omits the
+ratio, the app falls back to conservative score-only tracking and does not use
+a historical ratio for the current decision.
 
 ## What the app does NOT do:
 
 Downvote Delete will not:
 
-- Track comments - use crowd control for this.
+- Track downvoted comments - use crowd control for this.
 - Scan old posts from before installation.
 - Action manually approved posts.
 - Action the same tracked post more than once.
 - Continue watching posts that were already moderated or deleted.
 
 ## Patch Notes
-1.6.1 - Reddit API Router replaces the use of AI workaround. Devvit 0.13.10
-1.5.1 - Moving to registered Oauth data fetch as required by May 28 2026 Reddit announcement. 
-1.4.1 - Official Public Launch and Hackathon Submission. 
-1.3.9 - Fixed threshold settings using stale data. 
-1.3.5 - Removal thresholds are units from -1 to -5 downvotes. 
-1.3.3 - Fixed malformed JSON handling. 
-1.3.1 - Adds conservative reported upvote-ratio tracking. Devvit 0.13.0. 
-1.1.1 - Default tracking now 4 hours. Tracking changed to 2, 4, 6 hours. Improved downvote tracking. 
-1.0.5 - Initial Public Release. Devvit 0.12.24. 
+
+2.0.1 - Reddit API Router replaces the use of AI workaround. Devvit 0.13.10
+1.5.1 - Moving to registered Oauth data fetch as required by May 28 2026 Reddit announcement.
+1.4.1 - Official Public Launch and Hackathon Submission.
+1.3.9 - Fixed threshold settings using stale data.
+1.3.5 - Removal thresholds are units from -1 to -5 downvotes.
+1.3.3 - Fixed malformed JSON handling.
+1.3.1 - Adds conservative reported upvote-ratio tracking. Devvit 0.13.0.
+1.1.1 - Default tracking now 4 hours. Tracking changed to 2, 4, 6 hours. Improved downvote tracking.
+1.0.5 - Initial Public Release. Devvit 0.12.24.
