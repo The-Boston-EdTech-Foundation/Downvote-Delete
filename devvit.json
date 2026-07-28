@@ -101,6 +101,18 @@
       }
     }
   },
+  "menu": {
+    "items": [
+      {
+        "label": "Run Reddit domain probe",
+        "description": "Temporary diagnostic probe for Reddit API access.",
+        "forUserType": "moderator",
+        "location": "subreddit",
+        "endpoint": "/internal/menu/reddit-domain-probe",
+        "postFilter": "none"
+      }
+    ]
+  },
   "scripts": {
     "build": "vite build",
     "dev": "vite build --watch"
@@ -116,7 +128,17 @@
     "redis": true,
     "http": {
       "enable": true,
-      "domains": ["oauth.reddit.com"]
+      "domains": [
+        "www.reddit.com",
+        "old.reddit.com",
+        "new.reddit.com",
+        "sh.reddit.com",
+        "np.reddit.com",
+        "i.reddit.com",
+        "amp.reddit.com",
+        "oauth.reddit.com",
+        "ssl.reddit.com"
+      ]
     }
   },
   "dev": {

@@ -14,6 +14,12 @@ import {
 } from '../src/core/decision';
 import { formatLogContext } from '../src/core/logging';
 import {
+  buildRedditProbeTargets,
+  parseProbeVoteFields,
+  previewProbeText,
+  sanitizeProbeText,
+} from '../src/core/redditDomainProbe';
+import {
   fetchAuthenticatedRedditVoteSnapshot,
   readRedditOAuthConfigFromSettings,
   resetRedditOAuthTokenCacheForTests,
@@ -271,6 +277,75 @@ describe('backoff schedule', () => {
   test('uses a 5 minute delay for advanced tracking checks', () => {
     expect(getNextCheckDelayMinutes(0, 'advanced')).toBe(5);
     expect(getNextCheckDelayMinutes(20, 'advanced')).toBe(5);
+  });
+});
+
+describe('temporary Reddit domain probe helpers', () => {
+  test('redacts token-like values and caps previews at 300 characters', () => {
+    const raw = `${'x'.repeat(350)} access_token":"abc123" Bearer live-token Basic basic-token`;
+    const preview = previewProbeText(raw);
+
+    expect(preview.length).toBeLessThanOrEqual(300);
+    expect(sanitizeProbeText(raw)).not.toContain('abc123');
+    expect(sanitizeProbeText(raw)).not.toContain('live-token');
+    expect(sanitizeProbeText(raw)).not.toContain('basic-token');
+  });
+
+  test('recursively finds vote fields in Reddit listing shapes', () => {
+    expect(
+      parseProbeVoteFields(
+        JSON.stringify({
+          kind: 'Listing',
+          data: {
+            children: [
+              {
+                kind: 't3',
+                data: {
+                  name: 't3_1tqgga7',
+                  upvote_ratio: 0.42,
+                  score: 0,
+                },
+              },
+            ],
+          },
+        })
+      )
+    ).toEqual({
+      parsedUpvoteRatio: 0.42,
+      parsedScore: 0,
+      parsedName: 't3_1tqgga7',
+    });
+  });
+
+  test('builds hardcoded probe targets without user-controlled URLs', () => {
+    const targets = buildRedditProbeTargets({
+      config: {
+        clientId: 'client-id',
+        clientSecret: 'client-secret',
+        refreshToken: 'refresh-token',
+        userAgent: 'agent',
+      },
+      accessToken: 'access-token',
+    });
+
+    expect(targets.some((target) => target.url.includes('1tqgga7'))).toBe(true);
+    expect(targets.some((target) => target.auth === 'basic')).toBe(true);
+    expect(targets.some((target) => target.auth === 'bearer')).toBe(true);
+    expect(
+      new Set(targets.map((target) => new URL(target.url).hostname))
+    ).toEqual(
+      new Set([
+        'www.reddit.com',
+        'old.reddit.com',
+        'new.reddit.com',
+        'sh.reddit.com',
+        'np.reddit.com',
+        'i.reddit.com',
+        'amp.reddit.com',
+        'ssl.reddit.com',
+        'oauth.reddit.com',
+      ])
+    );
   });
 });
 

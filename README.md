@@ -30,6 +30,7 @@ Downvote Delete will not:
 - Continue watching posts that were already moderated or deleted.
 
 ## Patch Notes
+1.6.1 - Reddit API Router replaces the use of AI workaround. Devvit 0.13.10
 1.5.1 - Moving to registered Oauth data fetch as required by May 28 2026 Reddit announcement. 
 1.4.1 - Official Public Launch and Hackathon Submission. 
 1.3.9 - Fixed threshold settings using stale data. 
