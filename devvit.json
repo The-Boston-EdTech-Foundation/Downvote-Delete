@@ -107,7 +107,7 @@
     "redis": true,
     "http": {
       "enable": true,
-      "domains": []
+      "domains": ["p06u4e5dsf.execute-api.us-east-1.amazonaws.com"]
     }
   },
   "dev": {
