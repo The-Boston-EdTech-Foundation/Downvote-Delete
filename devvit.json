@@ -20,7 +20,7 @@
       "PRAW_ROUTER_URL": {
         "type": "string",
         "label": "PRAW router endpoint URL",
-        "helpText": "Full HTTPS URL ending in /v1/post-ratio."
+        "helpText": "Use https://api.bostonedtech.org/v1/post-ratio."
       },
       "PRAW_ROUTER_HMAC_SECRET": {
         "type": "string",
@@ -107,7 +107,7 @@
     "redis": true,
     "http": {
       "enable": true,
-      "domains": ["p06u4e5dsf.execute-api.us-east-1.amazonaws.com"]
+      "domains": ["api.bostonedtech.org"]
     }
   },
   "dev": {
