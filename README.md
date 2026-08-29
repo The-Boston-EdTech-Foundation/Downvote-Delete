@@ -39,3 +39,7 @@ Downvote Delete will not:
 - 1.3.1 - Adds conservative reported upvote-ratio tracking. Devvit 0.13.0.
 - 1.1.1 - Default tracking now 4 hours. Tracking changed to 2, 4, 6 hours. Improved downvote tracking.
 - 1.0.5 - Initial Public Release. Devvit 0.12.24.
+
+## Fetch Domains
+
+- downvote-delete-upvote-ratio.firebaseapp.com - Used to access the Reddit API for upvote_ratio data, not yet exposed with Devvit.
