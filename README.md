@@ -28,7 +28,7 @@ Downvote Delete will not:
 
 ## Patch Notes
 
-- 2.1.1 - Republished with authorized Official API Workaround. Devvit 0.14.1
+- 2.1.2 - Republished with authorized Official API Workaround. Devvit 0.14.1
 - 2.0.3 - Updated to Official API Resource
 - 2.0.1 - Reddit API Router replaces the use of AI workaround. Devvit 0.13.10
 - 1.5.1 - Moving to registered Oauth data fetch as required by May 28 2026 Reddit announcement.
