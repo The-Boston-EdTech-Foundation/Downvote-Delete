@@ -6,21 +6,15 @@ Community members downvote instead of reporting, so use that signal!
 
 ## What It Does
 
-Downvote Delete can:
+Downvote Delete will:
 
 - Watch new posts for 2, 4, or 6 hours.
 - Detect when a post reaches configured negative scores (-1 through -5).
-- Use an AWS-hosted PRAW router for conservative advanced ratio tracking when configured.
 - Stops watching posts that grow positively (+3, +5 or +10).
 - Ignore manually approved posts.
 - Stop tracking posts that are already removed, filtered, spammed, deleted, or unavailable.
 
 Downvote Delete watches posts only. It does not track comments or scan older posts. Use Crowd Control to automatically filter downvoted comments.
-
-Advanced ratio tracking calls the HMAC-authenticated PRAW router when
-configured. If the router is unavailable, rejects a request, or omits the
-ratio, the app falls back to conservative score-only tracking and does not use
-a historical ratio for the current decision.
 
 ## What the app does NOT do:
 
