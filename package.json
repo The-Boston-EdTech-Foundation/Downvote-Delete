@@ -25,15 +25,15 @@
     "node": ">=22.13.0"
   },
   "dependencies": {
-    "@devvit/start": "0.14.1",
-    "@devvit/web": "0.14.1",
+    "@devvit/start": "0.14.2",
+    "@devvit/web": "0.14.2",
     "@hono/node-server": "^2.0.12",
     "hono": "^4.12.32"
   },
   "devDependencies": {
     "@eslint/js": "9.39.5",
     "@types/node": "^22.19.7",
-    "devvit": "0.14.1",
+    "devvit": "0.14.2",
     "eslint": "9.39.5",
     "globals": "17.2.0",
     "prettier": "3.8.1",
