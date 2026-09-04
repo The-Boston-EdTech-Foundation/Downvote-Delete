@@ -21,6 +21,7 @@ import {
 import {
   initializationClaimKey,
   isCurrentCheckDelivery,
+  scheduleActionRecovery,
   scheduleInitialPostCheck,
   schedulePostCheck,
 } from '../src/core/scheduling';
@@ -349,6 +350,269 @@ describe('tracked-post scheduling', () => {
     });
   });
 
+  test('keeps a normal check when Redis committed before throwing', async () => {
+    let storedRecord: string | undefined;
+    const cancelled: string[] = [];
+    const scheduled = await schedulePostCheck({
+      record: trackedPost(),
+      checkCount: 1,
+      runAt: new Date(now + 60_000),
+      dependencies: {
+        createRunToken: () => 'committed-token',
+        now: () => now + 1,
+        schedulerClient: {
+          async runJob(): Promise<string> {
+            return 'committed-job';
+          },
+          async cancelJob(jobId: string): Promise<void> {
+            cancelled.push(jobId);
+          },
+        } as never,
+        redisClient: {
+          async set(_key: string, value: string): Promise<string> {
+            storedRecord = value;
+            throw new Error('reply timed out');
+          },
+          async get(): Promise<string | undefined> {
+            return storedRecord;
+          },
+        } as never,
+      },
+    });
+
+    expect(scheduled).toMatchObject({
+      lastJobId: 'committed-job',
+      scheduledRunToken: 'committed-token',
+    });
+    expect(cancelled).toEqual([]);
+  });
+
+  test('keeps an initial check when its transaction committed before throwing', async () => {
+    const values = new Map<string, string>();
+    const cancelled: string[] = [];
+    let tokenNumber = 0;
+    type InitialTransaction = {
+      multi(): Promise<void>;
+      set(key: string, value: string): Promise<InitialTransaction>;
+      hIncrBy(): Promise<InitialTransaction>;
+      exec(): Promise<unknown[]>;
+    };
+    const transaction: InitialTransaction = {
+      async multi(): Promise<void> {},
+      async set(key: string, value: string): Promise<typeof transaction> {
+        values.set(key, value);
+        return transaction;
+      },
+      async hIncrBy(): Promise<typeof transaction> {
+        return transaction;
+      },
+      async exec(): Promise<unknown[]> {
+        throw new Error('transaction reply timed out');
+      },
+    };
+    const result = await scheduleInitialPostCheck({
+      record: trackedPost(),
+      runAt: new Date(now + 60_000),
+      dependencies: {
+        createRunToken: () => `initial-token-${++tokenNumber}`,
+        now: () => now,
+        schedulerClient: {
+          async runJob(): Promise<string> {
+            return 'initial-job';
+          },
+          async cancelJob(jobId: string): Promise<void> {
+            cancelled.push(jobId);
+          },
+        } as never,
+        redisClient: {
+          async set(
+            key: string,
+            value: string,
+            options?: { nx?: boolean }
+          ): Promise<string | undefined> {
+            if (options?.nx && values.has(key)) {
+              return undefined;
+            }
+            values.set(key, value);
+            return 'OK';
+          },
+          async get(key: string): Promise<string | undefined> {
+            return values.get(key);
+          },
+          async del(key: string): Promise<void> {
+            values.delete(key);
+          },
+          async mGet(keys: string[]): Promise<(string | null)[]> {
+            return keys.map((key) => values.get(key) ?? null);
+          },
+          async watch(): Promise<typeof transaction> {
+            return transaction;
+          },
+        } as never,
+      },
+    });
+
+    expect(result.status).toBe('scheduled');
+    expect(cancelled).toEqual([]);
+  });
+
+  test('keeps an action recovery when Redis committed before throwing', async () => {
+    let storedRecord: string | undefined;
+    const cancelled: string[] = [];
+    const scheduled = await scheduleActionRecovery({
+      record: trackedPost({
+        status: 'actioning',
+        actionAttemptId: 'attempt-1',
+      }),
+      runAt: new Date(now + 60_000),
+      actionAttemptId: 'attempt-1',
+      dependencies: {
+        createRunToken: () => 'recovery-token',
+        schedulerClient: {
+          async runJob(): Promise<string> {
+            return 'recovery-job';
+          },
+          async cancelJob(jobId: string): Promise<void> {
+            cancelled.push(jobId);
+          },
+        } as never,
+        redisClient: {
+          async set(_key: string, value: string): Promise<string> {
+            storedRecord = value;
+            throw new Error('reply timed out');
+          },
+          async get(): Promise<string | undefined> {
+            return storedRecord;
+          },
+        } as never,
+      },
+    });
+
+    expect(scheduled).toMatchObject({
+      actionAttemptId: 'attempt-1',
+      actionRecoveryJobId: 'recovery-job',
+      actionRecoveryRunToken: 'recovery-token',
+    });
+    expect(cancelled).toEqual([]);
+  });
+
+  test('cancels a recovery job when the stored action attempt differs', async () => {
+    const cancelled: string[] = [];
+    await expect(
+      scheduleActionRecovery({
+        record: trackedPost({
+          status: 'actioning',
+          actionAttemptId: 'attempt-new',
+        }),
+        runAt: new Date(now + 60_000),
+        actionAttemptId: 'attempt-new',
+        dependencies: {
+          createRunToken: () => 'recovery-token',
+          schedulerClient: {
+            async runJob(): Promise<string> {
+              return 'recovery-job';
+            },
+            async cancelJob(jobId: string): Promise<void> {
+              cancelled.push(jobId);
+            },
+          } as never,
+          redisClient: {
+            async set(): Promise<string> {
+              throw new Error('redis unavailable');
+            },
+            async get(): Promise<string> {
+              return serializeTrackedPost(
+                trackedPost({
+                  status: 'actioning',
+                  actionAttemptId: 'attempt-old',
+                  actionRecoveryJobId: 'recovery-job',
+                  actionRecoveryRunToken: 'recovery-token',
+                })
+              );
+            },
+          } as never,
+        },
+      })
+    ).rejects.toThrow('redis unavailable');
+    expect(cancelled).toEqual(['recovery-job']);
+  });
+
+  test.each([
+    ['malformed record', async (): Promise<string> => '{not-json'],
+    [
+      'read-back failure',
+      async (): Promise<string> => {
+        throw new Error('read unavailable');
+      },
+    ],
+  ])(
+    'preserves a job when commit verification has a %s',
+    async (_name, get) => {
+      const cancelled: string[] = [];
+      await expect(
+        schedulePostCheck({
+          record: trackedPost(),
+          checkCount: 1,
+          runAt: new Date(now + 60_000),
+          dependencies: {
+            createRunToken: () => 'unknown-token',
+            schedulerClient: {
+              async runJob(): Promise<string> {
+                return 'unknown-job';
+              },
+              async cancelJob(jobId: string): Promise<void> {
+                cancelled.push(jobId);
+              },
+            } as never,
+            redisClient: {
+              async set(): Promise<string> {
+                throw new Error('redis unavailable');
+              },
+              get,
+            } as never,
+          },
+        })
+      ).rejects.toThrow('redis unavailable');
+      expect(cancelled).toEqual([]);
+    }
+  );
+
+  test('cancels a job when a valid read-back contains a different token', async () => {
+    const cancelled: string[] = [];
+    await expect(
+      schedulePostCheck({
+        record: trackedPost(),
+        checkCount: 1,
+        runAt: new Date(now + 60_000),
+        dependencies: {
+          createRunToken: () => 'new-token',
+          schedulerClient: {
+            async runJob(): Promise<string> {
+              return 'new-job';
+            },
+            async cancelJob(jobId: string): Promise<void> {
+              cancelled.push(jobId);
+            },
+          } as never,
+          redisClient: {
+            async set(): Promise<string> {
+              throw new Error('redis unavailable');
+            },
+            async get(): Promise<string> {
+              return serializeTrackedPost(
+                trackedPost({
+                  lastJobId: 'newer-job',
+                  scheduledRunToken: 'newer-token',
+                })
+              );
+            },
+          } as never,
+        },
+      })
+    ).rejects.toThrow('redis unavailable');
+    expect(cancelled).toEqual(['new-job']);
+  });
+
   test('cancels a job when its Redis record cannot be committed', async () => {
     const cancelled: string[] = [];
     await expect(
@@ -369,6 +633,9 @@ describe('tracked-post scheduling', () => {
           redisClient: {
             async set(): Promise<string> {
               throw new Error('redis unavailable');
+            },
+            async get(): Promise<undefined> {
+              return undefined;
             },
           } as never,
         },
@@ -446,6 +713,9 @@ describe('tracked-post scheduling', () => {
           redisClient: {
             async set(): Promise<string> {
               throw new Error('redis unavailable');
+            },
+            async get(): Promise<undefined> {
+              return undefined;
             },
           } as never,
         },

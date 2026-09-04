@@ -3,6 +3,7 @@ import { redis, scheduler } from '@devvit/web/server';
 import { logError, logWarn } from './logging';
 import {
   auditKey,
+  parseTrackedPostResult,
   serializeTrackedPost,
   statsKey,
   type TrackedPost,
@@ -11,6 +12,11 @@ import {
 
 export const CHECK_WATCHED_POST_TASK = 'checkWatchedPost';
 const INITIALIZATION_CLAIM_TTL_MS = 2 * 60 * 1000;
+
+type SchedulingKind = 'check' | 'action_recovery';
+type SchedulingCommitVerification = 'committed' | 'not_committed' | 'unknown';
+
+class InitialTrackingTransactionAbortedError extends Error {}
 
 export type CheckWatchedPostData = {
   postId?: string;
@@ -68,8 +74,95 @@ async function persistInitialTracking(
   await transaction.hIncrBy(statsKey(record.subredditId), 'started', 1);
   const replies = await transaction.exec();
   if (replies.length === 0) {
-    throw new Error('Initial tracking transaction was not committed.');
+    throw new InitialTrackingTransactionAbortedError(
+      'Initial tracking transaction was not committed.'
+    );
   }
+}
+
+async function verifySchedulingCommit(args: {
+  expectedRecord: TrackedPost;
+  kind: SchedulingKind;
+  redisClient: typeof redis;
+}): Promise<SchedulingCommitVerification> {
+  let rawRecord: string | undefined;
+  try {
+    rawRecord = await args.redisClient.get(
+      watchKey(args.expectedRecord.postId)
+    );
+  } catch {
+    return 'unknown';
+  }
+
+  if (rawRecord === undefined) {
+    return 'not_committed';
+  }
+
+  const parsed = parseTrackedPostResult(rawRecord);
+  if (!parsed.ok) {
+    return 'unknown';
+  }
+
+  if (args.kind === 'action_recovery') {
+    return parsed.record.actionRecoveryJobId ===
+      args.expectedRecord.actionRecoveryJobId &&
+      parsed.record.actionRecoveryRunToken ===
+        args.expectedRecord.actionRecoveryRunToken &&
+      parsed.record.actionAttemptId === args.expectedRecord.actionAttemptId
+      ? 'committed'
+      : 'not_committed';
+  }
+
+  return parsed.record.lastJobId === args.expectedRecord.lastJobId &&
+    parsed.record.scheduledRunToken === args.expectedRecord.scheduledRunToken
+    ? 'committed'
+    : 'not_committed';
+}
+
+async function resolveSchedulingPersistenceError(args: {
+  error: unknown;
+  expectedRecord: TrackedPost;
+  jobId: string;
+  runToken: string;
+  kind: SchedulingKind;
+  redisClient: typeof redis;
+  schedulerClient: typeof scheduler;
+}): Promise<boolean> {
+  if (args.error instanceof InitialTrackingTransactionAbortedError) {
+    await cancelOrphanedJob(
+      args.jobId,
+      args.expectedRecord.postId,
+      args.schedulerClient
+    );
+    return false;
+  }
+
+  const verification = await verifySchedulingCommit({
+    expectedRecord: args.expectedRecord,
+    kind: args.kind,
+    redisClient: args.redisClient,
+  });
+  logWarn('Verified scheduling state after a Redis persistence error.', {
+    postId: args.expectedRecord.postId,
+    jobId: args.jobId,
+    runToken: args.runToken,
+    schedulingKind: args.kind,
+    verification,
+    persistenceError:
+      args.error instanceof Error ? args.error.message : String(args.error),
+  });
+
+  if (verification === 'committed') {
+    return true;
+  }
+  if (verification === 'not_committed') {
+    await cancelOrphanedJob(
+      args.jobId,
+      args.expectedRecord.postId,
+      args.schedulerClient
+    );
+  }
+  return false;
 }
 
 export async function schedulePostCheck(args: {
@@ -110,7 +203,18 @@ export async function schedulePostCheck(args: {
       );
     }
   } catch (err: unknown) {
-    await cancelOrphanedJob(jobId, updatedRecord.postId, schedulerClient);
+    const committed = await resolveSchedulingPersistenceError({
+      error: err,
+      expectedRecord: updatedRecord,
+      jobId,
+      runToken,
+      kind: 'check',
+      redisClient,
+      schedulerClient,
+    });
+    if (committed) {
+      return updatedRecord;
+    }
     throw err;
   }
 
@@ -192,6 +296,7 @@ export async function scheduleActionRecovery(args: {
   });
   const updatedRecord: TrackedPost = {
     ...args.record,
+    actionAttemptId: args.actionAttemptId,
     actionRecoveryJobId: jobId,
     actionRecoveryRunToken: runToken,
     updatedAt: now(),
@@ -203,7 +308,18 @@ export async function scheduleActionRecovery(args: {
       serializeTrackedPost(updatedRecord)
     );
   } catch (err: unknown) {
-    await cancelOrphanedJob(jobId, updatedRecord.postId, schedulerClient);
+    const committed = await resolveSchedulingPersistenceError({
+      error: err,
+      expectedRecord: updatedRecord,
+      jobId,
+      runToken,
+      kind: 'action_recovery',
+      redisClient,
+      schedulerClient,
+    });
+    if (committed) {
+      return updatedRecord;
+    }
     throw err;
   }
 
