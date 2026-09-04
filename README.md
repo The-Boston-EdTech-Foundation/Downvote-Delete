@@ -43,3 +43,6 @@ Downvote Delete will not:
 ## Fetch Domains
 
 - downvote-delete-upvote-ratio.firebaseapp.com - Used to access the Reddit API for upvote_ratio data, not yet exposed with Devvit.
+
+The Firebase ratio-router endpoint is fixed by the app. Installations configure
+only the matching HMAC secret; custom router URLs are not accepted.

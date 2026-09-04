@@ -33,10 +33,13 @@ export type TrackedPost = {
   checkCount: number;
   trackingMode?: TrackingMode;
   advancedTrackingStartedAt?: number;
-  // Retained names keep existing Redis records compatible after the PRAW cutover.
+  // Retained field names and legacy source keep existing Redis records compatible.
   lastAuthenticatedRatioCheckAt?: number;
   lastAuthenticatedRatioReceived?: boolean;
-  lastAuthenticatedRatioSource?: 'authenticated_reddit_api' | 'praw_router';
+  lastAuthenticatedRatioSource?:
+    | 'authenticated_reddit_api'
+    | 'praw_router'
+    | 'firebase_router';
   lastAuthenticatedRatioError?: string;
   lastAuthenticatedRatioHttpStatus?: number;
   lastAuthenticatedRatioRawName?: string;

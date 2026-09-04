@@ -101,7 +101,6 @@ export function summarizeSubredditSettingsShapes(
     moderatorPostHandling: summarizeSettingsValueShape(
       values.moderatorPostHandling
     ),
-    PRAW_ROUTER_URL: summarizeSettingsValueShape(values.PRAW_ROUTER_URL),
     PRAW_ROUTER_HMAC_SECRET: summarizeSettingsValueShape(
       values.PRAW_ROUTER_HMAC_SECRET
     ),

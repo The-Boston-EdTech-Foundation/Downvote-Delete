@@ -14,12 +14,13 @@ import {
 } from '../src/core/decision';
 import { formatLogContext } from '../src/core/logging';
 import {
-  fetchPrawRouterVoteSnapshot,
-  readPrawRouterConfigFromSettings,
-  signPrawRouterRequest,
-  type PrawRouterConfig,
-  type PrawRouterFetch,
-} from '../src/core/prawRatioRouter';
+  fetchFirebaseRouterVoteSnapshot,
+  FIREBASE_RATIO_ROUTER_URL,
+  readFirebaseRouterConfigFromSettings,
+  signFirebaseRouterRequest,
+  type FirebaseRouterConfig,
+  type FirebaseRouterFetch,
+} from '../src/core/firebaseRatioRouter';
 import {
   advancedTrackingMaxRatio,
   buildRatioLookup,
@@ -36,10 +37,13 @@ import {
   MODERATOR_ACTION_ALL,
   MODERATOR_IGNORE,
   normalizeSettings,
+  summarizeSubredditSettingsShapes,
   type DownvoteDeleteSettings,
 } from '../src/core/settings';
 import {
+  parseTrackedPost,
   refreshTrackedPostActionSettings,
+  serializeTrackedPost,
   type TrackedPost,
 } from '../src/core/tracking';
 
@@ -278,9 +282,8 @@ describe('backoff schedule', () => {
   });
 });
 
-describe('PRAW ratio router client', () => {
-  const config: PrawRouterConfig = {
-    url: 'https://api-id.execute-api.us-east-1.amazonaws.com/prod/v1/post-ratio',
+describe('Firebase ratio router client', () => {
+  const config: FirebaseRouterConfig = {
     hmacSecret: 'router-secret',
   };
 
@@ -315,13 +318,13 @@ describe('PRAW ratio router client', () => {
   ): {
     calls: Array<{
       url: string;
-      init: Parameters<PrawRouterFetch>[1];
+      init: Parameters<FirebaseRouterFetch>[1];
     }>;
-    fetchImpl: PrawRouterFetch;
+    fetchImpl: FirebaseRouterFetch;
   } {
     const calls: Array<{
       url: string;
-      init: Parameters<PrawRouterFetch>[1];
+      init: Parameters<FirebaseRouterFetch>[1];
     }> = [];
 
     return {
@@ -340,25 +343,28 @@ describe('PRAW ratio router client', () => {
     };
   }
 
-  test('reads only a valid HTTPS router configuration', () => {
+  test('uses the fixed Firebase endpoint and ignores stale URL settings', () => {
     expect(
-      readPrawRouterConfigFromSettings({
-        PRAW_ROUTER_URL: config.url,
+      readFirebaseRouterConfigFromSettings({
+        PRAW_ROUTER_URL:
+          'https://api-id.execute-api.us-east-1.amazonaws.com/prod/v1/post-ratio',
         PRAW_ROUTER_HMAC_SECRET: config.hmacSecret,
       })
-    ).toEqual(config);
-    expect(readPrawRouterConfigFromSettings({})).toBeNull();
+    ).toEqual({ hmacSecret: config.hmacSecret });
+  });
+
+  test('requires a non-blank HMAC secret', () => {
+    expect(readFirebaseRouterConfigFromSettings({})).toBeNull();
     expect(
-      readPrawRouterConfigFromSettings({
-        PRAW_ROUTER_URL: 'http://router.example.com/v1/post-ratio',
-        PRAW_ROUTER_HMAC_SECRET: config.hmacSecret,
+      readFirebaseRouterConfigFromSettings({
+        PRAW_ROUTER_HMAC_SECRET: '   ',
       })
     ).toBeNull();
   });
 
   test('generates the expected deterministic HMAC signature', () => {
     expect(
-      signPrawRouterRequest({
+      signFirebaseRouterRequest({
         timestamp: 1_700_000_000,
         body: '{"postId":"t3_post"}',
         hmacSecret: config.hmacSecret,
@@ -368,7 +374,7 @@ describe('PRAW ratio router client', () => {
 
   test('posts a signed request and parses the ratio snapshot', async () => {
     const router = mockRouterFetch();
-    const result = await fetchPrawRouterVoteSnapshot('t3_post', {
+    const result = await fetchFirebaseRouterVoteSnapshot('t3_post', {
       config,
       fetchImpl: router.fetchImpl,
       now,
@@ -377,7 +383,7 @@ describe('PRAW ratio router client', () => {
     expect(result).toMatchObject({
       ok: true,
       postId: 't3_post',
-      source: 'praw_router',
+      source: 'firebase_router',
       endpoint: 'post_ratio',
       upvoteRatio: 0.33,
       ratioPercent: '33.0%',
@@ -386,7 +392,7 @@ describe('PRAW ratio router client', () => {
       rawId: 'post',
     });
     expect(router.calls).toHaveLength(1);
-    expect(router.calls[0]?.url).toBe(config.url);
+    expect(router.calls[0]?.url).toBe(FIREBASE_RATIO_ROUTER_URL);
     expect(router.calls[0]?.init).toMatchObject({
       method: 'POST',
       body: '{"postId":"t3_post"}',
@@ -400,21 +406,21 @@ describe('PRAW ratio router client', () => {
   });
 
   test('returns structured failure when router configuration is missing', async () => {
-    const result = await fetchPrawRouterVoteSnapshot('t3_post', {
-      config: readPrawRouterConfigFromSettings({}),
+    const result = await fetchFirebaseRouterVoteSnapshot('t3_post', {
+      config: readFirebaseRouterConfigFromSettings({}),
       fetchImpl: mockRouterFetch().fetchImpl,
     });
 
     expect(result).toMatchObject({
       ok: false,
-      source: 'praw_router',
+      source: 'firebase_router',
       upvoteRatio: null,
-      error: 'Missing or invalid PRAW router configuration.',
+      error: 'Firebase ratio router HMAC secret is missing.',
     });
   });
 
   test('accepts a matching post with no reported ratio', async () => {
-    const result = await fetchPrawRouterVoteSnapshot('t3_post', {
+    const result = await fetchFirebaseRouterVoteSnapshot('t3_post', {
       config,
       fetchImpl: mockRouterFetch({
         body: successBody({ upvoteRatio: null }),
@@ -429,7 +435,7 @@ describe('PRAW ratio router client', () => {
   });
 
   test('rejects mismatched posts and invalid ratios', async () => {
-    const mismatch = await fetchPrawRouterVoteSnapshot('t3_post', {
+    const mismatch = await fetchFirebaseRouterVoteSnapshot('t3_post', {
       config,
       fetchImpl: mockRouterFetch({
         body: successBody({
@@ -439,7 +445,7 @@ describe('PRAW ratio router client', () => {
         }),
       }).fetchImpl,
     });
-    const invalidRatio = await fetchPrawRouterVoteSnapshot('t3_post', {
+    const invalidRatio = await fetchFirebaseRouterVoteSnapshot('t3_post', {
       config,
       fetchImpl: mockRouterFetch({
         body: successBody({ upvoteRatio: 1.1 }),
@@ -448,18 +454,18 @@ describe('PRAW ratio router client', () => {
 
     expect(mismatch).toMatchObject({
       ok: false,
-      error: 'PRAW router returned a different post.',
+      error: 'Firebase ratio router returned a different post.',
       rawName: 't3_other',
       rawId: 'other',
     });
     expect(invalidRatio).toMatchObject({
       ok: false,
-      error: 'PRAW router returned an invalid success response.',
+      error: 'Firebase ratio router returned an invalid success response.',
     });
   });
 
   test('returns non-2xx and malformed responses as score-only failures', async () => {
-    const limited = await fetchPrawRouterVoteSnapshot('t3_post', {
+    const limited = await fetchFirebaseRouterVoteSnapshot('t3_post', {
       config,
       fetchImpl: mockRouterFetch({
         ok: false,
@@ -467,7 +473,7 @@ describe('PRAW ratio router client', () => {
         body: '{"apiVersion":"1","ok":false}',
       }).fetchImpl,
     });
-    const malformed = await fetchPrawRouterVoteSnapshot('t3_post', {
+    const malformed = await fetchFirebaseRouterVoteSnapshot('t3_post', {
       config,
       fetchImpl: mockRouterFetch({ body: '{"broken"' }).fetchImpl,
     });
@@ -476,7 +482,7 @@ describe('PRAW ratio router client', () => {
       ok: false,
       httpStatus: 429,
       upvoteRatio: null,
-      error: expect.stringContaining('PRAW router HTTP 429'),
+      error: expect.stringContaining('Firebase ratio router HTTP 429'),
     });
     expect(malformed).toMatchObject({
       ok: false,
@@ -485,7 +491,7 @@ describe('PRAW ratio router client', () => {
   });
 
   test('aborts router calls that exceed the configured timeout', async () => {
-    const fetchImpl: PrawRouterFetch = async (_url, init) =>
+    const fetchImpl: FirebaseRouterFetch = async (_url, init) =>
       new Promise((_resolve, reject) => {
         init.signal.addEventListener('abort', () => {
           const error = new Error('aborted');
@@ -494,7 +500,7 @@ describe('PRAW ratio router client', () => {
         });
       });
 
-    const result = await fetchPrawRouterVoteSnapshot('t3_post', {
+    const result = await fetchFirebaseRouterVoteSnapshot('t3_post', {
       config,
       fetchImpl,
       timeoutMs: 1,
@@ -502,7 +508,7 @@ describe('PRAW ratio router client', () => {
 
     expect(result).toMatchObject({
       ok: false,
-      error: 'PRAW router request timed out.',
+      error: 'Firebase ratio router request timed out.',
     });
   });
 });
@@ -813,6 +819,24 @@ describe('vote ratio confidence model', () => {
 });
 
 describe('tracked post decisions', () => {
+  test('keeps legacy router sources readable and persists new Firebase sources', () => {
+    const legacyRecord = parseTrackedPost(
+      serializeTrackedPost(
+        trackedPost({ lastAuthenticatedRatioSource: 'praw_router' })
+      )
+    );
+    const firebaseRecord = parseTrackedPost(
+      serializeTrackedPost(
+        trackedPost({ lastAuthenticatedRatioSource: 'firebase_router' })
+      )
+    );
+
+    expect(legacyRecord?.lastAuthenticatedRatioSource).toBe('praw_router');
+    expect(firebaseRecord?.lastAuthenticatedRatioSource).toBe(
+      'firebase_router'
+    );
+  });
+
   test('calculates vote score from upvotes and downvotes', () => {
     expect(calculateVoteScore({ upvotes: 1, downvotes: 2 })).toBe(-1);
   });
@@ -1378,5 +1402,17 @@ describe('logging helpers', () => {
         isActive: true,
       })
     ).toBe(' postId=t3_post score=-3 isActive=true');
+  });
+
+  test('summarizes Firebase configuration without URL or secret values', () => {
+    const summary = summarizeSubredditSettingsShapes({
+      PRAW_ROUTER_URL:
+        'https://api-id.execute-api.us-east-1.amazonaws.com/prod/v1/post-ratio',
+      PRAW_ROUTER_HMAC_SECRET: 'do-not-log-this-secret',
+    });
+
+    expect(summary).not.toHaveProperty('PRAW_ROUTER_URL');
+    expect(summary.PRAW_ROUTER_HMAC_SECRET).toBe('string');
+    expect(JSON.stringify(summary)).not.toContain('do-not-log-this-secret');
   });
 });

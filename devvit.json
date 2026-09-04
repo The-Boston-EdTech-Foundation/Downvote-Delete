@@ -17,15 +17,10 @@
   },
   "settings": {
     "global": {
-      "PRAW_ROUTER_URL": {
-        "type": "string",
-        "label": "PRAW router endpoint URL",
-        "helpText": "Use https://downvote-delete-upvote-ratio.firebaseapp.com/v1/post-ratio."
-      },
       "PRAW_ROUTER_HMAC_SECRET": {
         "type": "string",
-        "label": "PRAW router HMAC secret",
-        "helpText": "Must match router_hmac_secret in Firebase Secret Manager.",
+        "label": "Firebase ratio router HMAC secret",
+        "helpText": "Must match router_hmac_secret in Firebase Secret Manager. The Firebase endpoint is configured by the app.",
         "isSecret": true
       }
     },

@@ -1,14 +1,19 @@
 import { createHmac } from 'node:crypto';
 
-export type PrawRouterConfig = {
-  url: string;
+export const FIREBASE_RATIO_ROUTER_URL =
+  'https://downvote-delete-upvote-ratio.firebaseapp.com/v1/post-ratio';
+export const FIREBASE_RATIO_ROUTER_HOST = new URL(
+  FIREBASE_RATIO_ROUTER_URL
+).hostname;
+
+export type FirebaseRouterConfig = {
   hmacSecret: string;
 };
 
-export type PrawRouterVoteSnapshot = {
+export type FirebaseRouterVoteSnapshot = {
   ok: boolean;
   postId: string;
-  source: 'praw_router';
+  source: 'firebase_router';
   endpoint: 'post_ratio';
   score: number | null;
   upvoteRatio: number | null;
@@ -22,7 +27,7 @@ export type PrawRouterVoteSnapshot = {
   httpStatus?: number;
 };
 
-export type PrawRouterFetch = (
+export type FirebaseRouterFetch = (
   url: string,
   init: {
     method: 'POST';
@@ -37,7 +42,7 @@ export type PrawRouterFetch = (
   text(): Promise<string>;
 }>;
 
-type PrawRouterSuccessResponse = {
+type FirebaseRouterSuccessResponse = {
   apiVersion: '1';
   ok: true;
   postId: string;
@@ -50,10 +55,10 @@ type PrawRouterSuccessResponse = {
 const DEFAULT_TIMEOUT_MS = 10_000;
 const ERROR_PREVIEW_LENGTH = 500;
 
-function baseSnapshot(postId: string): Omit<PrawRouterVoteSnapshot, 'ok'> {
+function baseSnapshot(postId: string): Omit<FirebaseRouterVoteSnapshot, 'ok'> {
   return {
     postId,
-    source: 'praw_router',
+    source: 'firebase_router',
     endpoint: 'post_ratio',
     score: null,
     upvoteRatio: null,
@@ -70,8 +75,8 @@ function failureSnapshot(args: {
   postId: string;
   error: string;
   httpStatus?: number;
-}): PrawRouterVoteSnapshot {
-  const snapshot: PrawRouterVoteSnapshot = {
+}): FirebaseRouterVoteSnapshot {
+  const snapshot: FirebaseRouterVoteSnapshot = {
     ...baseSnapshot(args.postId),
     ok: false,
     error: previewText(args.error),
@@ -110,22 +115,7 @@ function readNullableNumber(value: unknown): number | null | undefined {
     : undefined;
 }
 
-function isValidRouterUrl(value: string): boolean {
-  try {
-    const parsed = new URL(value);
-    return (
-      parsed.protocol === 'https:' &&
-      Boolean(parsed.hostname) &&
-      !parsed.username &&
-      !parsed.password &&
-      !parsed.hash
-    );
-  } catch {
-    return false;
-  }
-}
-
-function readSuccessResponse(raw: unknown): PrawRouterSuccessResponse | null {
+function readSuccessResponse(raw: unknown): FirebaseRouterSuccessResponse | null {
   if (
     !isObject(raw) ||
     raw.apiVersion !== '1' ||
@@ -158,20 +148,19 @@ function readSuccessResponse(raw: unknown): PrawRouterSuccessResponse | null {
   };
 }
 
-export function readPrawRouterConfigFromSettings(
+export function readFirebaseRouterConfigFromSettings(
   settingsValues: Record<string, unknown>
-): PrawRouterConfig | null {
-  const url = readString(settingsValues.PRAW_ROUTER_URL);
+): FirebaseRouterConfig | null {
   const hmacSecret = readString(settingsValues.PRAW_ROUTER_HMAC_SECRET);
 
-  if (!url || !hmacSecret || !isValidRouterUrl(url)) {
+  if (!hmacSecret) {
     return null;
   }
 
-  return { url, hmacSecret };
+  return { hmacSecret };
 }
 
-export function signPrawRouterRequest(args: {
+export function signFirebaseRouterRequest(args: {
   timestamp: number;
   body: string;
   hmacSecret: string;
@@ -181,30 +170,30 @@ export function signPrawRouterRequest(args: {
     .digest('hex');
 }
 
-export async function fetchPrawRouterVoteSnapshot(
+export async function fetchFirebaseRouterVoteSnapshot(
   postId: string,
   options: {
-    config?: PrawRouterConfig | null;
-    fetchImpl?: PrawRouterFetch;
+    config?: FirebaseRouterConfig | null;
+    fetchImpl?: FirebaseRouterFetch;
     now?: number;
     timeoutMs?: number;
   } = {}
-): Promise<PrawRouterVoteSnapshot> {
+): Promise<FirebaseRouterVoteSnapshot> {
   const config =
     options.config === undefined
-      ? readPrawRouterConfigFromSettings({})
+      ? readFirebaseRouterConfigFromSettings({})
       : options.config;
   if (!config) {
     return failureSnapshot({
       postId,
-      error: 'Missing or invalid PRAW router configuration.',
+      error: 'Firebase ratio router HMAC secret is missing.',
     });
   }
 
   const fetchImpl = options.fetchImpl ?? fetch;
   const timestamp = Math.floor((options.now ?? Date.now()) / 1_000);
   const body = JSON.stringify({ postId });
-  const signature = signPrawRouterRequest({
+  const signature = signFirebaseRouterRequest({
     timestamp,
     body,
     hmacSecret: config.hmacSecret,
@@ -216,7 +205,7 @@ export async function fetchPrawRouterVoteSnapshot(
   );
 
   try {
-    const response = await fetchImpl(config.url, {
+    const response = await fetchImpl(FIREBASE_RATIO_ROUTER_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -233,7 +222,7 @@ export async function fetchPrawRouterVoteSnapshot(
         postId,
         httpStatus: response.status,
         error:
-          `PRAW router HTTP ${response.status} ${response.statusText ?? ''} ${previewText(text)}`.trim(),
+          `Firebase ratio router HTTP ${response.status} ${response.statusText ?? ''} ${previewText(text)}`.trim(),
       });
     }
 
@@ -241,7 +230,7 @@ export async function fetchPrawRouterVoteSnapshot(
     if (!parsed) {
       return failureSnapshot({
         postId,
-        error: 'PRAW router returned an invalid success response.',
+        error: 'Firebase ratio router returned an invalid success response.',
       });
     }
 
@@ -253,7 +242,7 @@ export async function fetchPrawRouterVoteSnapshot(
       return {
         ...failureSnapshot({
           postId,
-          error: 'PRAW router returned a different post.',
+          error: 'Firebase ratio router returned a different post.',
         }),
         rawName: parsed.rawName,
         rawId: parsed.rawId,
@@ -275,7 +264,7 @@ export async function fetchPrawRouterVoteSnapshot(
   } catch (err: unknown) {
     const message =
       err instanceof Error && err.name === 'AbortError'
-        ? 'PRAW router request timed out.'
+        ? 'Firebase ratio router request timed out.'
         : err instanceof Error
           ? err.message
           : String(err);

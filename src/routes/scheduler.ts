@@ -27,11 +27,12 @@ import {
 } from '../core/decision';
 import { logError, logInfo, logWarn } from '../core/logging';
 import {
-  fetchPrawRouterVoteSnapshot,
-  readPrawRouterConfigFromSettings,
-  type PrawRouterConfig,
-  type PrawRouterVoteSnapshot,
-} from '../core/prawRatioRouter';
+  fetchFirebaseRouterVoteSnapshot,
+  FIREBASE_RATIO_ROUTER_HOST,
+  readFirebaseRouterConfigFromSettings,
+  type FirebaseRouterConfig,
+  type FirebaseRouterVoteSnapshot,
+} from '../core/firebaseRatioRouter';
 import { postToSnapshot } from '../core/postStatus';
 import {
   normalizeSettings,
@@ -285,22 +286,23 @@ function clearFreshRatioDecision(
   record.possibleStates = [];
 }
 
-async function fetchAndLogRawRatio(args: {
+async function fetchAndLogFirebaseRatio(args: {
   postId: string;
-  config: PrawRouterConfig | null;
-}): Promise<PrawRouterVoteSnapshot> {
-  logInfo('Fetching Reddit ratio from PRAW router.', {
+  config: FirebaseRouterConfig | null;
+}): Promise<FirebaseRouterVoteSnapshot> {
+  logInfo('Fetching Reddit ratio from Firebase router.', {
     postId: args.postId,
-    source: 'praw_router',
+    source: 'firebase_router',
+    routerHost: FIREBASE_RATIO_ROUTER_HOST,
     endpoint: 'post_ratio',
   });
 
-  const result = await fetchPrawRouterVoteSnapshot(args.postId, {
+  const result = await fetchFirebaseRouterVoteSnapshot(args.postId, {
     config: args.config,
   });
 
   if (result.ok) {
-    logInfo('PRAW router ratio fetched.', {
+    logInfo('Firebase router ratio fetched.', {
       postId: args.postId,
       ok: true,
       source: result.source,
@@ -314,7 +316,7 @@ async function fetchAndLogRawRatio(args: {
       rawDowns: result.downs,
     });
   } else {
-    logWarn('PRAW router ratio fetch failed.', {
+    logWarn('Firebase router ratio fetch failed.', {
       postId: args.postId,
       ok: false,
       source: result.source,
@@ -325,7 +327,7 @@ async function fetchAndLogRawRatio(args: {
   }
 
   if (result.ok && result.upvoteRatio === null) {
-    logInfo('PRAW router ratio unavailable.', {
+    logInfo('Firebase router ratio unavailable.', {
       postId: args.postId,
       ok: true,
       source: result.source,
@@ -337,9 +339,9 @@ async function fetchAndLogRawRatio(args: {
   return result;
 }
 
-function applyPrawRouterRatioResult(
+function applyFirebaseRouterRatioResult(
   record: TrackedPost,
-  result: PrawRouterVoteSnapshot,
+  result: FirebaseRouterVoteSnapshot,
   now: number,
   moderatorThreshold: number,
   latestScore: number
@@ -966,7 +968,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     });
     const settingsValues = await devvitSettings.getAll<SettingsValues>();
     const currentSettings = normalizeSettings(settingsValues);
-    const prawRouterConfig = readPrawRouterConfigFromSettings(
+    const firebaseRouterConfig = readFirebaseRouterConfigFromSettings(
       settingsValues as Record<string, unknown>
     );
     logInfo('Loaded app installation settings for scheduled check.', {
@@ -977,15 +979,18 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
       actionToTake: currentSettings.actionToTake,
       moderatorPostHandling: currentSettings.moderatorPostHandling,
-      prawRouterConfigured: prawRouterConfig !== null,
+      firebaseRouterConfigured: firebaseRouterConfig !== null,
+      firebaseRouterHost: FIREBASE_RATIO_ROUTER_HOST,
       rawSettingShapes: summarizeSubredditSettingsShapes(settingsValues),
     });
-    if (!prawRouterConfig) {
+    if (!firebaseRouterConfig) {
       logWarn(
-        'PRAW router ratio disabled because its URL or secret is missing.',
+        'Firebase ratio router disabled because its HMAC secret is missing.',
         {
           postId,
-          source: 'praw_router',
+          source: 'firebase_router',
+          routerHost: FIREBASE_RATIO_ROUTER_HOST,
+          reason: 'missing_hmac_secret',
           fallback: 'reddit_score_only',
         }
       );
@@ -1119,11 +1124,11 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     );
 
     if (advancedTracking) {
-      const ratioResult = await fetchAndLogRawRatio({
+      const ratioResult = await fetchAndLogFirebaseRatio({
         postId,
-        config: prawRouterConfig,
+        config: firebaseRouterConfig,
       });
-      recordForNextCheck = applyPrawRouterRatioResult(
+      recordForNextCheck = applyFirebaseRouterRatioResult(
         recordForNextCheck,
         ratioResult,
         now,
