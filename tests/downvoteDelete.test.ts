@@ -1,9 +1,10 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import {
   applyModerationAction,
   buildRemovedForDownvotesModmailBody,
   REMOVAL_MODMAIL_SUBJECT,
 } from '../src/core/actions';
+import { resolveActionRecovery } from '../src/core/actionLifecycle';
 import { getNextCheckDelayMinutes } from '../src/core/backoff';
 import {
   calculateVoteScore,
@@ -13,6 +14,16 @@ import {
   type PostSnapshot,
 } from '../src/core/decision';
 import { formatLogContext } from '../src/core/logging';
+import {
+  finalizationClaimKey,
+  finalizeTrackedPost,
+} from '../src/core/finalization';
+import {
+  initializationClaimKey,
+  isCurrentCheckDelivery,
+  scheduleInitialPostCheck,
+  schedulePostCheck,
+} from '../src/core/scheduling';
 import {
   fetchFirebaseRouterVoteSnapshot,
   FIREBASE_RATIO_ROUTER_URL,
@@ -25,7 +36,6 @@ import {
   advancedTrackingMaxRatio,
   buildRatioLookup,
   evaluateRatioState,
-  severeDownvoteRatioThreshold,
   shouldRemoveByRatio,
   updateTrackedPostVoteState,
   type TrackedPostVoteState,
@@ -42,6 +52,7 @@ import {
 } from '../src/core/settings';
 import {
   parseTrackedPost,
+  parseTrackedPostResult,
   refreshTrackedPostActionSettings,
   serializeTrackedPost,
   type TrackedPost,
@@ -65,6 +76,7 @@ function mockPost(
     filterCalls: string[];
     removalNotes: unknown[];
     removeCalls: boolean[];
+    failRemovalNote: boolean;
   }> = {}
 ): ApplyModerationActionArgs['post'] & {
   filterCalls: string[];
@@ -74,6 +86,7 @@ function mockPost(
   const filterCalls = overrides.filterCalls ?? [];
   const removalNotes = overrides.removalNotes ?? [];
   const removeCalls = overrides.removeCalls ?? [];
+  const failRemovalNote = overrides.failRemovalNote ?? false;
   const post = {
     filterCalls,
     removalNotes,
@@ -86,6 +99,9 @@ function mockPost(
     },
     async addRemovalNote(note: unknown): Promise<void> {
       removalNotes.push(note);
+      if (failRemovalNote) {
+        throw new Error('removal note unavailable');
+      }
     },
   };
 
@@ -99,6 +115,7 @@ function mockPost(
 function mockRedditClient(
   args: {
     failModmail?: boolean;
+    reportErrors?: string[];
   } = {}
 ): ApplyModerationActionArgs['redditClient'] & {
   reports: unknown[];
@@ -109,8 +126,14 @@ function mockRedditClient(
   const client = {
     reports,
     modmailConversations,
-    async report(post: unknown, reportArgs: unknown): Promise<void> {
+    async report(
+      post: unknown,
+      reportArgs: unknown
+    ): Promise<{
+      json: { errors: string[] };
+    }> {
       reports.push({ post, reportArgs });
+      return { json: { errors: args.reportErrors ?? [] } };
     },
     modMail: {
       createConversation: async (conversation: unknown): Promise<void> => {
@@ -279,6 +302,435 @@ describe('backoff schedule', () => {
   test('uses a 5 minute delay for advanced tracking checks', () => {
     expect(getNextCheckDelayMinutes(0, 'advanced')).toBe(5);
     expect(getNextCheckDelayMinutes(20, 'advanced')).toBe(5);
+  });
+});
+
+describe('tracked-post scheduling', () => {
+  test('commits a run token with the scheduled job', async () => {
+    const jobs: unknown[] = [];
+    const writes: unknown[] = [];
+    const scheduled = await schedulePostCheck({
+      record: trackedPost(),
+      checkCount: 1,
+      runAt: new Date(now + 60_000),
+      dependencies: {
+        createRunToken: () => 'run-token',
+        now: () => now + 1,
+        schedulerClient: {
+          async runJob(job: unknown): Promise<string> {
+            jobs.push(job);
+            return 'job-id';
+          },
+          async cancelJob(): Promise<void> {},
+        } as never,
+        redisClient: {
+          async set(...args: unknown[]): Promise<string> {
+            writes.push(args);
+            return 'OK';
+          },
+        } as never,
+      },
+    });
+
+    expect(jobs).toEqual([
+      expect.objectContaining({
+        data: {
+          postId: 't3_post',
+          kind: 'check',
+          runToken: 'run-token',
+        },
+      }),
+    ]);
+    expect(writes).toHaveLength(1);
+    expect(scheduled).toMatchObject({
+      checkCount: 1,
+      lastJobId: 'job-id',
+      scheduledRunToken: 'run-token',
+    });
+  });
+
+  test('cancels a job when its Redis record cannot be committed', async () => {
+    const cancelled: string[] = [];
+    await expect(
+      schedulePostCheck({
+        record: trackedPost(),
+        checkCount: 1,
+        runAt: new Date(now + 60_000),
+        dependencies: {
+          createRunToken: () => 'orphan-token',
+          schedulerClient: {
+            async runJob(): Promise<string> {
+              return 'orphan-job';
+            },
+            async cancelJob(jobId: string): Promise<void> {
+              cancelled.push(jobId);
+            },
+          } as never,
+          redisClient: {
+            async set(): Promise<string> {
+              throw new Error('redis unavailable');
+            },
+          } as never,
+        },
+      })
+    ).rejects.toThrow('redis unavailable');
+    expect(cancelled).toEqual(['orphan-job']);
+  });
+
+  test('cancels an initial job when the Redis transaction is aborted', async () => {
+    const cancelled: string[] = [];
+    type TestTransaction = {
+      multi(): Promise<void>;
+      set(): Promise<TestTransaction>;
+      hIncrBy(): Promise<TestTransaction>;
+      exec(): Promise<unknown[]>;
+    };
+    const transaction: TestTransaction = {
+      async multi(): Promise<void> {},
+      async set(): Promise<typeof transaction> {
+        return transaction;
+      },
+      async hIncrBy(): Promise<typeof transaction> {
+        return transaction;
+      },
+      async exec(): Promise<unknown[]> {
+        return [];
+      },
+    };
+
+    await expect(
+      schedulePostCheck({
+        record: trackedPost(),
+        checkCount: 0,
+        runAt: new Date(now + 60_000),
+        incrementStarted: true,
+        dependencies: {
+          createRunToken: () => 'initial-token',
+          schedulerClient: {
+            async runJob(): Promise<string> {
+              return 'initial-job';
+            },
+            async cancelJob(jobId: string): Promise<void> {
+              cancelled.push(jobId);
+            },
+          } as never,
+          redisClient: {
+            async watch(): Promise<typeof transaction> {
+              return transaction;
+            },
+          } as never,
+        },
+      })
+    ).rejects.toThrow('Initial tracking transaction was not committed.');
+    expect(cancelled).toEqual(['initial-job']);
+  });
+
+  test('does not mask a Redis failure when orphan cancellation also fails', async () => {
+    const errorSpy = vi
+      .spyOn(globalThis.console, 'error')
+      .mockImplementation(() => {});
+    await expect(
+      schedulePostCheck({
+        record: trackedPost(),
+        checkCount: 1,
+        runAt: new Date(now + 60_000),
+        dependencies: {
+          schedulerClient: {
+            async runJob(): Promise<string> {
+              return 'uncancelled-job';
+            },
+            async cancelJob(): Promise<void> {
+              throw new Error('scheduler unavailable');
+            },
+          } as never,
+          redisClient: {
+            async set(): Promise<string> {
+              throw new Error('redis unavailable');
+            },
+          } as never,
+        },
+      })
+    ).rejects.toThrow('redis unavailable');
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  test('accepts legacy jobs only for legacy records and rejects stale tokens', () => {
+    expect(isCurrentCheckDelivery(trackedPost(), { postId: 't3_post' })).toBe(
+      true
+    );
+    expect(
+      isCurrentCheckDelivery(
+        trackedPost({ scheduledRunToken: 'current-token' }),
+        { postId: 't3_post' }
+      )
+    ).toBe(false);
+    expect(
+      isCurrentCheckDelivery(
+        trackedPost({ scheduledRunToken: 'current-token' }),
+        { postId: 't3_post', runToken: 'stale-token' }
+      )
+    ).toBe(false);
+    expect(
+      isCurrentCheckDelivery(
+        trackedPost({ scheduledRunToken: 'current-token' }),
+        { postId: 't3_post', runToken: 'current-token' }
+      )
+    ).toBe(true);
+  });
+
+  test('serializes duplicate initial scheduling and increments started once', async () => {
+    const values = new Map<string, string>();
+    const jobs: unknown[] = [];
+    let startedIncrements = 0;
+    type InitialTransaction = {
+      multi(): Promise<void>;
+      set(key: string, value: string): Promise<InitialTransaction>;
+      hIncrBy(): Promise<InitialTransaction>;
+      exec(): Promise<unknown[]>;
+    };
+    const transaction: InitialTransaction = {
+      async multi(): Promise<void> {},
+      async set(key: string, value: string): Promise<typeof transaction> {
+        values.set(key, value);
+        return transaction;
+      },
+      async hIncrBy(): Promise<typeof transaction> {
+        startedIncrements += 1;
+        return transaction;
+      },
+      async exec(): Promise<unknown[]> {
+        return ['OK', startedIncrements];
+      },
+    };
+    const redisClient = {
+      async set(
+        key: string,
+        value: string,
+        options?: { nx?: boolean }
+      ): Promise<string | undefined> {
+        if (options?.nx && values.has(key)) {
+          return undefined;
+        }
+        values.set(key, value);
+        return 'OK';
+      },
+      async get(key: string): Promise<string | undefined> {
+        return values.get(key);
+      },
+      async del(key: string): Promise<void> {
+        values.delete(key);
+      },
+      async mGet(keys: string[]): Promise<(string | null)[]> {
+        return keys.map((key) => values.get(key) ?? null);
+      },
+      async watch(): Promise<typeof transaction> {
+        return transaction;
+      },
+    };
+    const dependencies = {
+      createRunToken: (() => {
+        let token = 0;
+        return () => `token-${++token}`;
+      })(),
+      now: () => now,
+      redisClient: redisClient as never,
+      schedulerClient: {
+        async runJob(job: unknown): Promise<string> {
+          jobs.push(job);
+          return `job-${jobs.length}`;
+        },
+        async cancelJob(): Promise<void> {},
+      } as never,
+    };
+
+    const results = await Promise.all([
+      scheduleInitialPostCheck({
+        record: trackedPost(),
+        runAt: new Date(now + 60_000),
+        dependencies,
+      }),
+      scheduleInitialPostCheck({
+        record: trackedPost(),
+        runAt: new Date(now + 60_000),
+        dependencies,
+      }),
+    ]);
+
+    expect(results.map((result) => result.status).sort()).toEqual([
+      'already_tracking',
+      'scheduled',
+    ]);
+    expect(jobs).toHaveLength(1);
+    expect(startedIncrements).toBe(1);
+    expect(values.has(initializationClaimKey('t3_post'))).toBe(false);
+  });
+});
+
+describe('idempotent terminal finalization', () => {
+  function finalizationRedis(options: { throwAfterCommit?: boolean } = {}) {
+    const values = new Map<string, string>();
+    const increments: string[] = [];
+    let execCount = 0;
+    type FinalizationTransaction = {
+      multi(): Promise<void>;
+      set(key: string, value: string): Promise<FinalizationTransaction>;
+      hIncrBy(key: string, field: string): Promise<FinalizationTransaction>;
+      del(...keys: string[]): Promise<FinalizationTransaction>;
+      exec(): Promise<unknown[]>;
+    };
+    const transaction: FinalizationTransaction = {
+      async multi(): Promise<void> {},
+      async set(key: string, value: string): Promise<typeof transaction> {
+        values.set(key, value);
+        return transaction;
+      },
+      async hIncrBy(_key: string, field: string): Promise<typeof transaction> {
+        increments.push(field);
+        return transaction;
+      },
+      async del(...keys: string[]): Promise<typeof transaction> {
+        for (const key of keys) values.delete(key);
+        return transaction;
+      },
+      async exec(): Promise<unknown[]> {
+        execCount += 1;
+        if (options.throwAfterCommit) {
+          throw new Error('connection closed after commit');
+        }
+        return ['OK', 1, 1, 1];
+      },
+    };
+    const redisClient = {
+      async set(
+        key: string,
+        value: string,
+        setOptions?: { nx?: boolean }
+      ): Promise<string | undefined> {
+        if (setOptions?.nx && values.has(key)) return undefined;
+        values.set(key, value);
+        return 'OK';
+      },
+      async get(key: string): Promise<string | undefined> {
+        return values.get(key);
+      },
+      async del(key: string): Promise<void> {
+        values.delete(key);
+      },
+      async watch(): Promise<typeof transaction> {
+        return transaction;
+      },
+    };
+    return { values, increments, redisClient, getExecCount: () => execCount };
+  }
+
+  test('writes audit and counters only once across duplicate finalizers', async () => {
+    const state = finalizationRedis();
+    const args: Parameters<typeof finalizeTrackedPost>[0] = {
+      record: trackedPost({
+        status: 'actioning',
+        actionAttemptId: 'attempt-1',
+        attemptedAction: 'filter',
+      }),
+      status: 'actioned' as const,
+      successfulAction: ACTION_FILTER,
+      dependencies: {
+        redisClient: state.redisClient as never,
+        createClaimToken: () => 'claim-token',
+        now: () => now,
+      },
+    };
+
+    expect(await finalizeTrackedPost(args)).toEqual({ status: 'committed' });
+    expect(await finalizeTrackedPost(args)).toEqual({
+      status: 'already_finalized',
+    });
+    expect(state.getExecCount()).toBe(1);
+    expect(state.increments).toEqual(['actioned', 'action_filter']);
+    expect(state.values.has(finalizationClaimKey('t3_post'))).toBe(false);
+  });
+
+  test('recognizes a commit when the transaction response throws', async () => {
+    const state = finalizationRedis({ throwAfterCommit: true });
+    const result = await finalizeTrackedPost({
+      record: trackedPost({ status: 'actioning' }),
+      status: 'action_unknown',
+      dependencies: {
+        redisClient: state.redisClient as never,
+        createClaimToken: () => 'claim-token',
+        now: () => now,
+      },
+    });
+
+    expect(result).toEqual({ status: 'already_finalized' });
+    expect(state.getExecCount()).toBe(1);
+    expect(state.increments).toEqual(['action_unknown']);
+  });
+
+  test('defers without writing when another finalizer owns the claim', async () => {
+    const state = finalizationRedis();
+    state.values.set(finalizationClaimKey('t3_post'), 'other-owner');
+
+    expect(
+      await finalizeTrackedPost({
+        record: trackedPost({ status: 'actioning' }),
+        status: 'action_unknown',
+        dependencies: {
+          redisClient: state.redisClient as never,
+          createClaimToken: () => 'claim-token',
+          now: () => now,
+        },
+      })
+    ).toEqual({ status: 'retry_required', reason: 'claim_busy' });
+    expect(state.getExecCount()).toBe(0);
+    expect(state.increments).toEqual([]);
+  });
+});
+
+describe('at-most-once action recovery', () => {
+  test('preserves known successful and failed outcomes', () => {
+    expect(
+      resolveActionRecovery(
+        trackedPost({ actionOutcome: 'succeeded', attemptedAction: 'report' })
+      )
+    ).toEqual({
+      status: 'actioned',
+      outcome: 'succeeded',
+      confirmedApplied: true,
+    });
+    expect(
+      resolveActionRecovery(
+        trackedPost({ actionOutcome: 'failed', attemptedAction: 'filter' })
+      )
+    ).toEqual({
+      status: 'action_failed',
+      outcome: 'failed',
+      confirmedApplied: false,
+    });
+  });
+
+  test('confirms remove and filter from a refetched post without another action', () => {
+    expect(
+      resolveActionRecovery(trackedPost({ attemptedAction: 'remove' }), {
+        removed: true,
+      })
+    ).toMatchObject({ status: 'actioned', confirmedApplied: true });
+    expect(
+      resolveActionRecovery(trackedPost({ attemptedAction: 'filter' }), {
+        filtered: true,
+      })
+    ).toMatchObject({ status: 'actioned', confirmedApplied: true });
+  });
+
+  test('leaves unconfirmed and report attempts unknown for moderator review', () => {
+    expect(
+      resolveActionRecovery(trackedPost({ attemptedAction: 'remove' }), {})
+    ).toMatchObject({ status: 'action_unknown', confirmedApplied: false });
+    expect(
+      resolveActionRecovery(trackedPost({ attemptedAction: 'report' }), {
+        removed: true,
+      })
+    ).toMatchObject({ status: 'action_unknown', confirmedApplied: false });
   });
 });
 
@@ -517,7 +969,6 @@ describe('vote ratio confidence model', () => {
   const lookup = buildRatioLookup(30);
 
   test('exports named ratio thresholds', () => {
-    expect(severeDownvoteRatioThreshold).toBe(0.24);
     expect(advancedTrackingMaxRatio).toBe(0.4);
   });
 
@@ -550,7 +1001,7 @@ describe('vote ratio confidence model', () => {
     });
   });
 
-  test('ratio <= 0.24 always removes', () => {
+  test('ratio <= 0.24 still respects the configured threshold', () => {
     expect(
       shouldRemoveByRatio({
         ratio: 0.24,
@@ -559,9 +1010,26 @@ describe('vote ratio confidence model', () => {
         lookup,
       })
     ).toMatchObject({
-      remove: true,
-      reason: 'severe_downvote_ratio',
+      remove: false,
+      reason: 'continue_tracking',
     });
+
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0,
+        moderatorThreshold: -1,
+        minimumTotalVotes: 0,
+        lookup,
+      })
+    ).toMatchObject({ remove: true });
+    expect(
+      shouldRemoveByRatio({
+        ratio: 0,
+        moderatorThreshold: -5,
+        minimumTotalVotes: 0,
+        lookup,
+      })
+    ).toMatchObject({ remove: false });
   });
 
   test('ratio > 0.40 never removes from ratio alone', () => {
@@ -835,6 +1303,41 @@ describe('tracked post decisions', () => {
     expect(firebaseRecord?.lastAuthenticatedRatioSource).toBe(
       'firebase_router'
     );
+  });
+
+  test('validates tracked Redis records while allowing unknown future fields', () => {
+    const value = JSON.stringify({ ...trackedPost(), futureField: 'allowed' });
+    const result = parseTrackedPostResult(value);
+
+    expect(result.ok).toBe(true);
+    expect(parseTrackedPost(value)).toMatchObject({ postId: 't3_post' });
+  });
+
+  test.each([
+    [undefined, 'record_missing'],
+    ['{broken', 'invalid_json'],
+    ['null', 'record_not_object'],
+    ['[]', 'record_not_object'],
+    ['{}', 'invalid_subredditId'],
+    [JSON.stringify({ ...trackedPost(), status: 'mystery' }), 'invalid_status'],
+    [
+      JSON.stringify({ ...trackedPost(), actionToTake: 'ban' }),
+      'invalid_actionToTake',
+    ],
+    [
+      JSON.stringify({ ...trackedPost(), checkCount: -1 }),
+      'invalid_checkCount',
+    ],
+    [
+      JSON.stringify({ ...trackedPost(), trackingExpiresAt: null }),
+      'invalid_trackingExpiresAt',
+    ],
+  ])('rejects invalid tracked record %s', (value, expectedError) => {
+    expect(parseTrackedPostResult(value)).toEqual({
+      ok: false,
+      error: expectedError,
+    });
+    expect(parseTrackedPost(value)).toBeNull();
   });
 
   test('calculates vote score from upvotes and downvotes', () => {
@@ -1231,6 +1734,8 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
       },
     ]);
     expect(result.modmailSentAt).toEqual(expect.any(Number));
+    expect(result.actionStatus).toBe('succeeded');
+    expect(result.removalNoteStatus).toBe('added');
     expect(result.modmailStatus).toBe('sent');
     expect(result.modmailErrorMessage).toBeUndefined();
   });
@@ -1300,8 +1805,37 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     expect(filteredPost.filterCalls).toEqual([
       'Filtered for -3 Downvote Karma|false',
     ]);
-    expect(reportResult).toEqual({ modmailStatus: 'not_applicable' });
-    expect(filterResult).toEqual({ modmailStatus: 'not_applicable' });
+    expect(reportResult).toEqual({
+      actionStatus: 'succeeded',
+      removalNoteStatus: 'not_applicable',
+      modmailStatus: 'not_applicable',
+    });
+    expect(filterResult).toEqual({
+      actionStatus: 'succeeded',
+      removalNoteStatus: 'not_applicable',
+      modmailStatus: 'not_applicable',
+    });
+  });
+
+  test('treats structured report errors as a definite action failure', async () => {
+    const redditClient = mockRedditClient({
+      reportErrors: ['RATELIMIT: try again later'],
+    });
+
+    const result = await applyModerationAction({
+      redditClient,
+      post: mockPost(),
+      action: ACTION_REPORT,
+      threshold: -3,
+    });
+
+    expect(redditClient.reports).toHaveLength(1);
+    expect(result).toEqual({
+      actionStatus: 'failed',
+      actionErrorMessage: 'RATELIMIT: try again later',
+      removalNoteStatus: 'not_applicable',
+      modmailStatus: 'not_applicable',
+    });
   });
 
   test('missing username skips modmail without failing removal', async () => {
@@ -1320,6 +1854,8 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     expect(post.removeCalls).toEqual([false]);
     expect(redditClient.modmailConversations).toEqual([]);
     expect(result).toEqual({
+      actionStatus: 'succeeded',
+      removalNoteStatus: 'added',
       modmailStatus: 'skipped',
       modmailSkippedReason: 'missing_author_name',
     });
@@ -1341,6 +1877,8 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     expect(post.removeCalls).toEqual([false]);
     expect(redditClient.modmailConversations).toEqual([]);
     expect(result).toEqual({
+      actionStatus: 'succeeded',
+      removalNoteStatus: 'added',
       modmailStatus: 'skipped',
       modmailSkippedReason: 'missing_subreddit_name',
     });
@@ -1362,6 +1900,8 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     expect(post.removeCalls).toEqual([false]);
     expect(redditClient.modmailConversations).toEqual([]);
     expect(result).toEqual({
+      actionStatus: 'succeeded',
+      removalNoteStatus: 'added',
       modmailStatus: 'skipped',
       modmailSkippedReason: 'missing_post_link',
     });
@@ -1389,6 +1929,28 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     expect(result.modmailStatus).toBe('failed');
     expect(result.modmailErrorMessage).toBe('modmail unavailable');
     expect(result.modmailError).toBeInstanceOf(Error);
+    expect(result.actionStatus).toBe('succeeded');
+  });
+
+  test('removal-note failure does not fail or repeat the remove action', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost({ failRemovalNote: true });
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.removeCalls).toEqual([false]);
+    expect(post.removalNotes).toHaveLength(1);
+    expect(result.actionStatus).toBe('succeeded');
+    expect(result.removalNoteStatus).toBe('failed');
+    expect(result.removalNoteErrorMessage).toBe('removal note unavailable');
   });
 });
 

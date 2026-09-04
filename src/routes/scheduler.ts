@@ -1,15 +1,11 @@
 import { Hono } from 'hono';
+import { randomUUID } from 'node:crypto';
 import type {
   SettingsValues,
   TaskRequest,
   TaskResponse,
 } from '@devvit/web/server';
-import {
-  reddit,
-  redis,
-  scheduler,
-  settings as devvitSettings,
-} from '@devvit/web/server';
+import { reddit, redis, settings as devvitSettings } from '@devvit/web/server';
 import type { T3 } from '@devvit/shared-types/tid.js';
 import {
   applyModerationAction,
@@ -18,6 +14,7 @@ import {
   type ModerationActionArgs,
   type ModerationActionResult,
 } from '../core/actions';
+import { resolveActionRecovery } from '../core/actionLifecycle';
 import { getNextCheckDelayMinutes, getNextCheckRunAt } from '../core/backoff';
 import {
   decideTrackedPostCheck,
@@ -35,16 +32,26 @@ import {
 } from '../core/firebaseRatioRouter';
 import { postToSnapshot } from '../core/postStatus';
 import {
+  actionLockKey,
+  finalizeTrackedPost,
+  type FinalizationResult,
+} from '../core/finalization';
+import {
+  cancelScheduledJobSafely,
+  type CheckWatchedPostData,
+  isCurrentCheckDelivery,
+  scheduleActionRecovery,
+  schedulePostCheck,
+} from '../core/scheduling';
+import {
   normalizeSettings,
   summarizeSubredditSettingsShapes,
 } from '../core/settings';
 import {
   auditKey,
-  createAuditRecord,
-  parseTrackedPost,
+  parseTrackedPostResult,
   refreshTrackedPostActionSettings,
   serializeTrackedPost,
-  statsKey,
   type TrackedPost,
   type TrackingStatus,
   watchKey,
@@ -55,11 +62,6 @@ import {
   shouldRemoveByRatio,
   type RatioDecision,
 } from '../core/voteRatioModel';
-import { CHECK_WATCHED_POST_TASK } from './triggers';
-
-type CheckWatchedPostData = {
-  postId?: string;
-};
 
 type FetchedPostSnapshot = {
   post: Awaited<ReturnType<typeof reddit.getPostById>>;
@@ -68,8 +70,10 @@ type FetchedPostSnapshot = {
 
 export const scheduledJobs = new Hono();
 
-const actionLockKey = (postId: string): string =>
-  `downvote-delete:action-lock:${postId}`;
+const checkExecutionLockKey = (postId: string, runToken: string): string =>
+  `downvote-delete:check-lock:${postId}:${runToken}`;
+
+class FinalizationRetryError extends Error {}
 
 function buildFallbackPostLink(postId: string, subredditName: string): string {
   return `https://reddit.com/r/${subredditName}/comments/${postId.replace(/^t3_/, '')}`;
@@ -96,21 +100,37 @@ async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
   logInfo('Pulling tracking record from Redis.', { postId, redisKey });
 
   const rawRecord = await redis.get(redisKey);
-  const parsedRecord = parseTrackedPost(rawRecord);
 
   if (!rawRecord) {
     logInfo('No tracking record found in Redis.', { postId, redisKey });
     return null;
   }
 
-  if (!parsedRecord) {
+  const parsed = parseTrackedPostResult(rawRecord);
+  if (!parsed.ok) {
     logError('Tracking record in Redis is malformed.', {
       postId,
       redisKey,
       rawLength: rawRecord.length,
+      validationError: parsed.error,
     });
+    try {
+      await redis.del(redisKey);
+      logWarn('Deleted malformed tracking record.', {
+        postId,
+        redisKey,
+        validationError: parsed.error,
+      });
+    } catch (err: unknown) {
+      logError(
+        'Failed to delete malformed tracking record.',
+        { postId, redisKey },
+        err
+      );
+    }
     return null;
   }
+  const parsedRecord = parsed.record;
 
   logInfo('Loaded tracking record from Redis.', {
     postId,
@@ -137,33 +157,6 @@ async function loadTrackedPost(postId: string): Promise<TrackedPost | null> {
   return parsedRecord;
 }
 
-async function writeTrackedPost(record: TrackedPost): Promise<void> {
-  const redisKey = watchKey(record.postId);
-  logInfo('Writing tracking record to Redis.', {
-    postId: record.postId,
-    redisKey,
-    status: record.status,
-    checkCount: record.checkCount,
-    trackingMode: record.trackingMode,
-    lastKnownScore: record.lastKnownScore,
-    lastRawUpvoteRatio: record.lastRawUpvoteRatio,
-    lastRawRatioPercent: record.lastRawRatioPercent,
-    minimumTotalVotes: record.minimumTotalVotes,
-    guaranteedSpread: record.guaranteedSpread,
-    lastRatioDecision: record.lastRatioDecision,
-    lastRatioDecisionReason: record.lastRatioDecisionReason,
-    lastAuthenticatedRatioError: record.lastAuthenticatedRatioError,
-    lastAuthenticatedRatioSource: record.lastAuthenticatedRatioSource,
-    negativeDecisionScore: record.negativeDecisionScore,
-    negativeDecisionSource: record.negativeDecisionSource,
-    negativeScoreThreshold: record.negativeScoreThreshold,
-    positiveScoreStopThreshold: record.positiveScoreStopThreshold,
-    actionToTake: record.actionToTake,
-    lastJobId: record.lastJobId,
-  });
-  await redis.set(redisKey, serializeTrackedPost(record));
-}
-
 async function releaseActionLock(
   postId: string,
   reason: string
@@ -180,8 +173,9 @@ async function stopTracking(
   record: TrackedPost,
   status: Exclude<TrackingStatus, 'active' | 'actioning'>,
   now: number,
-  stopReason?: string
-): Promise<void> {
+  stopReason?: string,
+  successfulAction?: TrackedPost['actionToTake']
+): Promise<FinalizationResult> {
   const stoppedRecord: TrackedPost = {
     ...record,
     status,
@@ -214,19 +208,35 @@ async function stopTracking(
     redisKey: watchKey(record.postId),
   });
 
-  await redis.set(
-    auditKey(record.postId),
-    JSON.stringify(createAuditRecord(stoppedRecord, now))
-  );
-  await redis.hIncrBy(statsKey(record.subredditId), status, 1);
-  await redis.del(watchKey(record.postId));
+  const finalizationArgs: Parameters<typeof finalizeTrackedPost>[0] = {
+    record: stoppedRecord,
+    status,
+  };
+  if (stopReason) {
+    finalizationArgs.stopReason = stopReason;
+  }
+  if (successfulAction) {
+    finalizationArgs.successfulAction = successfulAction;
+  }
+  const result = await finalizeTrackedPost(finalizationArgs);
+
+  if (result.status === 'retry_required') {
+    logWarn('Terminal tracking finalization requires a retry.', {
+      postId: record.postId,
+      status,
+      reason: result.reason,
+    });
+    return result;
+  }
 
   logInfo('Tracking stopped and Redis watch key deleted.', {
     postId: record.postId,
     status,
     auditKey: auditKey(record.postId),
     deletedRedisKey: watchKey(record.postId),
+    finalizationResult: result.status,
   });
+  return result;
 }
 
 async function fetchPostSnapshot(
@@ -648,7 +658,17 @@ async function markErrorAndReschedule(
       postId: record.postId,
       reason: 'check_failed_after_expiration',
     });
-    await stopTracking(record, 'error', now, 'check_failed_after_expiration');
+    const result = await stopTracking(
+      record,
+      'error',
+      now,
+      'check_failed_after_expiration'
+    );
+    if (result.status === 'retry_required') {
+      throw new FinalizationRetryError(
+        'Expired tracking finalization requires retry.'
+      );
+    }
     return;
   }
 
@@ -656,18 +676,13 @@ async function markErrorAndReschedule(
   const cadence = record.trackingMode === 'advanced' ? 'advanced' : 'normal';
   const nextRunAt = getNextCheckRunAt(nextCheckCount, now, cadence);
   const nextDelayMinutes = getNextCheckDelayMinutes(nextCheckCount, cadence);
-  const jobId = await scheduler.runJob({
-    name: CHECK_WATCHED_POST_TASK,
-    data: { postId: record.postId },
-    runAt: nextRunAt,
-  });
-
-  await writeTrackedPost({
-    ...record,
+  const updatedRecord = await schedulePostCheck({
+    record: {
+      ...record,
+      errorMessage: err instanceof Error ? err.message : String(err),
+    },
     checkCount: nextCheckCount,
-    lastJobId: jobId,
-    updatedAt: now,
-    errorMessage: err instanceof Error ? err.message : String(err),
+    runAt: nextRunAt,
   });
 
   logInfo('Rescheduled post check after error.', {
@@ -675,11 +690,12 @@ async function markErrorAndReschedule(
     checkCount: nextCheckCount,
     nextDelayMinutes,
     nextRunAt,
-    jobId,
+    jobId: updatedRecord.lastJobId,
+    runToken: updatedRecord.scheduledRunToken,
   });
 }
 
-async function scheduleRetryWithoutRecordWrite(
+async function scheduleRetryAfterActionLock(
   record: TrackedPost,
   now: number,
   reason: string
@@ -696,21 +712,144 @@ async function scheduleRetryWithoutRecordWrite(
   const cadence = record.trackingMode === 'advanced' ? 'advanced' : 'normal';
   const nextRunAt = getNextCheckRunAt(nextCheckCount, now, cadence);
   const nextDelayMinutes = getNextCheckDelayMinutes(nextCheckCount, cadence);
-  const jobId = await scheduler.runJob({
-    name: CHECK_WATCHED_POST_TASK,
-    data: { postId: record.postId },
+  const updatedRecord = await schedulePostCheck({
+    record,
+    checkCount: nextCheckCount,
     runAt: nextRunAt,
   });
 
-  logInfo('Scheduled retry without rewriting tracking record.', {
+  logInfo('Scheduled retry after action lock contention.', {
     postId: record.postId,
     reason,
     checkCount: record.checkCount,
     nextCheckCount,
     nextDelayMinutes,
     nextRunAt,
-    jobId,
+    jobId: updatedRecord.lastJobId,
+    runToken: updatedRecord.scheduledRunToken,
   });
+}
+
+async function finalizeActionAttempt(
+  record: TrackedPost,
+  status: 'actioned' | 'action_failed' | 'action_unknown',
+  successfulAction?: TrackedPost['actionToTake'],
+  stopReason: string = status
+): Promise<boolean> {
+  let result: FinalizationResult;
+  try {
+    result = await stopTracking(
+      record,
+      status,
+      Date.now(),
+      stopReason,
+      successfulAction
+    );
+  } catch (err: unknown) {
+    logError(
+      'Action finalization could not start; recovery remains responsible and the action will not be repeated.',
+      {
+        postId: record.postId,
+        actionAttemptId: record.actionAttemptId,
+        actionOutcome: record.actionOutcome,
+        recoveryJobId: record.actionRecoveryJobId,
+      },
+      err
+    );
+    return false;
+  }
+  if (result.status === 'retry_required') {
+    logWarn(
+      'Action finalization deferred; the existing recovery job or task retry will finish it without repeating the action.',
+      {
+        postId: record.postId,
+        actionAttemptId: record.actionAttemptId,
+        actionOutcome: record.actionOutcome,
+        recoveryJobId: record.actionRecoveryJobId,
+        reason: result.reason,
+      }
+    );
+    return false;
+  }
+
+  if (record.actionRecoveryJobId) {
+    await cancelScheduledJobSafely({
+      postId: record.postId,
+      jobId: record.actionRecoveryJobId,
+      reason: 'action_finalized',
+    });
+  }
+  return true;
+}
+
+async function recoverActionAttempt(
+  record: TrackedPost,
+  task: CheckWatchedPostData
+): Promise<void> {
+  const actionAttemptId = task.actionAttemptId;
+  if (
+    record.status !== 'actioning' ||
+    !actionAttemptId ||
+    record.actionAttemptId !== actionAttemptId ||
+    record.actionRecoveryRunToken !== task.runToken
+  ) {
+    logInfo('Action recovery job is stale; no action was repeated.', {
+      postId: record.postId,
+      actionAttemptId,
+      storedActionAttemptId: record.actionAttemptId,
+      runToken: task.runToken,
+      storedRunToken: record.actionRecoveryRunToken,
+      status: record.status,
+    });
+    return;
+  }
+
+  let recoverySnapshot: PostSnapshot | undefined;
+  if (
+    record.actionOutcome !== 'failed' &&
+    record.actionOutcome !== 'succeeded' &&
+    (record.attemptedAction === 'remove' || record.attemptedAction === 'filter')
+  ) {
+    const fetched = await fetchPostSnapshot(record.postId);
+    recoverySnapshot = fetched?.snapshot;
+  }
+
+  const recovery = resolveActionRecovery(record, recoverySnapshot);
+  const knownFailure = recovery.status === 'action_failed';
+  const confirmedApplied = recovery.confirmedApplied;
+  const completedAt = Date.now();
+  const recoveredRecord: TrackedPost = {
+    ...record,
+    status: recovery.status,
+    actionOutcome: recovery.outcome,
+    actionCompletedAt: completedAt,
+    updatedAt: completedAt,
+  };
+  if (!knownFailure && !confirmedApplied) {
+    recoveredRecord.actionErrorMessage =
+      'Recovery could not confirm whether the moderation action completed.';
+  }
+
+  logWarn('Recovering an unfinished moderation action without repeating it.', {
+    postId: record.postId,
+    actionAttemptId,
+    attemptedAction: record.attemptedAction,
+    knownFailure,
+    confirmedApplied,
+  });
+  const finalized = await finalizeActionAttempt(
+    recoveredRecord,
+    recovery.status,
+    confirmedApplied ? record.attemptedAction : undefined,
+    knownFailure
+      ? 'action_recovery_failed'
+      : confirmedApplied
+        ? 'action_recovery_confirmed'
+        : 'action_recovery_unknown'
+  );
+  if (!finalized) {
+    throw new Error('Action recovery finalization requires retry.');
+  }
 }
 
 async function actionTrackedPost(args: {
@@ -743,7 +882,7 @@ async function actionTrackedPost(args: {
     );
     const latestRecord = await loadTrackedPost(args.postId);
     if (latestRecord?.status === 'active') {
-      await scheduleRetryWithoutRecordWrite(
+      await scheduleRetryAfterActionLock(
         latestRecord,
         Date.now(),
         'action_lock_busy'
@@ -775,19 +914,37 @@ async function actionTrackedPost(args: {
     latestRecord,
     args.recordForAction
   );
-
-  await writeTrackedPost({
+  const actionAttemptId = randomUUID();
+  const actionStartedAt = Date.now();
+  const actioningRecord: TrackedPost = {
     ...applyScoreSignals(
       actionRecord,
       args.currentSnapshot,
       args.negativeDecision
     ),
     status: 'actioning',
-    updatedAt: args.now,
-  });
+    attemptedAction: actionRecord.actionToTake,
+    actionAttemptId,
+    actionStartedAt,
+    updatedAt: actionStartedAt,
+  };
+
+  let preparedRecord: TrackedPost;
+  try {
+    preparedRecord = await scheduleActionRecovery({
+      record: actioningRecord,
+      actionAttemptId,
+      runAt: new Date(actionStartedAt + 5 * 60 * 1000),
+    });
+  } catch (err: unknown) {
+    await releaseActionLock(args.postId, 'action_preparation_failed');
+    throw err;
+  }
 
   logInfo('Applying selected moderation action.', {
     postId: args.postId,
+    actionAttemptId,
+    recoveryJobId: preparedRecord.actionRecoveryJobId,
     actionToTake: actionRecord.actionToTake,
     score: args.currentSnapshot?.score,
     calculatedVoteScore: args.negativeDecision?.calculatedVoteScore,
@@ -802,6 +959,8 @@ async function actionTrackedPost(args: {
   });
 
   let moderationActionResult: ModerationActionResult = {
+    actionStatus: 'failed',
+    removalNoteStatus: 'not_applicable',
     modmailStatus: 'not_applicable',
   };
 
@@ -837,19 +996,70 @@ async function actionTrackedPost(args: {
 
     moderationActionResult = await applyModerationAction(moderationActionArgs);
   } catch (err: unknown) {
-    await releaseActionLock(args.postId, 'moderation_action_failed');
-    await markErrorAndReschedule(
+    const completedAt = Date.now();
+    const unknownRecord: TrackedPost = {
+      ...preparedRecord,
+      status: 'actioning',
+      actionOutcome: 'unknown',
+      actionCompletedAt: completedAt,
+      actionErrorMessage: err instanceof Error ? err.message : String(err),
+      updatedAt: completedAt,
+    };
+    logError(
+      'Moderation action outcome is unknown; it will not be repeated.',
       {
-        ...applyScoreSignals(
-          actionRecord,
-          args.currentSnapshot,
-          args.negativeDecision
-        ),
-        status: 'active',
+        postId: args.postId,
+        actionAttemptId,
+        actionToTake: actionRecord.actionToTake,
       },
-      err,
-      Date.now()
+      err
     );
+    try {
+      await redis.set(
+        watchKey(unknownRecord.postId),
+        serializeTrackedPost(unknownRecord)
+      );
+    } catch (persistErr: unknown) {
+      logError(
+        'Could not persist the ambiguous action outcome; the existing recovery record remains active.',
+        { postId: args.postId, actionAttemptId },
+        persistErr
+      );
+    }
+    return;
+  }
+
+  if (moderationActionResult.actionStatus === 'failed') {
+    const completedAt = Date.now();
+    const failedRecord: TrackedPost = {
+      ...preparedRecord,
+      status: 'actioning',
+      actionOutcome: 'failed',
+      actionCompletedAt: completedAt,
+      actionErrorMessage:
+        moderationActionResult.actionErrorMessage ??
+        'Moderation API rejected the action.',
+      updatedAt: completedAt,
+    };
+    logError('Moderation action was rejected and will not be repeated.', {
+      postId: args.postId,
+      actionAttemptId,
+      actionToTake: actionRecord.actionToTake,
+      error: failedRecord.actionErrorMessage,
+    });
+    try {
+      await redis.set(
+        watchKey(failedRecord.postId),
+        serializeTrackedPost(failedRecord)
+      );
+    } catch (persistErr: unknown) {
+      logError(
+        'Could not persist the rejected action outcome before finalization.',
+        { postId: args.postId, actionAttemptId },
+        persistErr
+      );
+    }
+    await finalizeActionAttempt(failedRecord, 'action_failed');
     return;
   }
 
@@ -880,17 +1090,31 @@ async function actionTrackedPost(args: {
     });
   }
 
+  if (moderationActionResult.removalNoteStatus === 'failed') {
+    logWarn('Removal note failed after the moderation action succeeded.', {
+      postId: args.postId,
+      actionAttemptId,
+      error: moderationActionResult.removalNoteErrorMessage,
+    });
+  }
+
+  const completedAt = Date.now();
   const actionedRecord: TrackedPost = {
-    ...applyScoreSignals(
-      actionRecord,
-      args.currentSnapshot,
-      args.negativeDecision
-    ),
-    status: 'actioned',
-    actionedAt: Date.now(),
+    ...preparedRecord,
+    status: 'actioning',
+    actionOutcome: 'succeeded',
+    actionedAt: completedAt,
+    actionCompletedAt: completedAt,
+    updatedAt: completedAt,
   };
 
+  actionedRecord.removalNoteStatus = moderationActionResult.removalNoteStatus;
   actionedRecord.modmailStatus = moderationActionResult.modmailStatus;
+
+  if (typeof moderationActionResult.removalNoteErrorMessage === 'string') {
+    actionedRecord.removalNoteErrorMessage =
+      moderationActionResult.removalNoteErrorMessage;
+  }
 
   if (typeof moderationActionResult.modmailSentAt === 'number') {
     actionedRecord.modmailSentAt = moderationActionResult.modmailSentAt;
@@ -906,15 +1130,32 @@ async function actionTrackedPost(args: {
       moderationActionResult.modmailErrorMessage;
   }
 
-  await stopTracking(actionedRecord, 'actioned', Date.now(), args.stopReason);
-  await redis.hIncrBy(
-    statsKey(actionRecord.subredditId),
-    `action_${actionRecord.actionToTake}`,
-    1
+  try {
+    await redis.set(
+      watchKey(actionedRecord.postId),
+      serializeTrackedPost(actionedRecord)
+    );
+  } catch (persistErr: unknown) {
+    logError(
+      'Could not persist the successful action outcome before finalization.',
+      { postId: args.postId, actionAttemptId },
+      persistErr
+    );
+  }
+
+  const finalized = await finalizeActionAttempt(
+    actionedRecord,
+    'actioned',
+    actionRecord.actionToTake,
+    args.stopReason
   );
+  if (!finalized) {
+    return;
+  }
 
   logInfo('Post action complete and audit record written.', {
     postId: args.postId,
+    actionAttemptId,
     actionToTake: actionRecord.actionToTake,
     score: args.currentSnapshot?.score,
     calculatedVoteScore: args.negativeDecision?.calculatedVoteScore,
@@ -936,6 +1177,9 @@ scheduledJobs.post('/check-watched-post', async (c) => {
 
   logInfo('Scheduled post check started.', {
     postId,
+    kind: task.data?.kind ?? 'legacy_check',
+    runToken: task.data?.runToken,
+    actionAttemptId: task.data?.actionAttemptId,
     payload: task.data,
   });
 
@@ -947,7 +1191,33 @@ scheduledJobs.post('/check-watched-post', async (c) => {
   }
 
   const initialRecord = await loadTrackedPost(postId);
-  if (!initialRecord || initialRecord.status !== 'active') {
+  if (!initialRecord) {
+    logInfo('Scheduled check exited because no tracking record exists.', {
+      postId,
+      reason: 'record_missing',
+    });
+    return c.json<TaskResponse>({}, 200);
+  }
+
+  const isRecoveryTask = task.data?.kind === 'action_recovery';
+  if (isRecoveryTask) {
+    if (
+      initialRecord.status !== 'actioning' ||
+      !task.data?.actionAttemptId ||
+      initialRecord.actionAttemptId !== task.data.actionAttemptId ||
+      initialRecord.actionRecoveryRunToken !== task.data.runToken
+    ) {
+      logInfo('Action recovery job exited because its token is stale.', {
+        postId,
+        actionAttemptId: task.data?.actionAttemptId,
+        storedActionAttemptId: initialRecord.actionAttemptId,
+        runToken: task.data?.runToken,
+        storedRunToken: initialRecord.actionRecoveryRunToken,
+        status: initialRecord.status,
+      });
+      return c.json<TaskResponse>({}, 200);
+    }
+  } else if (initialRecord.status !== 'active') {
     logInfo(
       'Scheduled check exited without action because no active record exists.',
       {
@@ -959,282 +1229,331 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     return c.json<TaskResponse>({}, 200);
   }
 
-  const now = Date.now();
-  let activeRecord = initialRecord;
+  if (!isRecoveryTask && !isCurrentCheckDelivery(initialRecord, task.data)) {
+    logInfo('Scheduled check exited because its run token is stale.', {
+      postId,
+      runToken: task.data?.runToken,
+      storedRunToken: initialRecord.scheduledRunToken,
+      reason: 'stale_run_token',
+    });
+    return c.json<TaskResponse>({}, 200);
+  }
+
+  const executionToken =
+    task.data?.runToken ??
+    `legacy-${isRecoveryTask ? 'recovery' : initialRecord.checkCount}`;
+  const executionLock = checkExecutionLockKey(postId, executionToken);
+  const executionLockWasSet = await redis.set(executionLock, '1', {
+    nx: true,
+    expiration: new Date(Date.now() + 5 * 60 * 1000),
+  });
+  if (executionLockWasSet !== 'OK') {
+    logInfo('Duplicate scheduled check delivery was ignored.', {
+      postId,
+      runToken: executionToken,
+      executionLock,
+      reason: 'execution_lock_busy',
+    });
+    return c.json<TaskResponse>({}, 200);
+  }
 
   try {
-    logInfo('Reading app installation settings for scheduled check.', {
-      postId,
-    });
-    const settingsValues = await devvitSettings.getAll<SettingsValues>();
-    const currentSettings = normalizeSettings(settingsValues);
-    const firebaseRouterConfig = readFirebaseRouterConfigFromSettings(
-      settingsValues as Record<string, unknown>
-    );
-    logInfo('Loaded app installation settings for scheduled check.', {
-      postId,
-      isActive: currentSettings.isActive,
-      trackingDurationHours: currentSettings.trackingDurationHours,
-      negativeScoreThreshold: currentSettings.negativeScoreThreshold,
-      positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
-      actionToTake: currentSettings.actionToTake,
-      moderatorPostHandling: currentSettings.moderatorPostHandling,
-      firebaseRouterConfigured: firebaseRouterConfig !== null,
-      firebaseRouterHost: FIREBASE_RATIO_ROUTER_HOST,
-      rawSettingShapes: summarizeSubredditSettingsShapes(settingsValues),
-    });
-    if (!firebaseRouterConfig) {
-      logWarn(
-        'Firebase ratio router disabled because its HMAC secret is missing.',
-        {
+    if (isRecoveryTask && task.data) {
+      await recoverActionAttempt(initialRecord, task.data);
+      return c.json<TaskResponse>({}, 200);
+    }
+
+    const now = Date.now();
+    let activeRecord = initialRecord;
+
+    try {
+      logInfo('Reading app installation settings for scheduled check.', {
+        postId,
+      });
+      const settingsValues = await devvitSettings.getAll<SettingsValues>();
+      const currentSettings = normalizeSettings(settingsValues);
+      const firebaseRouterConfig = readFirebaseRouterConfigFromSettings(
+        settingsValues as Record<string, unknown>
+      );
+      logInfo('Loaded app installation settings for scheduled check.', {
+        postId,
+        isActive: currentSettings.isActive,
+        trackingDurationHours: currentSettings.trackingDurationHours,
+        negativeScoreThreshold: currentSettings.negativeScoreThreshold,
+        positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
+        actionToTake: currentSettings.actionToTake,
+        moderatorPostHandling: currentSettings.moderatorPostHandling,
+        firebaseRouterConfigured: firebaseRouterConfig !== null,
+        firebaseRouterHost: FIREBASE_RATIO_ROUTER_HOST,
+        rawSettingShapes: summarizeSubredditSettingsShapes(settingsValues),
+      });
+      if (!firebaseRouterConfig) {
+        logWarn(
+          'Firebase ratio router disabled because its HMAC secret is missing.',
+          {
+            postId,
+            source: 'firebase_router',
+            routerHost: FIREBASE_RATIO_ROUTER_HOST,
+            reason: 'missing_hmac_secret',
+            fallback: 'reddit_score_only',
+          }
+        );
+      }
+      activeRecord = refreshTrackedPostActionSettings(
+        initialRecord,
+        currentSettings
+      );
+      logInfo('Refreshed active tracking record from current settings.', {
+        postId,
+        storedNegativeScoreThreshold: initialRecord.negativeScoreThreshold,
+        activeNegativeScoreThreshold: activeRecord.negativeScoreThreshold,
+        storedPositiveScoreStopThreshold:
+          initialRecord.positiveScoreStopThreshold,
+        activePositiveScoreStopThreshold:
+          activeRecord.positiveScoreStopThreshold,
+        storedActionToTake: initialRecord.actionToTake,
+        activeActionToTake: activeRecord.actionToTake,
+        trackingExpiresAt: new Date(activeRecord.trackingExpiresAt),
+      });
+
+      const fetched = await fetchPostSnapshot(postId);
+      if (!fetched) {
+        logWarn('Decision: retry because Reddit post fetch failed.', {
           postId,
-          source: 'firebase_router',
-          routerHost: FIREBASE_RATIO_ROUTER_HOST,
-          reason: 'missing_hmac_secret',
-          fallback: 'reddit_score_only',
-        }
-      );
-    }
-    activeRecord = refreshTrackedPostActionSettings(
-      initialRecord,
-      currentSettings
-    );
-    logInfo('Refreshed active tracking record from current settings.', {
-      postId,
-      storedNegativeScoreThreshold: initialRecord.negativeScoreThreshold,
-      activeNegativeScoreThreshold: activeRecord.negativeScoreThreshold,
-      storedPositiveScoreStopThreshold:
-        initialRecord.positiveScoreStopThreshold,
-      activePositiveScoreStopThreshold: activeRecord.positiveScoreStopThreshold,
-      storedActionToTake: initialRecord.actionToTake,
-      activeActionToTake: activeRecord.actionToTake,
-      trackingExpiresAt: new Date(activeRecord.trackingExpiresAt),
-    });
+          reason: 'fetch_failed_retrying',
+          checkCount: activeRecord.checkCount,
+        });
+        await markErrorAndReschedule(
+          activeRecord,
+          new Error('fetch_failed_retrying'),
+          now
+        );
+        return c.json<TaskResponse>({}, 200);
+      }
 
-    const fetched = await fetchPostSnapshot(postId);
-    if (!fetched) {
-      logWarn('Decision: retry because Reddit post fetch failed.', {
-        postId,
-        reason: 'fetch_failed_retrying',
-        checkCount: activeRecord.checkCount,
-      });
-      await markErrorAndReschedule(
-        activeRecord,
-        new Error('fetch_failed_retrying'),
-        now
-      );
-      return c.json<TaskResponse>({}, 200);
-    }
+      const currentSnapshot = fetched ? fetched.snapshot : null;
+      const negativeDecision = currentSnapshot
+        ? getNegativeDecisionScore(currentSnapshot)
+        : undefined;
 
-    const currentSnapshot = fetched ? fetched.snapshot : null;
-    const negativeDecision = currentSnapshot
-      ? getNegativeDecisionScore(currentSnapshot)
-      : undefined;
+      if (currentSnapshot && negativeDecision) {
+        logInfo('Computed negative decision score for scheduled check.', {
+          postId,
+          fetchedScore: currentSnapshot.score,
+          calculatedVoteScore: negativeDecision.calculatedVoteScore,
+          negativeDecisionScore: negativeDecision.score,
+          negativeDecisionSource: negativeDecision.source,
+        });
+      }
 
-    if (currentSnapshot && negativeDecision) {
-      logInfo('Computed negative decision score for scheduled check.', {
-        postId,
-        fetchedScore: currentSnapshot.score,
-        calculatedVoteScore: negativeDecision.calculatedVoteScore,
-        negativeDecisionScore: negativeDecision.score,
-        negativeDecisionSource: negativeDecision.source,
-      });
-    }
-
-    const decision = decideTrackedPostCheck({
-      tracking: activeRecord,
-      settings: currentSettings,
-      post: currentSnapshot,
-      now,
-    });
-
-    if (decision.type === 'exit') {
-      logInfo('Decision: exit without action.', {
-        postId,
-        status: activeRecord.status,
-        reason: 'decision_exit',
-      });
-      return c.json<TaskResponse>({}, 200);
-    }
-
-    if (decision.type === 'stop') {
-      const stopLogReason =
-        decision.status === 'stopped_invalid'
-          ? 'post_invalid_stopping'
-          : decision.status === 'stopped_removed'
-            ? 'post_removed_or_spam_stopping'
-            : decision.status;
-      logInfo('Decision: stop tracking.', {
-        postId,
-        status: decision.status,
-        reason: stopLogReason,
-        score: currentSnapshot?.score,
-        negativeDecisionScore: negativeDecision?.score,
-        negativeDecisionSource: negativeDecision?.source,
-        checkCount: activeRecord.checkCount,
-      });
-      await stopTracking(
-        applyScoreSignals(activeRecord, currentSnapshot, negativeDecision),
-        decision.status,
+      const decision = decideTrackedPostCheck({
+        tracking: activeRecord,
+        settings: currentSettings,
+        post: currentSnapshot,
         now,
-        decision.status
-      );
-      return c.json<TaskResponse>({}, 200);
-    }
+      });
 
-    if (decision.type === 'action') {
-      const actionReason = buildActionReason(
-        activeRecord.actionToTake,
-        activeRecord.negativeScoreThreshold
+      if (decision.type === 'exit') {
+        logInfo('Decision: exit without action.', {
+          postId,
+          status: activeRecord.status,
+          reason: 'decision_exit',
+        });
+        return c.json<TaskResponse>({}, 200);
+      }
+
+      if (decision.type === 'stop') {
+        const stopLogReason =
+          decision.status === 'stopped_invalid'
+            ? 'post_invalid_stopping'
+            : decision.status === 'stopped_removed'
+              ? 'post_removed_or_spam_stopping'
+              : decision.status;
+        logInfo('Decision: stop tracking.', {
+          postId,
+          status: decision.status,
+          reason: stopLogReason,
+          score: currentSnapshot?.score,
+          negativeDecisionScore: negativeDecision?.score,
+          negativeDecisionSource: negativeDecision?.source,
+          checkCount: activeRecord.checkCount,
+        });
+        const result = await stopTracking(
+          applyScoreSignals(activeRecord, currentSnapshot, negativeDecision),
+          decision.status,
+          now,
+          decision.status
+        );
+        if (result.status === 'retry_required') {
+          throw new FinalizationRetryError(
+            'Terminal tracking finalization requires retry.'
+          );
+        }
+        return c.json<TaskResponse>({}, 200);
+      }
+
+      if (decision.type === 'action') {
+        const actionReason = buildActionReason(
+          activeRecord.actionToTake,
+          activeRecord.negativeScoreThreshold
+        );
+
+        logInfo('Decision: action post because score reached threshold.', {
+          postId,
+          score: currentSnapshot?.score,
+          calculatedVoteScore: negativeDecision?.calculatedVoteScore,
+          negativeDecisionScore: negativeDecision?.score,
+          negativeDecisionSource: negativeDecision?.source,
+          negativeScoreThreshold: activeRecord.negativeScoreThreshold,
+          actionToTake: activeRecord.actionToTake,
+          reason: actionReason,
+        });
+
+        if (fetched) {
+          await actionTrackedPost({
+            postId,
+            fetched,
+            recordForAction: activeRecord,
+            currentSnapshot,
+            negativeDecision,
+            now,
+            actionReason,
+            stopReason: activeRecord.actionToTake,
+          });
+        }
+
+        return c.json<TaskResponse>({}, 200);
+      }
+
+      const nextCheckCount = activeRecord.checkCount + 1;
+      const advancedTracking = shouldUseAdvancedTracking(currentSnapshot);
+      let recordForNextCheck = applyScoreSignals(
+        activeRecord,
+        currentSnapshot,
+        negativeDecision
       );
 
-      logInfo('Decision: action post because score reached threshold.', {
+      if (advancedTracking) {
+        const ratioResult = await fetchAndLogFirebaseRatio({
+          postId,
+          config: firebaseRouterConfig,
+        });
+        recordForNextCheck = applyFirebaseRouterRatioResult(
+          recordForNextCheck,
+          ratioResult,
+          now,
+          activeRecord.negativeScoreThreshold,
+          currentSnapshot?.score ?? 0
+        );
+
+        const ratioDecision = getRatioDecision(recordForNextCheck);
+        if (ratioDecision?.remove && fetched) {
+          const actionReason = buildRatioActionReason(
+            recordForNextCheck.actionToTake
+          );
+          logInfo(
+            'Decision: action post because ratio confidence threshold was met.',
+            {
+              postId,
+              rawUpvoteRatio: recordForNextCheck.lastRawUpvoteRatio,
+              minimumTotalVotes: recordForNextCheck.minimumTotalVotes,
+              guaranteedSpread: recordForNextCheck.guaranteedSpread,
+              threshold: recordForNextCheck.negativeScoreThreshold,
+              ratioDecisionReason: recordForNextCheck.lastRatioDecisionReason,
+              ratioSource: recordForNextCheck.lastAuthenticatedRatioSource,
+              possibleStateCount: recordForNextCheck.possibleStates?.length,
+              actionToTake: recordForNextCheck.actionToTake,
+              reason: actionReason,
+            }
+          );
+          await actionTrackedPost({
+            postId,
+            fetched,
+            recordForAction: recordForNextCheck,
+            currentSnapshot,
+            negativeDecision,
+            now,
+            actionReason,
+            stopReason:
+              recordForNextCheck.lastRatioDecisionReason ?? 'ratio_action',
+          });
+          return c.json<TaskResponse>({}, 200);
+        }
+      } else {
+        recordForNextCheck = {
+          ...recordForNextCheck,
+          trackingMode: 'normal',
+        };
+      }
+
+      const nextCadence = advancedTracking ? 'advanced' : 'normal';
+      const nextDelayMinutes = getNextCheckDelayMinutes(
+        nextCheckCount,
+        nextCadence
+      );
+      const nextRunAt = getNextCheckRunAt(nextCheckCount, now, nextCadence);
+      logInfo('Decision: reschedule because no terminal condition was met.', {
         postId,
         score: currentSnapshot?.score,
         calculatedVoteScore: negativeDecision?.calculatedVoteScore,
         negativeDecisionScore: negativeDecision?.score,
         negativeDecisionSource: negativeDecision?.source,
-        negativeScoreThreshold: activeRecord.negativeScoreThreshold,
-        actionToTake: activeRecord.actionToTake,
-        reason: actionReason,
+        trackingMode: recordForNextCheck.trackingMode,
+        rawUpvoteRatio: recordForNextCheck.lastRawUpvoteRatio,
+        rawRatioPercent: recordForNextCheck.lastRawRatioPercent,
+        authenticatedRatioReceived:
+          recordForNextCheck.lastAuthenticatedRatioReceived,
+        authenticatedRatioSource:
+          recordForNextCheck.lastAuthenticatedRatioSource,
+        authenticatedRatioError: recordForNextCheck.lastAuthenticatedRatioError,
+        previousCheckCount: activeRecord.checkCount,
+        nextCheckCount,
+        nextDelayMinutes,
+        nextRunAt,
       });
 
-      if (fetched) {
-        await actionTrackedPost({
-          postId,
-          fetched,
-          recordForAction: activeRecord,
-          currentSnapshot,
-          negativeDecision,
-          now,
-          actionReason,
-          stopReason: activeRecord.actionToTake,
-        });
-      }
+      const updatedRecord = await schedulePostCheck({
+        record: recordForNextCheck,
+        checkCount: nextCheckCount,
+        runAt: nextRunAt,
+      });
 
-      return c.json<TaskResponse>({}, 200);
-    }
-
-    const nextCheckCount = activeRecord.checkCount + 1;
-    const advancedTracking = shouldUseAdvancedTracking(currentSnapshot);
-    let recordForNextCheck = applyScoreSignals(
-      activeRecord,
-      currentSnapshot,
-      negativeDecision
-    );
-
-    if (advancedTracking) {
-      const ratioResult = await fetchAndLogFirebaseRatio({
+      logInfo('Scheduled next post check.', {
         postId,
-        config: firebaseRouterConfig,
+        jobId: updatedRecord.lastJobId,
+        runToken: updatedRecord.scheduledRunToken,
+        checkCount: nextCheckCount,
+        nextDelayMinutes,
+        nextRunAt,
+        trackingMode: updatedRecord.trackingMode,
+        score: updatedRecord.lastKnownScore,
+        rawUpvoteRatio: updatedRecord.lastRawUpvoteRatio,
+        rawRatioPercent: updatedRecord.lastRawRatioPercent,
+        authenticatedRatioReceived:
+          updatedRecord.lastAuthenticatedRatioReceived,
+        authenticatedRatioSource: updatedRecord.lastAuthenticatedRatioSource,
+        authenticatedRatioError: updatedRecord.lastAuthenticatedRatioError,
+        negativeDecisionScore: updatedRecord.negativeDecisionScore,
+        negativeDecisionSource: updatedRecord.negativeDecisionSource,
       });
-      recordForNextCheck = applyFirebaseRouterRatioResult(
-        recordForNextCheck,
-        ratioResult,
-        now,
-        activeRecord.negativeScoreThreshold,
-        currentSnapshot?.score ?? 0
-      );
-
-      const ratioDecision = getRatioDecision(recordForNextCheck);
-      if (ratioDecision?.remove && fetched) {
-        const actionReason = buildRatioActionReason(
-          recordForNextCheck.actionToTake
-        );
-        logInfo(
-          'Decision: action post because ratio confidence threshold was met.',
-          {
-            postId,
-            rawUpvoteRatio: recordForNextCheck.lastRawUpvoteRatio,
-            minimumTotalVotes: recordForNextCheck.minimumTotalVotes,
-            guaranteedSpread: recordForNextCheck.guaranteedSpread,
-            threshold: recordForNextCheck.negativeScoreThreshold,
-            ratioDecisionReason: recordForNextCheck.lastRatioDecisionReason,
-            ratioSource: recordForNextCheck.lastAuthenticatedRatioSource,
-            possibleStateCount: recordForNextCheck.possibleStates?.length,
-            actionToTake: recordForNextCheck.actionToTake,
-            reason: actionReason,
-          }
-        );
-        await actionTrackedPost({
-          postId,
-          fetched,
-          recordForAction: recordForNextCheck,
-          currentSnapshot,
-          negativeDecision,
-          now,
-          actionReason,
-          stopReason:
-            recordForNextCheck.lastRatioDecisionReason ?? 'ratio_action',
-        });
-        return c.json<TaskResponse>({}, 200);
+    } catch (err: unknown) {
+      if (err instanceof FinalizationRetryError) {
+        throw err;
       }
-    } else {
-      recordForNextCheck = {
-        ...recordForNextCheck,
-        trackingMode: 'normal',
-      };
+      await markErrorAndReschedule(activeRecord, err, Date.now());
     }
 
-    const nextCadence = advancedTracking ? 'advanced' : 'normal';
-    const nextDelayMinutes = getNextCheckDelayMinutes(
-      nextCheckCount,
-      nextCadence
-    );
-    const nextRunAt = getNextCheckRunAt(nextCheckCount, now, nextCadence);
-    logInfo('Decision: reschedule because no terminal condition was met.', {
-      postId,
-      score: currentSnapshot?.score,
-      calculatedVoteScore: negativeDecision?.calculatedVoteScore,
-      negativeDecisionScore: negativeDecision?.score,
-      negativeDecisionSource: negativeDecision?.source,
-      trackingMode: recordForNextCheck.trackingMode,
-      rawUpvoteRatio: recordForNextCheck.lastRawUpvoteRatio,
-      rawRatioPercent: recordForNextCheck.lastRawRatioPercent,
-      authenticatedRatioReceived:
-        recordForNextCheck.lastAuthenticatedRatioReceived,
-      authenticatedRatioSource: recordForNextCheck.lastAuthenticatedRatioSource,
-      authenticatedRatioError: recordForNextCheck.lastAuthenticatedRatioError,
-      previousCheckCount: activeRecord.checkCount,
-      nextCheckCount,
-      nextDelayMinutes,
-      nextRunAt,
-    });
-
-    const jobId = await scheduler.runJob({
-      name: CHECK_WATCHED_POST_TASK,
-      data: { postId },
-      runAt: nextRunAt,
-    });
-
-    const updatedRecord: TrackedPost = {
-      ...recordForNextCheck,
-      checkCount: nextCheckCount,
-      lastJobId: jobId,
-      updatedAt: now,
-    };
-
-    await writeTrackedPost(updatedRecord);
-
-    logInfo('Scheduled next post check.', {
-      postId,
-      jobId,
-      checkCount: nextCheckCount,
-      nextDelayMinutes,
-      nextRunAt,
-      trackingMode: updatedRecord.trackingMode,
-      score: updatedRecord.lastKnownScore,
-      rawUpvoteRatio: updatedRecord.lastRawUpvoteRatio,
-      rawRatioPercent: updatedRecord.lastRawRatioPercent,
-      authenticatedRatioReceived: updatedRecord.lastAuthenticatedRatioReceived,
-      authenticatedRatioSource: updatedRecord.lastAuthenticatedRatioSource,
-      authenticatedRatioError: updatedRecord.lastAuthenticatedRatioError,
-      negativeDecisionScore: updatedRecord.negativeDecisionScore,
-      negativeDecisionSource: updatedRecord.negativeDecisionSource,
-    });
-  } catch (err: unknown) {
-    await markErrorAndReschedule(activeRecord, err, Date.now());
+    return c.json<TaskResponse>({}, 200);
+  } finally {
+    try {
+      await redis.del(executionLock);
+    } catch (err: unknown) {
+      logWarn('Execution lock cleanup failed; expiration will release it.', {
+        postId,
+        runToken: executionToken,
+        executionLock,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
-
-  return c.json<TaskResponse>({}, 200);
 });

@@ -10,11 +10,19 @@ Downvote Delete will:
 
 - Watch new posts for 2, 4, or 6 hours.
 - Detect when a post reaches configured negative scores (-1 through -5).
+- Apply the installation's selected action when either the Reddit score or the
+  conservative ratio model reaches that configured threshold.
+- Remove the post, hide it in ModQueue with Filter, or leave it visible and
+  report it to ModQueue for moderator review.
 - Stops watching posts that grow positively (+3, +5 or +10).
 - Ignore manually approved posts.
 - Stop tracking posts that are already removed, filtered, spammed, deleted, or unavailable.
 
 Downvote Delete watches posts only. It does not track comments or scan older posts. Use Crowd Control to automatically filter downvoted comments.
+
+Filter uses Devvit's hidden-while-queued mode. Report leaves the post visible.
+Once a moderation API call begins, an ambiguous result is recorded for
+moderator review instead of automatically repeating the action.
 
 ## What the app does NOT do:
 

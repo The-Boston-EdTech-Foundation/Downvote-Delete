@@ -1,32 +1,21 @@
 import { Hono } from 'hono';
-import type {
-  OnPostSubmitRequest,
-  TriggerResponse,
-} from '@devvit/web/shared';
-import {
-  reddit,
-  redis,
-  scheduler,
-  settings as devvitSettings,
-} from '@devvit/web/server';
+import type { OnPostSubmitRequest, TriggerResponse } from '@devvit/web/shared';
+import { reddit, settings as devvitSettings } from '@devvit/web/server';
 import { getNextCheckRunAt } from '../core/backoff';
 import { logError, logInfo, logWarn } from '../core/logging';
+import {
+  CHECK_WATCHED_POST_TASK,
+  scheduleInitialPostCheck,
+} from '../core/scheduling';
 import {
   normalizeSettings,
   summarizeSubredditSettingsShapes,
   type DownvoteDeleteSettings,
 } from '../core/settings';
 import { shouldTrackNewPost } from '../core/decision';
-import {
-  serializeTrackedPost,
-  statsKey,
-  type TrackedPost,
-  watchKey,
-} from '../core/tracking';
+import { type TrackedPost, watchKey } from '../core/tracking';
 
 export const triggers = new Hono();
-
-const CHECK_WATCHED_POST_TASK = 'checkWatchedPost';
 
 function getPostId(input: OnPostSubmitRequest): string | undefined {
   return input.post?.id;
@@ -41,10 +30,13 @@ async function isModeratorPost(args: {
   subredditName: string | undefined;
 }): Promise<boolean> {
   if (!args.authorName || !args.subredditName) {
-    logInfo('Moderator detection skipped because author or subreddit is missing.', {
-      authorName: args.authorName,
-      subredditName: args.subredditName,
-    });
+    logInfo(
+      'Moderator detection skipped because author or subreddit is missing.',
+      {
+        authorName: args.authorName,
+        subredditName: args.subredditName,
+      }
+    );
     return false;
   }
 
@@ -136,15 +128,23 @@ triggers.post('/on-post-submit', async (c) => {
       return c.json<TriggerResponse>({}, 200);
     }
 
-    if (!shouldTrackNewPost({ settings: currentSettings, isModeratorPost: moderatorPost })) {
-      logInfo('Skipping post because moderator posts are ignored by settings.', {
-        postId,
-        subredditName,
-        authorName,
+    if (
+      !shouldTrackNewPost({
+        settings: currentSettings,
         isModeratorPost: moderatorPost,
-        moderatorPostHandling: currentSettings.moderatorPostHandling,
-        reason: 'moderator_post_ignored',
-      });
+      })
+    ) {
+      logInfo(
+        'Skipping post because moderator posts are ignored by settings.',
+        {
+          postId,
+          subredditName,
+          authorName,
+          isModeratorPost: moderatorPost,
+          moderatorPostHandling: currentSettings.moderatorPostHandling,
+          reason: 'moderator_post_ignored',
+        }
+      );
       return c.json<TriggerResponse>({}, 200);
     }
 
@@ -184,7 +184,7 @@ triggers.post('/on-post-submit', async (c) => {
     }
 
     const redisKey = watchKey(postId);
-    logInfo('Writing initial tracking record to Redis.', {
+    logInfo('Scheduling initial tracked-post check.', {
       postId,
       subredditName,
       authorName,
@@ -197,33 +197,38 @@ triggers.post('/on-post-submit', async (c) => {
       actionToTake: record.actionToTake,
     });
 
-    await redis.set(redisKey, serializeTrackedPost(record));
-
     const firstRunAt = getNextCheckRunAt(record.checkCount, now);
-    const jobId = await scheduler.runJob({
-      name: CHECK_WATCHED_POST_TASK,
-      data: { postId },
+    const schedulingResult = await scheduleInitialPostCheck({
+      record,
       runAt: firstRunAt,
     });
 
-    await redis.set(
-      redisKey,
-      serializeTrackedPost({ ...record, lastJobId: jobId, updatedAt: Date.now() })
-    );
-    await redis.hIncrBy(statsKey(subredditId), 'started', 1);
+    if (schedulingResult.status === 'already_tracking') {
+      logInfo('Post submit trigger was already initialized.', {
+        postId,
+        subredditName,
+        authorName,
+        redisKey,
+        reason: 'already_tracking',
+      });
+      return c.json<TriggerResponse>({}, 200);
+    }
+    const scheduledRecord = schedulingResult.record;
 
     logInfo('Started tracking new post and scheduled first check.', {
       postId,
       subredditName,
       authorName,
       redisKey,
-      jobId,
+      jobId: scheduledRecord.lastJobId,
+      runToken: scheduledRecord.scheduledRunToken,
       firstRunAt,
       initialScore: record.lastKnownScore,
       expiresAt: new Date(record.trackingExpiresAt),
     });
   } catch (err: unknown) {
     logError('Failed to process post submit trigger.', undefined, err);
+    return c.json<TriggerResponse>({}, 500);
   }
 
   return c.json<TriggerResponse>({}, 200);

@@ -1,5 +1,4 @@
 export const confidenceModelMaxVotes = 30;
-export const severeDownvoteRatioThreshold = 0.24;
 export const advancedTrackingMaxRatio = 0.4;
 
 export type VoteState = {
@@ -163,16 +162,6 @@ export function shouldRemoveByRatio(params: {
   }
 
   const ratio = roundRatioToTwoDecimals(params.ratio);
-
-  if (ratio <= severeDownvoteRatioThreshold) {
-    return {
-      remove: true,
-      reason: 'severe_downvote_ratio',
-      updatedMinimumTotalVotes: params.minimumTotalVotes,
-      guaranteedSpread: null,
-      possibleStates: [],
-    };
-  }
 
   if (ratio > advancedTrackingMaxRatio) {
     return {

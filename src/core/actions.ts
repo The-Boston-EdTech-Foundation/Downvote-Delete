@@ -18,6 +18,10 @@ export type RemovalModmailInput = {
 };
 
 export type ModerationActionResult = {
+  actionStatus: 'succeeded' | 'failed';
+  actionErrorMessage?: string;
+  removalNoteStatus: 'not_applicable' | 'added' | 'failed';
+  removalNoteErrorMessage?: string;
   modmailStatus: 'not_applicable' | 'sent' | 'skipped' | 'failed';
   modmailSentAt?: number;
   modmailSkippedReason?: string;
@@ -99,38 +103,70 @@ export async function applyModerationAction(
   const reason = args.reason ?? buildActionReason(args.action, args.threshold);
 
   if (args.action === ACTION_REPORT) {
-    await args.redditClient.report(args.post, { reason });
-    return { modmailStatus: 'not_applicable' };
+    const result = await args.redditClient.report(args.post, { reason });
+    const errors = result.json?.errors ?? [];
+    if (errors.length > 0) {
+      return {
+        actionStatus: 'failed',
+        actionErrorMessage: errors.join('; '),
+        removalNoteStatus: 'not_applicable',
+        modmailStatus: 'not_applicable',
+      };
+    }
+    return {
+      actionStatus: 'succeeded',
+      removalNoteStatus: 'not_applicable',
+      modmailStatus: 'not_applicable',
+    };
   }
 
   if (args.action === ACTION_FILTER) {
     await args.post.filter({ reason, keep: false });
-    return { modmailStatus: 'not_applicable' };
+    return {
+      actionStatus: 'succeeded',
+      removalNoteStatus: 'not_applicable',
+      modmailStatus: 'not_applicable',
+    };
   }
 
   if (args.action === ACTION_REMOVE) {
     await args.post.remove(false);
-    await args.post.addRemovalNote({ reasonId: '', modNote: reason });
+    let removalNoteStatus: ModerationActionResult['removalNoteStatus'] =
+      'added';
+    let removalNoteErrorMessage: string | undefined;
+    try {
+      await args.post.addRemovalNote({ reasonId: '', modNote: reason });
+    } catch (err: unknown) {
+      removalNoteStatus = 'failed';
+      removalNoteErrorMessage =
+        err instanceof Error ? err.message : String(err);
+    }
+
+    const result: ModerationActionResult = {
+      actionStatus: 'succeeded',
+      removalNoteStatus,
+      modmailStatus: 'not_applicable',
+    };
+    if (removalNoteErrorMessage) {
+      result.removalNoteErrorMessage = removalNoteErrorMessage;
+    }
 
     if (!args.authorName) {
-      return {
-        modmailStatus: 'skipped',
-        modmailSkippedReason: 'missing_author_name',
-      };
+      result.modmailStatus = 'skipped';
+      result.modmailSkippedReason = 'missing_author_name';
+      return result;
     }
 
     if (!args.subredditName) {
-      return {
-        modmailStatus: 'skipped',
-        modmailSkippedReason: 'missing_subreddit_name',
-      };
+      result.modmailStatus = 'skipped';
+      result.modmailSkippedReason = 'missing_subreddit_name';
+      return result;
     }
 
     if (!args.postLink) {
-      return {
-        modmailStatus: 'skipped',
-        modmailSkippedReason: 'missing_post_link',
-      };
+      result.modmailStatus = 'skipped';
+      result.modmailSkippedReason = 'missing_post_link';
+      return result;
     }
 
     try {
@@ -147,18 +183,22 @@ export async function applyModerationAction(
 
       await sendRemovalModmail(modmailArgs);
 
-      return {
-        modmailStatus: 'sent',
-        modmailSentAt: Date.now(),
-      };
+      result.modmailStatus = 'sent';
+      result.modmailSentAt = Date.now();
+      return result;
     } catch (err: unknown) {
-      return {
-        modmailStatus: 'failed',
-        modmailErrorMessage: err instanceof Error ? err.message : String(err),
-        modmailError: err,
-      };
+      result.modmailStatus = 'failed';
+      result.modmailErrorMessage =
+        err instanceof Error ? err.message : String(err);
+      result.modmailError = err;
+      return result;
     }
   }
 
-  return { modmailStatus: 'not_applicable' };
+  return {
+    actionStatus: 'failed',
+    actionErrorMessage: 'Unsupported moderation action.',
+    removalNoteStatus: 'not_applicable',
+    modmailStatus: 'not_applicable',
+  };
 }
