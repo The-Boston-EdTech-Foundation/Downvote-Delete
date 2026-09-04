@@ -28,7 +28,7 @@ Downvote Delete will not:
 
 ## Patch Notes
 
-- 2.2.1 - Properly integrated Firebase for upvote_ratio tracking. Devvit 0.14.2
+- 2.2.1 - Properly integrated Firebase for upvote_ratio tracking. Bug fixes on upvote_ratio below 0.24. Devvit 0.14.2
 - 2.1.2 - Republished with authorized Official API Workaround. Devvit 0.14.1
 - 2.0.3 - Updated to Official API Resource
 - 2.0.1 - Reddit API Router replaces the use of AI workaround. Devvit 0.13.10
