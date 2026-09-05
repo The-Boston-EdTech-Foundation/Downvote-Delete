@@ -240,12 +240,13 @@ describe('settings normalization', () => {
       'At what negative score should we action a post?'
     );
     expect(subredditSettings.actionToTake).toMatchObject({
-      label: 'Once it reaches the negative score, what should happen?',
+      label:
+        'When a post is downvoted to the negative score, what should happen?',
       defaultValue: 'remove',
       options: [
         { label: 'Report to ModQueue', value: 'report' },
         { label: 'Filter (Report and Hide)', value: 'filter' },
-        { label: 'Remove and Lock Comments', value: 'remove' },
+        { label: 'Remove the Post, Lock the Comments', value: 'remove' },
       ],
     });
     expect(subredditSettings.moderatorPostHandling.label).toBe(
