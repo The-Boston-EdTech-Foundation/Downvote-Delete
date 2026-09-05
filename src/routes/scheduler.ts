@@ -10,7 +10,7 @@ import type { T3 } from '@devvit/shared-types/tid.js';
 import {
   applyModerationAction,
   buildActionReason,
-  REMOVAL_MODMAIL_SUBJECT,
+  REMOVAL_PRIVATE_MESSAGE_SUBJECT,
   type ModerationActionArgs,
   type ModerationActionResult,
 } from '../core/actions';
@@ -960,8 +960,9 @@ async function actionTrackedPost(args: {
 
   let moderationActionResult: ModerationActionResult = {
     actionStatus: 'failed',
+    postLockStatus: 'not_applicable',
     removalNoteStatus: 'not_applicable',
-    modmailStatus: 'not_applicable',
+    privateMessageStatus: 'not_applicable',
   };
 
   try {
@@ -985,12 +986,12 @@ async function actionTrackedPost(args: {
     }
 
     if (actionRecord.actionToTake === 'remove') {
-      logInfo('Preparing removal modmail notification.', {
+      logInfo('Preparing removal direct message notification.', {
         postId: args.postId,
         authorName: actionRecord.authorName,
         subredditName: actionRecord.subredditName,
         postLink,
-        subject: REMOVAL_MODMAIL_SUBJECT,
+        subject: REMOVAL_PRIVATE_MESSAGE_SUBJECT,
       });
     }
 
@@ -1063,30 +1064,39 @@ async function actionTrackedPost(args: {
     return;
   }
 
-  if (moderationActionResult.modmailStatus === 'sent') {
-    logInfo('Removal modmail notification sent.', {
+  if (moderationActionResult.privateMessageStatus === 'sent') {
+    logInfo('Removal direct message notification sent.', {
       postId: args.postId,
       authorName: actionRecord.authorName,
       subredditName: actionRecord.subredditName,
-      modmailSentAt: moderationActionResult.modmailSentAt,
+      privateMessageSentAt: moderationActionResult.privateMessageSentAt,
     });
-  } else if (moderationActionResult.modmailStatus === 'failed') {
+  } else if (moderationActionResult.privateMessageStatus === 'failed') {
     logError(
-      'Removal modmail notification failed.',
+      'Removal direct message notification failed.',
       {
         postId: args.postId,
         authorName: actionRecord.authorName,
         subredditName: actionRecord.subredditName,
-        modmailErrorMessage: moderationActionResult.modmailErrorMessage,
+        privateMessageErrorMessage:
+          moderationActionResult.privateMessageErrorMessage,
       },
-      moderationActionResult.modmailError
+      moderationActionResult.privateMessageError
     );
-  } else if (moderationActionResult.modmailStatus === 'skipped') {
-    logWarn('Removal modmail notification skipped.', {
+  } else if (moderationActionResult.privateMessageStatus === 'skipped') {
+    logWarn('Removal direct message notification skipped.', {
       postId: args.postId,
       authorName: actionRecord.authorName,
       subredditName: actionRecord.subredditName,
-      reason: moderationActionResult.modmailSkippedReason,
+      reason: moderationActionResult.privateMessageSkippedReason,
+    });
+  }
+
+  if (moderationActionResult.postLockStatus === 'failed') {
+    logWarn('Post lock failed; removal still succeeded.', {
+      postId: args.postId,
+      actionAttemptId,
+      error: moderationActionResult.postLockErrorMessage,
     });
   }
 
@@ -1108,26 +1118,34 @@ async function actionTrackedPost(args: {
     updatedAt: completedAt,
   };
 
+  actionedRecord.postLockStatus = moderationActionResult.postLockStatus;
   actionedRecord.removalNoteStatus = moderationActionResult.removalNoteStatus;
-  actionedRecord.modmailStatus = moderationActionResult.modmailStatus;
+  actionedRecord.privateMessageStatus =
+    moderationActionResult.privateMessageStatus;
+
+  if (typeof moderationActionResult.postLockErrorMessage === 'string') {
+    actionedRecord.postLockErrorMessage =
+      moderationActionResult.postLockErrorMessage;
+  }
 
   if (typeof moderationActionResult.removalNoteErrorMessage === 'string') {
     actionedRecord.removalNoteErrorMessage =
       moderationActionResult.removalNoteErrorMessage;
   }
 
-  if (typeof moderationActionResult.modmailSentAt === 'number') {
-    actionedRecord.modmailSentAt = moderationActionResult.modmailSentAt;
+  if (typeof moderationActionResult.privateMessageSentAt === 'number') {
+    actionedRecord.privateMessageSentAt =
+      moderationActionResult.privateMessageSentAt;
   }
 
-  if (typeof moderationActionResult.modmailSkippedReason === 'string') {
-    actionedRecord.modmailSkippedReason =
-      moderationActionResult.modmailSkippedReason;
+  if (typeof moderationActionResult.privateMessageSkippedReason === 'string') {
+    actionedRecord.privateMessageSkippedReason =
+      moderationActionResult.privateMessageSkippedReason;
   }
 
-  if (typeof moderationActionResult.modmailErrorMessage === 'string') {
-    actionedRecord.modmailErrorMessage =
-      moderationActionResult.modmailErrorMessage;
+  if (typeof moderationActionResult.privateMessageErrorMessage === 'string') {
+    actionedRecord.privateMessageErrorMessage =
+      moderationActionResult.privateMessageErrorMessage;
   }
 
   try {

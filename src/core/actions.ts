@@ -8,9 +8,9 @@ import {
 
 type RedditClient = typeof reddit;
 
-export const REMOVAL_MODMAIL_SUBJECT = 'Your post has been removed';
+export const REMOVAL_PRIVATE_MESSAGE_SUBJECT = 'Your post has been removed';
 
-export type RemovalModmailInput = {
+export type RemovalPrivateMessageInput = {
   username: string;
   subredditName: string;
   postLink: string;
@@ -20,13 +20,15 @@ export type RemovalModmailInput = {
 export type ModerationActionResult = {
   actionStatus: 'succeeded' | 'failed';
   actionErrorMessage?: string;
+  postLockStatus: 'not_applicable' | 'locked' | 'failed';
+  postLockErrorMessage?: string;
   removalNoteStatus: 'not_applicable' | 'added' | 'failed';
   removalNoteErrorMessage?: string;
-  modmailStatus: 'not_applicable' | 'sent' | 'skipped' | 'failed';
-  modmailSentAt?: number;
-  modmailSkippedReason?: string;
-  modmailErrorMessage?: string;
-  modmailError?: unknown;
+  privateMessageStatus: 'not_applicable' | 'sent' | 'skipped' | 'failed';
+  privateMessageSentAt?: number;
+  privateMessageSkippedReason?: string;
+  privateMessageErrorMessage?: string;
+  privateMessageError?: unknown;
 };
 
 export type ModerationActionArgs = {
@@ -56,8 +58,8 @@ export function buildActionReason(
   return `Removed for ${threshold} Downvote Karma`;
 }
 
-export function buildRemovedForDownvotesModmailBody(
-  input: RemovalModmailInput
+export function buildRemovedForDownvotesPrivateMessageBody(
+  input: RemovalPrivateMessageInput
 ): string {
   return `Hi u/${input.username},
 
@@ -71,14 +73,14 @@ Please review the [community rules](https://reddit.com/r/${input.subredditName}/
 *Removed post: ${input.postLink}*`;
 }
 
-export async function sendRemovalModmail(args: {
+export async function sendRemovalPrivateMessage(args: {
   redditClient: RedditClient;
   username: string;
   subredditName: string;
   postLink: string;
   explanation?: string;
 }): Promise<void> {
-  const bodyInput: RemovalModmailInput = {
+  const bodyInput: RemovalPrivateMessageInput = {
     username: args.username,
     subredditName: args.subredditName,
     postLink: args.postLink,
@@ -88,12 +90,10 @@ export async function sendRemovalModmail(args: {
     bodyInput.explanation = args.explanation;
   }
 
-  await args.redditClient.modMail.createConversation({
-    subredditName: args.subredditName,
-    subject: REMOVAL_MODMAIL_SUBJECT,
-    body: buildRemovedForDownvotesModmailBody(bodyInput),
-    to: `u/${args.username}`,
-    isAuthorHidden: true,
+  await args.redditClient.sendPrivateMessage({
+    to: args.username,
+    subject: REMOVAL_PRIVATE_MESSAGE_SUBJECT,
+    text: buildRemovedForDownvotesPrivateMessageBody(bodyInput),
   });
 }
 
@@ -109,14 +109,16 @@ export async function applyModerationAction(
       return {
         actionStatus: 'failed',
         actionErrorMessage: errors.join('; '),
+        postLockStatus: 'not_applicable',
         removalNoteStatus: 'not_applicable',
-        modmailStatus: 'not_applicable',
+        privateMessageStatus: 'not_applicable',
       };
     }
     return {
       actionStatus: 'succeeded',
+      postLockStatus: 'not_applicable',
       removalNoteStatus: 'not_applicable',
-      modmailStatus: 'not_applicable',
+      privateMessageStatus: 'not_applicable',
     };
   }
 
@@ -124,12 +126,22 @@ export async function applyModerationAction(
     await args.post.filter({ reason, keep: false });
     return {
       actionStatus: 'succeeded',
+      postLockStatus: 'not_applicable',
       removalNoteStatus: 'not_applicable',
-      modmailStatus: 'not_applicable',
+      privateMessageStatus: 'not_applicable',
     };
   }
 
   if (args.action === ACTION_REMOVE) {
+    let postLockStatus: ModerationActionResult['postLockStatus'] = 'locked';
+    let postLockErrorMessage: string | undefined;
+    try {
+      await args.post.lock();
+    } catch (err: unknown) {
+      postLockStatus = 'failed';
+      postLockErrorMessage = err instanceof Error ? err.message : String(err);
+    }
+
     await args.post.remove(false);
     let removalNoteStatus: ModerationActionResult['removalNoteStatus'] =
       'added';
@@ -144,33 +156,39 @@ export async function applyModerationAction(
 
     const result: ModerationActionResult = {
       actionStatus: 'succeeded',
+      postLockStatus,
       removalNoteStatus,
-      modmailStatus: 'not_applicable',
+      privateMessageStatus: 'not_applicable',
     };
+    if (postLockErrorMessage) {
+      result.postLockErrorMessage = postLockErrorMessage;
+    }
     if (removalNoteErrorMessage) {
       result.removalNoteErrorMessage = removalNoteErrorMessage;
     }
 
     if (!args.authorName) {
-      result.modmailStatus = 'skipped';
-      result.modmailSkippedReason = 'missing_author_name';
+      result.privateMessageStatus = 'skipped';
+      result.privateMessageSkippedReason = 'missing_author_name';
       return result;
     }
 
     if (!args.subredditName) {
-      result.modmailStatus = 'skipped';
-      result.modmailSkippedReason = 'missing_subreddit_name';
+      result.privateMessageStatus = 'skipped';
+      result.privateMessageSkippedReason = 'missing_subreddit_name';
       return result;
     }
 
     if (!args.postLink) {
-      result.modmailStatus = 'skipped';
-      result.modmailSkippedReason = 'missing_post_link';
+      result.privateMessageStatus = 'skipped';
+      result.privateMessageSkippedReason = 'missing_post_link';
       return result;
     }
 
     try {
-      const modmailArgs: Parameters<typeof sendRemovalModmail>[0] = {
+      const privateMessageArgs: Parameters<
+        typeof sendRemovalPrivateMessage
+      >[0] = {
         redditClient: args.redditClient,
         username: args.authorName,
         subredditName: args.subredditName,
@@ -178,19 +196,19 @@ export async function applyModerationAction(
       };
 
       if (args.removalExplanation) {
-        modmailArgs.explanation = args.removalExplanation;
+        privateMessageArgs.explanation = args.removalExplanation;
       }
 
-      await sendRemovalModmail(modmailArgs);
+      await sendRemovalPrivateMessage(privateMessageArgs);
 
-      result.modmailStatus = 'sent';
-      result.modmailSentAt = Date.now();
+      result.privateMessageStatus = 'sent';
+      result.privateMessageSentAt = Date.now();
       return result;
     } catch (err: unknown) {
-      result.modmailStatus = 'failed';
-      result.modmailErrorMessage =
+      result.privateMessageStatus = 'failed';
+      result.privateMessageErrorMessage =
         err instanceof Error ? err.message : String(err);
-      result.modmailError = err;
+      result.privateMessageError = err;
       return result;
     }
   }
@@ -198,7 +216,8 @@ export async function applyModerationAction(
   return {
     actionStatus: 'failed',
     actionErrorMessage: 'Unsupported moderation action.',
+    postLockStatus: 'not_applicable',
     removalNoteStatus: 'not_applicable',
-    modmailStatus: 'not_applicable',
+    privateMessageStatus: 'not_applicable',
   };
 }

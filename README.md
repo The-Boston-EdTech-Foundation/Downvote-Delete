@@ -10,10 +10,9 @@ Downvote Delete will:
 
 - Watch new posts for 2, 4, or 6 hours.
 - Detect when a post reaches configured negative scores (-1 through -5).
-- Apply the installation's selected action when either the Reddit score or the
-  conservative ratio model reaches that configured threshold.
 - Remove the post, hide it in ModQueue with Filter, or leave it visible and
   report it to ModQueue for moderator review.
+- Lock removed posts to prevent more comments
 - Stops watching posts that grow positively (+3, +5 or +10).
 - Ignore manually approved posts.
 - Stop tracking posts that are already removed, filtered, spammed, deleted, or unavailable.
@@ -36,6 +35,7 @@ Downvote Delete will not:
 
 ## Patch Notes
 
+- 2.3.1 - Proper use of DMs for removals. Deleted posts are also locked. Clearer app settings options.
 - 2.2.1 - Properly integrated Firebase for upvote_ratio tracking. Bug fixes on upvote_ratio below 0.24. Devvit 0.14.2
 - 2.1.2 - Republished with authorized Official API Workaround. Devvit 0.14.1
 - 2.0.3 - Updated to Official API Resource
@@ -52,6 +52,3 @@ Downvote Delete will not:
 ## Fetch Domains
 
 - downvote-delete-upvote-ratio.firebaseapp.com - Used to access the Reddit API for upvote_ratio data, not yet exposed with Devvit.
-
-The Firebase ratio-router endpoint is fixed by the app. Installations configure
-only the matching HMAC secret; custom router URLs are not accepted.

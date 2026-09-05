@@ -84,9 +84,16 @@ export type TrackedPost = {
   attemptedAction?: DownvoteDeleteAction;
   actionOutcome?: 'succeeded' | 'failed' | 'unknown';
   actionErrorMessage?: string;
+  postLockStatus?: 'not_applicable' | 'locked' | 'failed';
+  postLockErrorMessage?: string;
   removalNoteStatus?: 'not_applicable' | 'added' | 'failed';
   removalNoteErrorMessage?: string;
   actionedAt?: number;
+  privateMessageStatus?: 'not_applicable' | 'sent' | 'skipped' | 'failed';
+  privateMessageSentAt?: number;
+  privateMessageSkippedReason?: string;
+  privateMessageErrorMessage?: string;
+  // Legacy fields remain readable for audit records written before DM delivery.
   modmailStatus?: 'not_applicable' | 'sent' | 'skipped' | 'failed';
   modmailSentAt?: number;
   modmailSkippedReason?: string;
@@ -109,7 +116,12 @@ export const statsKey = (subredditId: string): string =>
   `downvote-delete:stats:${subredditId}`;
 
 export function serializeTrackedPost(record: TrackedPost): string {
-  return JSON.stringify(record);
+  const serializedRecord: Record<string, unknown> = { ...record };
+  delete serializedRecord.modmailStatus;
+  delete serializedRecord.modmailSentAt;
+  delete serializedRecord.modmailSkippedReason;
+  delete serializedRecord.modmailErrorMessage;
+  return JSON.stringify(serializedRecord);
 }
 
 export type TrackedPostParseResult =
@@ -224,6 +236,7 @@ function validateTrackedPost(raw: unknown): string | undefined {
       'actionRecoveryJobId',
       'actionRecoveryRunToken',
       'actionErrorMessage',
+      'postLockErrorMessage',
       'removalNoteErrorMessage',
       'lastAuthenticatedRatioError',
       'lastAuthenticatedRatioRawName',
@@ -231,6 +244,8 @@ function validateTrackedPost(raw: unknown): string | undefined {
       'lastRawRatioPercent',
       'stopReason',
       'errorMessage',
+      'privateMessageSkippedReason',
+      'privateMessageErrorMessage',
       'modmailSkippedReason',
       'modmailErrorMessage',
     ],
@@ -262,6 +277,7 @@ function validateTrackedPost(raw: unknown): string | undefined {
       'lastCalculatedVoteScore',
       'negativeDecisionScore',
       'actionedAt',
+      'privateMessageSentAt',
       'modmailSentAt',
       'actionStartedAt',
       'actionCompletedAt',
@@ -325,7 +341,9 @@ function validateTrackedPost(raw: unknown): string | undefined {
       ],
     ],
     ['negativeDecisionSource', ['reddit_score', 'calculated_votes']],
+    ['privateMessageStatus', ['not_applicable', 'sent', 'skipped', 'failed']],
     ['modmailStatus', ['not_applicable', 'sent', 'skipped', 'failed']],
+    ['postLockStatus', ['not_applicable', 'locked', 'failed']],
     ['removalNoteStatus', ['not_applicable', 'added', 'failed']],
     ['attemptedAction', actionValues],
     ['actionOutcome', ['succeeded', 'failed', 'unknown']],

@@ -1,8 +1,9 @@
 import { describe, expect, test, vi } from 'vitest';
+import devvitConfig from '../devvit.json';
 import {
   applyModerationAction,
-  buildRemovedForDownvotesModmailBody,
-  REMOVAL_MODMAIL_SUBJECT,
+  buildRemovedForDownvotesPrivateMessageBody,
+  REMOVAL_PRIVATE_MESSAGE_SUBJECT,
 } from '../src/core/actions';
 import { resolveActionRecovery } from '../src/core/actionLifecycle';
 import { getNextCheckDelayMinutes } from '../src/core/backoff';
@@ -74,28 +75,48 @@ type ApplyModerationActionArgs = Parameters<typeof applyModerationAction>[0];
 
 function mockPost(
   overrides: Partial<{
+    actionCalls: string[];
     filterCalls: string[];
+    lockCalls: number;
     removalNotes: unknown[];
     removeCalls: boolean[];
+    failLock: boolean;
     failRemovalNote: boolean;
   }> = {}
 ): ApplyModerationActionArgs['post'] & {
+  actionCalls: string[];
   filterCalls: string[];
+  lockCalls: number;
   removalNotes: unknown[];
   removeCalls: boolean[];
 } {
+  const actionCalls = overrides.actionCalls ?? [];
   const filterCalls = overrides.filterCalls ?? [];
+  let lockCalls = overrides.lockCalls ?? 0;
   const removalNotes = overrides.removalNotes ?? [];
   const removeCalls = overrides.removeCalls ?? [];
+  const failLock = overrides.failLock ?? false;
   const failRemovalNote = overrides.failRemovalNote ?? false;
   const post = {
+    actionCalls,
     filterCalls,
+    get lockCalls(): number {
+      return lockCalls;
+    },
     removalNotes,
     removeCalls,
     async filter(options: { reason?: string; keep?: boolean }): Promise<void> {
       filterCalls.push(`${options.reason}|${options.keep}`);
     },
+    async lock(): Promise<void> {
+      actionCalls.push('lock');
+      lockCalls += 1;
+      if (failLock) {
+        throw new Error('post lock unavailable');
+      }
+    },
     async remove(isSpam: boolean): Promise<void> {
+      actionCalls.push('remove');
       removeCalls.push(isSpam);
     },
     async addRemovalNote(note: unknown): Promise<void> {
@@ -107,7 +128,9 @@ function mockPost(
   };
 
   return post as unknown as ApplyModerationActionArgs['post'] & {
+    actionCalls: string[];
     filterCalls: string[];
+    lockCalls: number;
     removalNotes: unknown[];
     removeCalls: boolean[];
   };
@@ -115,17 +138,20 @@ function mockPost(
 
 function mockRedditClient(
   args: {
-    failModmail?: boolean;
+    failPrivateMessage?: boolean;
     reportErrors?: string[];
   } = {}
 ): ApplyModerationActionArgs['redditClient'] & {
   reports: unknown[];
+  privateMessages: unknown[];
   modmailConversations: unknown[];
 } {
   const reports: unknown[] = [];
+  const privateMessages: unknown[] = [];
   const modmailConversations: unknown[] = [];
   const client = {
     reports,
+    privateMessages,
     modmailConversations,
     async report(
       post: unknown,
@@ -136,19 +162,23 @@ function mockRedditClient(
       reports.push({ post, reportArgs });
       return { json: { errors: args.reportErrors ?? [] } };
     },
+    async sendPrivateMessage(message: unknown): Promise<void> {
+      privateMessages.push(message);
+
+      if (args.failPrivateMessage) {
+        throw new Error('private message unavailable');
+      }
+    },
     modMail: {
       createConversation: async (conversation: unknown): Promise<void> => {
         modmailConversations.push(conversation);
-
-        if (args.failModmail) {
-          throw new Error('modmail unavailable');
-        }
       },
     },
   };
 
   return client as unknown as ApplyModerationActionArgs['redditClient'] & {
     reports: unknown[];
+    privateMessages: unknown[];
     modmailConversations: unknown[];
   };
 }
@@ -189,6 +219,43 @@ function postSnapshot(overrides: Partial<PostSnapshot> = {}): PostSnapshot {
 }
 
 describe('settings normalization', () => {
+  test('presents subreddit settings in the requested order and wording', () => {
+    const subredditSettings = devvitConfig.settings.subreddit;
+
+    expect(Object.keys(subredditSettings)).toEqual([
+      'isActive',
+      'trackingDurationHours',
+      'positiveScoreStopThreshold',
+      'negativeScoreThreshold',
+      'actionToTake',
+      'moderatorPostHandling',
+    ]);
+    expect(subredditSettings.trackingDurationHours.label).toBe(
+      'How long should post scores be tracked?'
+    );
+    expect(subredditSettings.positiveScoreStopThreshold.label).toBe(
+      'At what positive score should we stop tracking posts?'
+    );
+    expect(subredditSettings.negativeScoreThreshold.label).toBe(
+      'At what negative score should we action a post?'
+    );
+    expect(subredditSettings.actionToTake).toMatchObject({
+      label: 'Once it reaches the negative score, what should happen?',
+      defaultValue: 'remove',
+      options: [
+        { label: 'Report to ModQueue', value: 'report' },
+        { label: 'Filter (Report and Hide)', value: 'filter' },
+        { label: 'Remove and Lock Comments', value: 'remove' },
+      ],
+    });
+    expect(subredditSettings.moderatorPostHandling.label).toBe(
+      'What should happen if a moderator post is downvoted?'
+    );
+    expect(subredditSettings.trackingDurationHours.defaultValue).toBe('4');
+    expect(subredditSettings.positiveScoreStopThreshold.defaultValue).toBe('5');
+    expect(subredditSettings.negativeScoreThreshold.defaultValue).toBe('-2');
+  });
+
   test('defaults tracking duration to 4 hours when unset', () => {
     expect(normalizeSettings({}).trackingDurationHours).toBe(4);
   });
@@ -1557,6 +1624,55 @@ describe('vote ratio confidence model', () => {
 });
 
 describe('tracked post decisions', () => {
+  test('validates and persists post lock audit fields', () => {
+    const serialized = serializeTrackedPost(
+      trackedPost({
+        postLockStatus: 'failed',
+        postLockErrorMessage: 'post lock unavailable',
+      })
+    );
+
+    expect(parseTrackedPost(serialized)).toMatchObject({
+      postLockStatus: 'failed',
+      postLockErrorMessage: 'post lock unavailable',
+    });
+    expect(
+      parseTrackedPostResult(
+        JSON.stringify({ ...trackedPost(), postLockStatus: 'unknown' })
+      )
+    ).toEqual({ ok: false, error: 'invalid_postLockStatus' });
+  });
+
+  test('reads legacy modmail audit fields but omits them from new writes', () => {
+    const legacyValue = JSON.stringify({
+      ...trackedPost(),
+      modmailStatus: 'failed',
+      modmailSentAt: now,
+      modmailSkippedReason: 'legacy_skip',
+      modmailErrorMessage: 'legacy_error',
+    });
+    const legacyRecord = parseTrackedPost(legacyValue);
+
+    expect(legacyRecord).toMatchObject({
+      modmailStatus: 'failed',
+      modmailSentAt: now,
+      modmailSkippedReason: 'legacy_skip',
+      modmailErrorMessage: 'legacy_error',
+    });
+
+    const serialized = serializeTrackedPost({
+      ...legacyRecord!,
+      privateMessageStatus: 'sent',
+      privateMessageSentAt: now + 1,
+    });
+
+    expect(JSON.parse(serialized)).toMatchObject({
+      privateMessageStatus: 'sent',
+      privateMessageSentAt: now + 1,
+    });
+    expect(serialized).not.toContain('modmail');
+  });
+
   test('keeps legacy router sources readable and persists new Firebase sources', () => {
     const legacyRecord = parseTrackedPost(
       serializeTrackedPost(
@@ -1944,9 +2060,9 @@ describe('moderator handling', () => {
   });
 });
 
-describe('removal modmail notifications', () => {
-  test('builds the requested removal modmail body', () => {
-    const body = buildRemovedForDownvotesModmailBody({
+describe('removal private message notifications', () => {
+  test('builds the requested removal private message body', () => {
+    const body = buildRemovedForDownvotesPrivateMessageBody({
       username: 'someUser',
       subredditName: 'mySubreddit',
       postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
@@ -1972,7 +2088,7 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
 *Removed post: https://reddit.com/r/mySubreddit/comments/abc123*`);
   });
 
-  test('sends modmail after a successful remove action', async () => {
+  test('sends a direct message after a successful remove action', async () => {
     const redditClient = mockRedditClient();
     const post = mockPost();
 
@@ -1987,30 +2103,79 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     });
 
     expect(post.removeCalls).toEqual([false]);
+    expect(post.lockCalls).toBe(1);
+    expect(post.actionCalls).toEqual(['lock', 'remove']);
     expect(post.removalNotes).toEqual([
       { reasonId: '', modNote: 'Removed for -3 Downvote Karma' },
     ]);
-    expect(redditClient.modmailConversations).toEqual([
+    expect(redditClient.privateMessages).toEqual([
       {
-        subredditName: 'mySubreddit',
-        subject: REMOVAL_MODMAIL_SUBJECT,
-        body: buildRemovedForDownvotesModmailBody({
+        to: 'someUser',
+        subject: REMOVAL_PRIVATE_MESSAGE_SUBJECT,
+        text: buildRemovedForDownvotesPrivateMessageBody({
           username: 'someUser',
           subredditName: 'mySubreddit',
           postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
         }),
-        to: 'u/someUser',
-        isAuthorHidden: true,
       },
     ]);
-    expect(result.modmailSentAt).toEqual(expect.any(Number));
+    expect(redditClient.modmailConversations).toEqual([]);
+    expect(result.privateMessageSentAt).toEqual(expect.any(Number));
     expect(result.actionStatus).toBe('succeeded');
+    expect(result.postLockStatus).toBe('locked');
     expect(result.removalNoteStatus).toBe('added');
-    expect(result.modmailStatus).toBe('sent');
-    expect(result.modmailErrorMessage).toBeUndefined();
+    expect(result.privateMessageStatus).toBe('sent');
+    expect(result.privateMessageErrorMessage).toBeUndefined();
   });
 
-  test('uses default modmail wording for ratio removal reasons', async () => {
+  test('sends a direct message to a moderator author', async () => {
+    const redditClient = mockRedditClient();
+
+    const result = await applyModerationAction({
+      redditClient,
+      post: mockPost(),
+      action: ACTION_REMOVE,
+      threshold: -3,
+      authorName: 'moderatorUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(redditClient.privateMessages).toEqual([
+      expect.objectContaining({ to: 'moderatorUser' }),
+    ]);
+    expect(redditClient.modmailConversations).toEqual([]);
+    expect(result.privateMessageStatus).toBe('sent');
+  });
+
+  test('removes and notifies when locking the post fails', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost({ failLock: true });
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.actionCalls).toEqual(['lock', 'remove']);
+    expect(post.removeCalls).toEqual([false]);
+    expect(post.removalNotes).toHaveLength(1);
+    expect(redditClient.privateMessages).toHaveLength(1);
+    expect(result).toMatchObject({
+      actionStatus: 'succeeded',
+      postLockStatus: 'failed',
+      postLockErrorMessage: 'post lock unavailable',
+      removalNoteStatus: 'added',
+      privateMessageStatus: 'sent',
+    });
+  });
+
+  test('uses default private message wording for ratio removal reasons', async () => {
     const redditClient = mockRedditClient();
     const post = mockPost();
 
@@ -2028,30 +2193,31 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     expect(post.removalNotes).toEqual([
       { reasonId: '', modNote: 'Removed for downvote ratio threshold' },
     ]);
-    expect(redditClient.modmailConversations[0]).toMatchObject({
-      body: expect.stringContaining(
+    expect(redditClient.privateMessages[0]).toMatchObject({
+      text: expect.stringContaining(
         'Your post was removed because it received too much negative community feedback.'
       ),
     });
-    expect(redditClient.modmailConversations[0]).not.toEqual(
+    expect(redditClient.privateMessages[0]).not.toEqual(
       expect.objectContaining({
-        body: expect.stringContaining('reported upvote ratio'),
+        text: expect.stringContaining('reported upvote ratio'),
       })
     );
-    expect(redditClient.modmailConversations[0]).not.toEqual(
+    expect(redditClient.privateMessages[0]).not.toEqual(
       expect.objectContaining({
-        body: expect.stringContaining('estimated minimum vote spread'),
+        text: expect.stringContaining('estimated minimum vote spread'),
       })
     );
   });
 
-  test('does not send modmail for report or filter actions', async () => {
+  test('does not send a direct message for report or filter actions', async () => {
     const reportClient = mockRedditClient();
     const filterClient = mockRedditClient();
+    const reportPost = mockPost();
 
     const reportResult = await applyModerationAction({
       redditClient: reportClient,
-      post: mockPost(),
+      post: reportPost,
       action: ACTION_REPORT,
       threshold: -3,
       authorName: 'someUser',
@@ -2070,6 +2236,10 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
       postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
     });
 
+    expect(reportClient.privateMessages).toEqual([]);
+    expect(filterClient.privateMessages).toEqual([]);
+    expect(reportPost.lockCalls).toBe(0);
+    expect(filteredPost.lockCalls).toBe(0);
     expect(reportClient.modmailConversations).toEqual([]);
     expect(filterClient.modmailConversations).toEqual([]);
     expect(filteredPost.filterCalls).toEqual([
@@ -2077,13 +2247,15 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     ]);
     expect(reportResult).toEqual({
       actionStatus: 'succeeded',
+      postLockStatus: 'not_applicable',
       removalNoteStatus: 'not_applicable',
-      modmailStatus: 'not_applicable',
+      privateMessageStatus: 'not_applicable',
     });
     expect(filterResult).toEqual({
       actionStatus: 'succeeded',
+      postLockStatus: 'not_applicable',
       removalNoteStatus: 'not_applicable',
-      modmailStatus: 'not_applicable',
+      privateMessageStatus: 'not_applicable',
     });
   });
 
@@ -2103,12 +2275,13 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     expect(result).toEqual({
       actionStatus: 'failed',
       actionErrorMessage: 'RATELIMIT: try again later',
+      postLockStatus: 'not_applicable',
       removalNoteStatus: 'not_applicable',
-      modmailStatus: 'not_applicable',
+      privateMessageStatus: 'not_applicable',
     });
   });
 
-  test('missing username skips modmail without failing removal', async () => {
+  test('missing username skips direct message without failing removal', async () => {
     const redditClient = mockRedditClient();
     const post = mockPost();
 
@@ -2122,16 +2295,17 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     });
 
     expect(post.removeCalls).toEqual([false]);
-    expect(redditClient.modmailConversations).toEqual([]);
+    expect(redditClient.privateMessages).toEqual([]);
     expect(result).toEqual({
       actionStatus: 'succeeded',
+      postLockStatus: 'locked',
       removalNoteStatus: 'added',
-      modmailStatus: 'skipped',
-      modmailSkippedReason: 'missing_author_name',
+      privateMessageStatus: 'skipped',
+      privateMessageSkippedReason: 'missing_author_name',
     });
   });
 
-  test('missing subreddit skips modmail without failing removal', async () => {
+  test('missing subreddit skips direct message without failing removal', async () => {
     const redditClient = mockRedditClient();
     const post = mockPost();
 
@@ -2145,16 +2319,17 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     });
 
     expect(post.removeCalls).toEqual([false]);
-    expect(redditClient.modmailConversations).toEqual([]);
+    expect(redditClient.privateMessages).toEqual([]);
     expect(result).toEqual({
       actionStatus: 'succeeded',
+      postLockStatus: 'locked',
       removalNoteStatus: 'added',
-      modmailStatus: 'skipped',
-      modmailSkippedReason: 'missing_subreddit_name',
+      privateMessageStatus: 'skipped',
+      privateMessageSkippedReason: 'missing_subreddit_name',
     });
   });
 
-  test('missing post link skips modmail without failing removal', async () => {
+  test('missing post link skips direct message without failing removal', async () => {
     const redditClient = mockRedditClient();
     const post = mockPost();
 
@@ -2168,17 +2343,18 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     });
 
     expect(post.removeCalls).toEqual([false]);
-    expect(redditClient.modmailConversations).toEqual([]);
+    expect(redditClient.privateMessages).toEqual([]);
     expect(result).toEqual({
       actionStatus: 'succeeded',
+      postLockStatus: 'locked',
       removalNoteStatus: 'added',
-      modmailStatus: 'skipped',
-      modmailSkippedReason: 'missing_post_link',
+      privateMessageStatus: 'skipped',
+      privateMessageSkippedReason: 'missing_post_link',
     });
   });
 
-  test('modmail failure does not fail the remove action', async () => {
-    const redditClient = mockRedditClient({ failModmail: true });
+  test('direct message failure does not fail the remove action', async () => {
+    const redditClient = mockRedditClient({ failPrivateMessage: true });
     const post = mockPost();
 
     const result = await applyModerationAction({
@@ -2195,10 +2371,13 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     expect(post.removalNotes).toEqual([
       { reasonId: '', modNote: 'Removed for -3 Downvote Karma' },
     ]);
-    expect(redditClient.modmailConversations).toHaveLength(1);
-    expect(result.modmailStatus).toBe('failed');
-    expect(result.modmailErrorMessage).toBe('modmail unavailable');
-    expect(result.modmailError).toBeInstanceOf(Error);
+    expect(redditClient.privateMessages).toHaveLength(1);
+    expect(redditClient.modmailConversations).toEqual([]);
+    expect(result.privateMessageStatus).toBe('failed');
+    expect(result.privateMessageErrorMessage).toBe(
+      'private message unavailable'
+    );
+    expect(result.privateMessageError).toBeInstanceOf(Error);
     expect(result.actionStatus).toBe('succeeded');
   });
 
