@@ -17,6 +17,11 @@ export type RemovalPrivateMessageInput = {
   explanation?: string;
 };
 
+export type RemovalCommentInput = {
+  subredditName: string;
+  explanation?: string;
+};
+
 export type ModerationActionResult = {
   actionStatus: 'succeeded' | 'failed';
   actionErrorMessage?: string;
@@ -29,6 +34,15 @@ export type ModerationActionResult = {
   privateMessageSkippedReason?: string;
   privateMessageErrorMessage?: string;
   privateMessageError?: unknown;
+  removalCommentStatus: 'not_applicable' | 'added' | 'skipped' | 'failed';
+  removalCommentAddedAt?: number;
+  removalCommentId?: string;
+  removalCommentSkippedReason?: string;
+  removalCommentErrorMessage?: string;
+  removalCommentError?: unknown;
+  removalCommentStyleStatus: 'not_applicable' | 'styled' | 'failed';
+  removalCommentStyleErrorMessage?: string;
+  removalCommentStyleError?: unknown;
 };
 
 export type ModerationActionArgs = {
@@ -38,6 +52,8 @@ export type ModerationActionArgs = {
   threshold: number;
   reason?: string;
   removalExplanation?: string;
+  sendRemovalDirectMessage?: boolean;
+  leaveRemovalComment?: boolean;
   authorName?: string;
   subredditName?: string;
   postLink?: string;
@@ -71,6 +87,16 @@ Please review the [community rules](https://reddit.com/r/${input.subredditName}/
 
 
 *Removed post: ${input.postLink}*`;
+}
+
+export function buildRemovedForDownvotesCommentBody(
+  input: RemovalCommentInput
+): string {
+  return `${input.explanation ?? 'Your post was removed because it received too much negative community feedback.'}
+
+Posts may be downvoted for many reasons, including rule issues, content quality, or controversial opinions. This removal helps prevent your account from accumulating additional negative karma from the post.
+
+Please review the [community rules](https://reddit.com/r/${input.subredditName}/about/rules) before posting again.`;
 }
 
 export async function sendRemovalPrivateMessage(args: {
@@ -112,6 +138,8 @@ export async function applyModerationAction(
         postLockStatus: 'not_applicable',
         removalNoteStatus: 'not_applicable',
         privateMessageStatus: 'not_applicable',
+        removalCommentStatus: 'not_applicable',
+        removalCommentStyleStatus: 'not_applicable',
       };
     }
     return {
@@ -119,6 +147,8 @@ export async function applyModerationAction(
       postLockStatus: 'not_applicable',
       removalNoteStatus: 'not_applicable',
       privateMessageStatus: 'not_applicable',
+      removalCommentStatus: 'not_applicable',
+      removalCommentStyleStatus: 'not_applicable',
     };
   }
 
@@ -129,6 +159,8 @@ export async function applyModerationAction(
       postLockStatus: 'not_applicable',
       removalNoteStatus: 'not_applicable',
       privateMessageStatus: 'not_applicable',
+      removalCommentStatus: 'not_applicable',
+      removalCommentStyleStatus: 'not_applicable',
     };
   }
 
@@ -159,12 +191,60 @@ export async function applyModerationAction(
       postLockStatus,
       removalNoteStatus,
       privateMessageStatus: 'not_applicable',
+      removalCommentStatus: 'not_applicable',
+      removalCommentStyleStatus: 'not_applicable',
     };
     if (postLockErrorMessage) {
       result.postLockErrorMessage = postLockErrorMessage;
     }
     if (removalNoteErrorMessage) {
       result.removalNoteErrorMessage = removalNoteErrorMessage;
+    }
+
+    if (args.leaveRemovalComment ?? false) {
+      if (!args.subredditName) {
+        result.removalCommentStatus = 'skipped';
+        result.removalCommentSkippedReason = 'missing_subreddit_name';
+      } else {
+        try {
+          const comment = await args.post.addComment({
+            text: buildRemovedForDownvotesCommentBody({
+              subredditName: args.subredditName,
+              ...(args.removalExplanation
+                ? { explanation: args.removalExplanation }
+                : {}),
+            }),
+            runAs: 'APP',
+          });
+          result.removalCommentStatus = 'added';
+          result.removalCommentAddedAt = Date.now();
+          result.removalCommentId = String(comment.id);
+
+          try {
+            await comment.distinguish(true);
+            result.removalCommentStyleStatus = 'styled';
+          } catch (err: unknown) {
+            result.removalCommentStyleStatus = 'failed';
+            result.removalCommentStyleErrorMessage =
+              err instanceof Error ? err.message : String(err);
+            result.removalCommentStyleError = err;
+          }
+        } catch (err: unknown) {
+          result.removalCommentStatus = 'failed';
+          result.removalCommentErrorMessage =
+            err instanceof Error ? err.message : String(err);
+          result.removalCommentError = err;
+        }
+      }
+    } else {
+      result.removalCommentStatus = 'skipped';
+      result.removalCommentSkippedReason = 'disabled_by_settings';
+    }
+
+    if (!(args.sendRemovalDirectMessage ?? true)) {
+      result.privateMessageStatus = 'skipped';
+      result.privateMessageSkippedReason = 'disabled_by_settings';
+      return result;
     }
 
     if (!args.authorName) {
@@ -219,5 +299,7 @@ export async function applyModerationAction(
     postLockStatus: 'not_applicable',
     removalNoteStatus: 'not_applicable',
     privateMessageStatus: 'not_applicable',
+    removalCommentStatus: 'not_applicable',
+    removalCommentStyleStatus: 'not_applicable',
   };
 }

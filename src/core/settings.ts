@@ -22,6 +22,8 @@ export type DownvoteDeleteSettings = {
   negativeScoreThreshold: -1 | -2 | -3 | -4 | -5;
   positiveScoreStopThreshold: 3 | 5 | 10;
   actionToTake: DownvoteDeleteAction;
+  sendRemovalDirectMessage: boolean;
+  leaveRemovalComment: boolean;
   moderatorPostHandling: ModeratorPostHandling;
 };
 
@@ -31,6 +33,8 @@ export const defaultSettings: DownvoteDeleteSettings = {
   negativeScoreThreshold: -2,
   positiveScoreStopThreshold: 5,
   actionToTake: ACTION_REMOVE,
+  sendRemovalDirectMessage: true,
+  leaveRemovalComment: false,
   moderatorPostHandling: MODERATOR_IGNORE,
 };
 
@@ -98,6 +102,12 @@ export function summarizeSubredditSettingsShapes(
       values.positiveScoreStopThreshold
     ),
     actionToTake: summarizeSettingsValueShape(values.actionToTake),
+    sendRemovalDirectMessage: summarizeSettingsValueShape(
+      values.sendRemovalDirectMessage
+    ),
+    leaveRemovalComment: summarizeSettingsValueShape(
+      values.leaveRemovalComment
+    ),
     moderatorPostHandling: summarizeSettingsValueShape(
       values.moderatorPostHandling
     ),
@@ -135,6 +145,18 @@ export function normalizeSettings(
       validActions,
       defaultSettings.actionToTake
     ),
+    sendRemovalDirectMessage:
+      selectString(
+        values.sendRemovalDirectMessage,
+        ['yes', 'no'] as const,
+        defaultSettings.sendRemovalDirectMessage ? 'yes' : 'no'
+      ) === 'yes',
+    leaveRemovalComment:
+      selectString(
+        values.leaveRemovalComment,
+        ['yes', 'no'] as const,
+        defaultSettings.leaveRemovalComment ? 'yes' : 'no'
+      ) === 'yes',
     moderatorPostHandling: selectString(
       values.moderatorPostHandling,
       validModeratorHandling,

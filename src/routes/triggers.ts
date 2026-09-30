@@ -77,6 +77,8 @@ async function readSettings(): Promise<DownvoteDeleteSettings> {
       negativeScoreThreshold: currentSettings.negativeScoreThreshold,
       positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
       actionToTake: currentSettings.actionToTake,
+      sendRemovalDirectMessage: currentSettings.sendRemovalDirectMessage,
+      leaveRemovalComment: currentSettings.leaveRemovalComment,
       moderatorPostHandling: currentSettings.moderatorPostHandling,
       rawSettingShapes: summarizeSubredditSettingsShapes(rawSettings),
     });
@@ -166,6 +168,8 @@ triggers.post('/on-post-submit', async (c) => {
       negativeScoreThreshold: currentSettings.negativeScoreThreshold,
       positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
       actionToTake: currentSettings.actionToTake,
+      sendRemovalDirectMessage: currentSettings.sendRemovalDirectMessage,
+      leaveRemovalComment: currentSettings.leaveRemovalComment,
       moderatorPostHandling: currentSettings.moderatorPostHandling,
       status: 'active',
       updatedAt: now,
@@ -195,6 +199,8 @@ triggers.post('/on-post-submit', async (c) => {
       negativeScoreThreshold: record.negativeScoreThreshold,
       positiveScoreStopThreshold: record.positiveScoreStopThreshold,
       actionToTake: record.actionToTake,
+      sendRemovalDirectMessage: record.sendRemovalDirectMessage,
+      leaveRemovalComment: record.leaveRemovalComment,
     });
 
     const firstRunAt = getNextCheckRunAt(record.checkCount, now);

@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from 'vitest';
 import devvitConfig from '../devvit.json';
 import {
   applyModerationAction,
+  buildRemovedForDownvotesCommentBody,
   buildRemovedForDownvotesPrivateMessageBody,
   REMOVAL_PRIVATE_MESSAGE_SUBJECT,
 } from '../src/core/actions';
@@ -68,6 +69,8 @@ const activeSettings: DownvoteDeleteSettings = {
   negativeScoreThreshold: -3,
   positiveScoreStopThreshold: 5,
   actionToTake: ACTION_REMOVE,
+  sendRemovalDirectMessage: true,
+  leaveRemovalComment: false,
   moderatorPostHandling: MODERATOR_IGNORE,
 };
 
@@ -79,24 +82,31 @@ function mockPost(
     filterCalls: string[];
     lockCalls: number;
     removalNotes: unknown[];
+    comments: unknown[];
     removeCalls: boolean[];
     failLock: boolean;
     failRemovalNote: boolean;
+    failComment: boolean;
+    failCommentStyle: boolean;
   }> = {}
 ): ApplyModerationActionArgs['post'] & {
   actionCalls: string[];
   filterCalls: string[];
   lockCalls: number;
   removalNotes: unknown[];
+  comments: unknown[];
   removeCalls: boolean[];
 } {
   const actionCalls = overrides.actionCalls ?? [];
   const filterCalls = overrides.filterCalls ?? [];
   let lockCalls = overrides.lockCalls ?? 0;
   const removalNotes = overrides.removalNotes ?? [];
+  const comments = overrides.comments ?? [];
   const removeCalls = overrides.removeCalls ?? [];
   const failLock = overrides.failLock ?? false;
   const failRemovalNote = overrides.failRemovalNote ?? false;
+  const failComment = overrides.failComment ?? false;
+  const failCommentStyle = overrides.failCommentStyle ?? false;
   const post = {
     actionCalls,
     filterCalls,
@@ -104,6 +114,7 @@ function mockPost(
       return lockCalls;
     },
     removalNotes,
+    comments,
     removeCalls,
     async filter(options: { reason?: string; keep?: boolean }): Promise<void> {
       filterCalls.push(`${options.reason}|${options.keep}`);
@@ -125,6 +136,22 @@ function mockPost(
         throw new Error('removal note unavailable');
       }
     },
+    async addComment(comment: unknown): Promise<unknown> {
+      actionCalls.push('comment');
+      comments.push(comment);
+      if (failComment) {
+        throw new Error('comment unavailable');
+      }
+      return {
+        id: 't1_removal_comment',
+        async distinguish(makeSticky?: boolean): Promise<void> {
+          actionCalls.push(`distinguish:${String(makeSticky)}`);
+          if (failCommentStyle) {
+            throw new Error('comment styling unavailable');
+          }
+        },
+      };
+    },
   };
 
   return post as unknown as ApplyModerationActionArgs['post'] & {
@@ -132,6 +159,7 @@ function mockPost(
     filterCalls: string[];
     lockCalls: number;
     removalNotes: unknown[];
+    comments: unknown[];
     removeCalls: boolean[];
   };
 }
@@ -228,6 +256,8 @@ describe('settings normalization', () => {
       'positiveScoreStopThreshold',
       'negativeScoreThreshold',
       'actionToTake',
+      'sendRemovalDirectMessage',
+      'leaveRemovalComment',
       'moderatorPostHandling',
     ]);
     expect(subredditSettings.trackingDurationHours.label).toBe(
@@ -252,6 +282,31 @@ describe('settings normalization', () => {
     expect(subredditSettings.moderatorPostHandling.label).toBe(
       'What should happen if a moderator post is downvoted?'
     );
+    expect(subredditSettings.sendRemovalDirectMessage).toMatchObject({
+      label: 'Should we send a direct message to users when a post is removed?',
+      defaultValue: 'yes',
+      options: [
+        {
+          label: 'Yes, DM the user their post was removed.',
+          value: 'yes',
+        },
+        { label: 'No, do not notify the user', value: 'no' },
+      ],
+    });
+    expect(subredditSettings.leaveRemovalComment).toMatchObject({
+      label: 'Should we leave a comment on the post when it is removed?',
+      defaultValue: 'no',
+      options: [
+        {
+          label: 'No, do not leave a comment on the removed post',
+          value: 'no',
+        },
+        {
+          label: 'Yes, leave a comment on the removed post',
+          value: 'yes',
+        },
+      ],
+    });
     expect(subredditSettings.trackingDurationHours.defaultValue).toBe('4');
     expect(subredditSettings.positiveScoreStopThreshold.defaultValue).toBe('5');
     expect(subredditSettings.negativeScoreThreshold.defaultValue).toBe('-2');
@@ -259,6 +314,53 @@ describe('settings normalization', () => {
 
   test('defaults tracking duration to 4 hours when unset', () => {
     expect(normalizeSettings({}).trackingDurationHours).toBe(4);
+  });
+
+  test('defaults to direct messages without removal comments', () => {
+    expect(normalizeSettings({})).toMatchObject({
+      sendRemovalDirectMessage: true,
+      leaveRemovalComment: false,
+    });
+  });
+
+  test.each<[string | string[], boolean]>([
+    ['yes', true],
+    ['no', false],
+    [['yes'], true],
+    [['no'], false],
+  ])(
+    'normalizes direct message setting %j',
+    (sendRemovalDirectMessage, expected) => {
+      expect(normalizeSettings({ sendRemovalDirectMessage })).toMatchObject({
+        sendRemovalDirectMessage: expected,
+      });
+    }
+  );
+
+  test.each<[string | string[], boolean]>([
+    ['yes', true],
+    ['no', false],
+    [['yes'], true],
+    [['no'], false],
+  ])(
+    'normalizes removal comment setting %j',
+    (leaveRemovalComment, expected) => {
+      expect(normalizeSettings({ leaveRemovalComment })).toMatchObject({
+        leaveRemovalComment: expected,
+      });
+    }
+  );
+
+  test('uses notification defaults for invalid selections', () => {
+    expect(
+      normalizeSettings({
+        sendRemovalDirectMessage: 'sometimes',
+        leaveRemovalComment: [],
+      })
+    ).toMatchObject({
+      sendRemovalDirectMessage: true,
+      leaveRemovalComment: false,
+    });
   });
 
   test.each([2, 4, 6] as const)(
@@ -1644,6 +1746,38 @@ describe('tracked post decisions', () => {
     ).toEqual({ ok: false, error: 'invalid_postLockStatus' });
   });
 
+  test('validates and persists removal notification settings and audit fields', () => {
+    const serialized = serializeTrackedPost(
+      trackedPost({
+        sendRemovalDirectMessage: false,
+        leaveRemovalComment: true,
+        removalCommentStatus: 'added',
+        removalCommentAddedAt: now,
+        removalCommentId: 't1_comment',
+        removalCommentStyleStatus: 'styled',
+      })
+    );
+
+    expect(parseTrackedPost(serialized)).toMatchObject({
+      sendRemovalDirectMessage: false,
+      leaveRemovalComment: true,
+      removalCommentStatus: 'added',
+      removalCommentAddedAt: now,
+      removalCommentId: 't1_comment',
+      removalCommentStyleStatus: 'styled',
+    });
+    expect(
+      parseTrackedPostResult(
+        JSON.stringify({ ...trackedPost(), removalCommentStatus: 'unknown' })
+      )
+    ).toEqual({ ok: false, error: 'invalid_removalCommentStatus' });
+    expect(
+      parseTrackedPostResult(
+        JSON.stringify({ ...trackedPost(), leaveRemovalComment: 'yes' })
+      )
+    ).toEqual({ ok: false, error: 'invalid_leaveRemovalComment' });
+  });
+
   test('reads legacy modmail audit fields but omits them from new writes', () => {
     const legacyValue = JSON.stringify({
       ...trackedPost(),
@@ -1939,7 +2073,28 @@ describe('tracked post decisions', () => {
       refreshTrackedPostActionSettings(staleRecord, currentSettings)
     ).toMatchObject({
       negativeScoreThreshold: -1,
+      sendRemovalDirectMessage: true,
+      leaveRemovalComment: false,
       trackingExpiresAt: staleRecord.trackingExpiresAt,
+    });
+  });
+
+  test('refreshes removal notification settings for an existing tracked post', () => {
+    const staleRecord = trackedPost({
+      sendRemovalDirectMessage: true,
+      leaveRemovalComment: false,
+    });
+    const currentSettings: DownvoteDeleteSettings = {
+      ...activeSettings,
+      sendRemovalDirectMessage: false,
+      leaveRemovalComment: true,
+    };
+
+    expect(
+      refreshTrackedPostActionSettings(staleRecord, currentSettings)
+    ).toMatchObject({
+      sendRemovalDirectMessage: false,
+      leaveRemovalComment: true,
     });
   });
 
@@ -2089,6 +2244,19 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
 *Removed post: https://reddit.com/r/mySubreddit/comments/abc123*`);
   });
 
+  test('builds a public removal comment without the private greeting or post link', () => {
+    const body = buildRemovedForDownvotesCommentBody({
+      subredditName: 'mySubreddit',
+    });
+
+    expect(body).toContain(
+      'Your post was removed because it received too much negative community feedback.'
+    );
+    expect(body).toContain('https://reddit.com/r/mySubreddit/about/rules');
+    expect(body).not.toContain('Hi u/');
+    expect(body).not.toContain('Removed post:');
+  });
+
   test('sends a direct message after a successful remove action', async () => {
     const redditClient = mockRedditClient();
     const post = mockPost();
@@ -2147,6 +2315,177 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     ]);
     expect(redditClient.modmailConversations).toEqual([]);
     expect(result.privateMessageStatus).toBe('sent');
+  });
+
+  test('adds, distinguishes, and stickies a configured removal comment', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost();
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      sendRemovalDirectMessage: false,
+      leaveRemovalComment: true,
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.actionCalls).toEqual([
+      'lock',
+      'remove',
+      'comment',
+      'distinguish:true',
+    ]);
+    expect(post.comments).toEqual([
+      {
+        text: buildRemovedForDownvotesCommentBody({
+          subredditName: 'mySubreddit',
+        }),
+        runAs: 'APP',
+      },
+    ]);
+    expect(redditClient.privateMessages).toEqual([]);
+    expect(result).toMatchObject({
+      actionStatus: 'succeeded',
+      privateMessageStatus: 'skipped',
+      privateMessageSkippedReason: 'disabled_by_settings',
+      removalCommentStatus: 'added',
+      removalCommentId: 't1_removal_comment',
+      removalCommentAddedAt: expect.any(Number),
+      removalCommentStyleStatus: 'styled',
+    });
+  });
+
+  test('can send both configured removal notifications', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost();
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      sendRemovalDirectMessage: true,
+      leaveRemovalComment: true,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.comments).toHaveLength(1);
+    expect(redditClient.privateMessages).toHaveLength(1);
+    expect(result).toMatchObject({
+      privateMessageStatus: 'sent',
+      removalCommentStatus: 'added',
+      removalCommentStyleStatus: 'styled',
+    });
+  });
+
+  test('can disable both removal notifications', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost();
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      sendRemovalDirectMessage: false,
+      leaveRemovalComment: false,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.comments).toEqual([]);
+    expect(redditClient.privateMessages).toEqual([]);
+    expect(result).toMatchObject({
+      privateMessageStatus: 'skipped',
+      privateMessageSkippedReason: 'disabled_by_settings',
+      removalCommentStatus: 'skipped',
+      removalCommentSkippedReason: 'disabled_by_settings',
+      removalCommentStyleStatus: 'not_applicable',
+    });
+  });
+
+  test('missing author skips only the direct message', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost();
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      leaveRemovalComment: true,
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.comments).toHaveLength(1);
+    expect(redditClient.privateMessages).toEqual([]);
+    expect(result).toMatchObject({
+      privateMessageStatus: 'skipped',
+      privateMessageSkippedReason: 'missing_author_name',
+      removalCommentStatus: 'added',
+      removalCommentStyleStatus: 'styled',
+    });
+  });
+
+  test('comment creation failure does not block the direct message or removal', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost({ failComment: true });
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      leaveRemovalComment: true,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.removeCalls).toEqual([false]);
+    expect(redditClient.privateMessages).toHaveLength(1);
+    expect(result).toMatchObject({
+      actionStatus: 'succeeded',
+      privateMessageStatus: 'sent',
+      removalCommentStatus: 'failed',
+      removalCommentErrorMessage: 'comment unavailable',
+      removalCommentStyleStatus: 'not_applicable',
+    });
+    expect(result.removalCommentError).toBeInstanceOf(Error);
+  });
+
+  test('comment styling failure preserves the added comment and direct message', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost({ failCommentStyle: true });
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      leaveRemovalComment: true,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.comments).toHaveLength(1);
+    expect(redditClient.privateMessages).toHaveLength(1);
+    expect(result).toMatchObject({
+      actionStatus: 'succeeded',
+      privateMessageStatus: 'sent',
+      removalCommentStatus: 'added',
+      removalCommentStyleStatus: 'failed',
+      removalCommentStyleErrorMessage: 'comment styling unavailable',
+    });
+    expect(result.removalCommentStyleError).toBeInstanceOf(Error);
   });
 
   test('removes and notifies when locking the post fails', async () => {
@@ -2221,6 +2560,8 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
       post: reportPost,
       action: ACTION_REPORT,
       threshold: -3,
+      sendRemovalDirectMessage: true,
+      leaveRemovalComment: true,
       authorName: 'someUser',
       subredditName: 'mySubreddit',
       postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
@@ -2232,6 +2573,8 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
       post: filteredPost,
       action: ACTION_FILTER,
       threshold: -3,
+      sendRemovalDirectMessage: true,
+      leaveRemovalComment: true,
       authorName: 'someUser',
       subredditName: 'mySubreddit',
       postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
@@ -2239,6 +2582,8 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
 
     expect(reportClient.privateMessages).toEqual([]);
     expect(filterClient.privateMessages).toEqual([]);
+    expect(reportPost.comments).toEqual([]);
+    expect(filteredPost.comments).toEqual([]);
     expect(reportPost.lockCalls).toBe(0);
     expect(filteredPost.lockCalls).toBe(0);
     expect(reportClient.modmailConversations).toEqual([]);
@@ -2251,12 +2596,16 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
       postLockStatus: 'not_applicable',
       removalNoteStatus: 'not_applicable',
       privateMessageStatus: 'not_applicable',
+      removalCommentStatus: 'not_applicable',
+      removalCommentStyleStatus: 'not_applicable',
     });
     expect(filterResult).toEqual({
       actionStatus: 'succeeded',
       postLockStatus: 'not_applicable',
       removalNoteStatus: 'not_applicable',
       privateMessageStatus: 'not_applicable',
+      removalCommentStatus: 'not_applicable',
+      removalCommentStyleStatus: 'not_applicable',
     });
   });
 
@@ -2279,6 +2628,8 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
       postLockStatus: 'not_applicable',
       removalNoteStatus: 'not_applicable',
       privateMessageStatus: 'not_applicable',
+      removalCommentStatus: 'not_applicable',
+      removalCommentStyleStatus: 'not_applicable',
     });
   });
 
@@ -2303,6 +2654,9 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
       removalNoteStatus: 'added',
       privateMessageStatus: 'skipped',
       privateMessageSkippedReason: 'missing_author_name',
+      removalCommentStatus: 'skipped',
+      removalCommentSkippedReason: 'disabled_by_settings',
+      removalCommentStyleStatus: 'not_applicable',
     });
   });
 
@@ -2327,6 +2681,9 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
       removalNoteStatus: 'added',
       privateMessageStatus: 'skipped',
       privateMessageSkippedReason: 'missing_subreddit_name',
+      removalCommentStatus: 'skipped',
+      removalCommentSkippedReason: 'disabled_by_settings',
+      removalCommentStyleStatus: 'not_applicable',
     });
   });
 
@@ -2351,6 +2708,9 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
       removalNoteStatus: 'added',
       privateMessageStatus: 'skipped',
       privateMessageSkippedReason: 'missing_post_link',
+      removalCommentStatus: 'skipped',
+      removalCommentSkippedReason: 'disabled_by_settings',
+      removalCommentStyleStatus: 'not_applicable',
     });
   });
 

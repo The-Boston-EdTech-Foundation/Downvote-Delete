@@ -71,6 +71,8 @@ export type TrackedPost = {
   negativeScoreThreshold: number;
   positiveScoreStopThreshold: number;
   actionToTake: DownvoteDeleteAction;
+  sendRemovalDirectMessage?: boolean;
+  leaveRemovalComment?: boolean;
   moderatorPostHandling: ModeratorPostHandling;
   status: TrackingStatus;
   lastJobId?: string;
@@ -93,6 +95,13 @@ export type TrackedPost = {
   privateMessageSentAt?: number;
   privateMessageSkippedReason?: string;
   privateMessageErrorMessage?: string;
+  removalCommentStatus?: 'not_applicable' | 'added' | 'skipped' | 'failed';
+  removalCommentAddedAt?: number;
+  removalCommentId?: string;
+  removalCommentSkippedReason?: string;
+  removalCommentErrorMessage?: string;
+  removalCommentStyleStatus?: 'not_applicable' | 'styled' | 'failed';
+  removalCommentStyleErrorMessage?: string;
   // Legacy fields remain readable for audit records written before DM delivery.
   modmailStatus?: 'not_applicable' | 'sent' | 'skipped' | 'failed';
   modmailSentAt?: number;
@@ -246,6 +255,10 @@ function validateTrackedPost(raw: unknown): string | undefined {
       'errorMessage',
       'privateMessageSkippedReason',
       'privateMessageErrorMessage',
+      'removalCommentId',
+      'removalCommentSkippedReason',
+      'removalCommentErrorMessage',
+      'removalCommentStyleErrorMessage',
       'modmailSkippedReason',
       'modmailErrorMessage',
     ],
@@ -278,6 +291,7 @@ function validateTrackedPost(raw: unknown): string | undefined {
       'negativeDecisionScore',
       'actionedAt',
       'privateMessageSentAt',
+      'removalCommentAddedAt',
       'modmailSentAt',
       'actionStartedAt',
       'actionCompletedAt',
@@ -290,7 +304,12 @@ function validateTrackedPost(raw: unknown): string | undefined {
 
   const invalidBoolean = invalidOptional(
     raw,
-    ['lastAuthenticatedRatioReceived', 'lastAuthenticatedRatioHideScore'],
+    [
+      'lastAuthenticatedRatioReceived',
+      'lastAuthenticatedRatioHideScore',
+      'sendRemovalDirectMessage',
+      'leaveRemovalComment',
+    ],
     (value) => typeof value === 'boolean'
   );
   if (invalidBoolean) {
@@ -342,6 +361,8 @@ function validateTrackedPost(raw: unknown): string | undefined {
     ],
     ['negativeDecisionSource', ['reddit_score', 'calculated_votes']],
     ['privateMessageStatus', ['not_applicable', 'sent', 'skipped', 'failed']],
+    ['removalCommentStatus', ['not_applicable', 'added', 'skipped', 'failed']],
+    ['removalCommentStyleStatus', ['not_applicable', 'styled', 'failed']],
     ['modmailStatus', ['not_applicable', 'sent', 'skipped', 'failed']],
     ['postLockStatus', ['not_applicable', 'locked', 'failed']],
     ['removalNoteStatus', ['not_applicable', 'added', 'failed']],
@@ -403,6 +424,8 @@ export function refreshTrackedPostActionSettings(
     negativeScoreThreshold: settings.negativeScoreThreshold,
     positiveScoreStopThreshold: settings.positiveScoreStopThreshold,
     actionToTake: settings.actionToTake,
+    sendRemovalDirectMessage: settings.sendRemovalDirectMessage,
+    leaveRemovalComment: settings.leaveRemovalComment,
     moderatorPostHandling: settings.moderatorPostHandling,
   };
 }

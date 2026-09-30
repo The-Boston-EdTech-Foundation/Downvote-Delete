@@ -489,6 +489,10 @@ function mergeFreshActionFields(
   actionRecord.positiveScoreStopThreshold =
     recordForAction.positiveScoreStopThreshold;
   actionRecord.actionToTake = recordForAction.actionToTake;
+  actionRecord.sendRemovalDirectMessage =
+    recordForAction.sendRemovalDirectMessage ?? true;
+  actionRecord.leaveRemovalComment =
+    recordForAction.leaveRemovalComment ?? false;
   actionRecord.moderatorPostHandling = recordForAction.moderatorPostHandling;
 
   if (typeof recordForAction.lastKnownScore === 'number') {
@@ -946,6 +950,8 @@ async function actionTrackedPost(args: {
     actionAttemptId,
     recoveryJobId: preparedRecord.actionRecoveryJobId,
     actionToTake: actionRecord.actionToTake,
+    sendRemovalDirectMessage: actionRecord.sendRemovalDirectMessage,
+    leaveRemovalComment: actionRecord.leaveRemovalComment,
     score: args.currentSnapshot?.score,
     calculatedVoteScore: args.negativeDecision?.calculatedVoteScore,
     negativeDecisionScore: args.negativeDecision?.score,
@@ -963,6 +969,8 @@ async function actionTrackedPost(args: {
     postLockStatus: 'not_applicable',
     removalNoteStatus: 'not_applicable',
     privateMessageStatus: 'not_applicable',
+    removalCommentStatus: 'not_applicable',
+    removalCommentStyleStatus: 'not_applicable',
   };
 
   try {
@@ -979,6 +987,8 @@ async function actionTrackedPost(args: {
       subredditName: actionRecord.subredditName,
       postLink,
       reason: args.actionReason,
+      sendRemovalDirectMessage: actionRecord.sendRemovalDirectMessage ?? true,
+      leaveRemovalComment: actionRecord.leaveRemovalComment ?? false,
     };
 
     if (actionRecord.authorName) {
@@ -986,12 +996,14 @@ async function actionTrackedPost(args: {
     }
 
     if (actionRecord.actionToTake === 'remove') {
-      logInfo('Preparing removal direct message notification.', {
+      logInfo('Preparing configured removal notifications.', {
         postId: args.postId,
         authorName: actionRecord.authorName,
         subredditName: actionRecord.subredditName,
         postLink,
         subject: REMOVAL_PRIVATE_MESSAGE_SUBJECT,
+        sendRemovalDirectMessage: moderationActionArgs.sendRemovalDirectMessage,
+        leaveRemovalComment: moderationActionArgs.leaveRemovalComment,
       });
     }
 
@@ -1092,6 +1104,42 @@ async function actionTrackedPost(args: {
     });
   }
 
+  if (moderationActionResult.removalCommentStatus === 'added') {
+    logInfo('Removal comment notification added.', {
+      postId: args.postId,
+      subredditName: actionRecord.subredditName,
+      removalCommentId: moderationActionResult.removalCommentId,
+      removalCommentAddedAt: moderationActionResult.removalCommentAddedAt,
+      removalCommentStyleStatus:
+        moderationActionResult.removalCommentStyleStatus,
+    });
+  } else if (moderationActionResult.removalCommentStatus === 'failed') {
+    logError(
+      'Removal comment notification failed.',
+      {
+        postId: args.postId,
+        subredditName: actionRecord.subredditName,
+        removalCommentErrorMessage:
+          moderationActionResult.removalCommentErrorMessage,
+      },
+      moderationActionResult.removalCommentError
+    );
+  } else if (moderationActionResult.removalCommentStatus === 'skipped') {
+    logInfo('Removal comment notification skipped.', {
+      postId: args.postId,
+      subredditName: actionRecord.subredditName,
+      reason: moderationActionResult.removalCommentSkippedReason,
+    });
+  }
+
+  if (moderationActionResult.removalCommentStyleStatus === 'failed') {
+    logWarn('Removal comment was added but could not be styled.', {
+      postId: args.postId,
+      removalCommentId: moderationActionResult.removalCommentId,
+      error: moderationActionResult.removalCommentStyleErrorMessage,
+    });
+  }
+
   if (moderationActionResult.postLockStatus === 'failed') {
     logWarn('Post lock failed; removal still succeeded.', {
       postId: args.postId,
@@ -1122,6 +1170,10 @@ async function actionTrackedPost(args: {
   actionedRecord.removalNoteStatus = moderationActionResult.removalNoteStatus;
   actionedRecord.privateMessageStatus =
     moderationActionResult.privateMessageStatus;
+  actionedRecord.removalCommentStatus =
+    moderationActionResult.removalCommentStatus;
+  actionedRecord.removalCommentStyleStatus =
+    moderationActionResult.removalCommentStyleStatus;
 
   if (typeof moderationActionResult.postLockErrorMessage === 'string') {
     actionedRecord.postLockErrorMessage =
@@ -1146,6 +1198,32 @@ async function actionTrackedPost(args: {
   if (typeof moderationActionResult.privateMessageErrorMessage === 'string') {
     actionedRecord.privateMessageErrorMessage =
       moderationActionResult.privateMessageErrorMessage;
+  }
+
+  if (typeof moderationActionResult.removalCommentAddedAt === 'number') {
+    actionedRecord.removalCommentAddedAt =
+      moderationActionResult.removalCommentAddedAt;
+  }
+
+  if (typeof moderationActionResult.removalCommentId === 'string') {
+    actionedRecord.removalCommentId = moderationActionResult.removalCommentId;
+  }
+
+  if (typeof moderationActionResult.removalCommentSkippedReason === 'string') {
+    actionedRecord.removalCommentSkippedReason =
+      moderationActionResult.removalCommentSkippedReason;
+  }
+
+  if (typeof moderationActionResult.removalCommentErrorMessage === 'string') {
+    actionedRecord.removalCommentErrorMessage =
+      moderationActionResult.removalCommentErrorMessage;
+  }
+
+  if (
+    typeof moderationActionResult.removalCommentStyleErrorMessage === 'string'
+  ) {
+    actionedRecord.removalCommentStyleErrorMessage =
+      moderationActionResult.removalCommentStyleErrorMessage;
   }
 
   try {
@@ -1300,6 +1378,8 @@ scheduledJobs.post('/check-watched-post', async (c) => {
         negativeScoreThreshold: currentSettings.negativeScoreThreshold,
         positiveScoreStopThreshold: currentSettings.positiveScoreStopThreshold,
         actionToTake: currentSettings.actionToTake,
+        sendRemovalDirectMessage: currentSettings.sendRemovalDirectMessage,
+        leaveRemovalComment: currentSettings.leaveRemovalComment,
         moderatorPostHandling: currentSettings.moderatorPostHandling,
         firebaseRouterConfigured: firebaseRouterConfig !== null,
         firebaseRouterHost: FIREBASE_RATIO_ROUTER_HOST,
@@ -1331,6 +1411,10 @@ scheduledJobs.post('/check-watched-post', async (c) => {
           activeRecord.positiveScoreStopThreshold,
         storedActionToTake: initialRecord.actionToTake,
         activeActionToTake: activeRecord.actionToTake,
+        storedSendRemovalDirectMessage: initialRecord.sendRemovalDirectMessage,
+        activeSendRemovalDirectMessage: activeRecord.sendRemovalDirectMessage,
+        storedLeaveRemovalComment: initialRecord.leaveRemovalComment,
+        activeLeaveRemovalComment: activeRecord.leaveRemovalComment,
         trackingExpiresAt: new Date(activeRecord.trackingExpiresAt),
       });
 

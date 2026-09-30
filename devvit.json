@@ -73,6 +73,33 @@
         ],
         "defaultValue": "remove"
       },
+      "sendRemovalDirectMessage": {
+        "type": "select",
+        "label": "Should we send a direct message to users when a post is removed?",
+        "options": [
+          {
+            "label": "Yes, DM the user their post was removed.",
+            "value": "yes"
+          },
+          { "label": "No, do not notify the user", "value": "no" }
+        ],
+        "defaultValue": "yes"
+      },
+      "leaveRemovalComment": {
+        "type": "select",
+        "label": "Should we leave a comment on the post when it is removed?",
+        "options": [
+          {
+            "label": "No, do not leave a comment on the removed post",
+            "value": "no"
+          },
+          {
+            "label": "Yes, leave a comment on the removed post",
+            "value": "yes"
+          }
+        ],
+        "defaultValue": "no"
+      },
       "moderatorPostHandling": {
         "type": "select",
         "label": "What should happen if a moderator post is downvoted?",

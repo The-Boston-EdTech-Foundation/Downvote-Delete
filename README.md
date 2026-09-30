@@ -13,6 +13,8 @@ Downvote Delete will:
 - Remove the post, hide it in ModQueue with Filter, or leave it visible and
   report it to ModQueue for moderator review.
 - Lock removed posts to prevent more comments
+- Optionally notify authors by direct message, a distinguished sticky comment,
+  both, or neither when their post is removed.
 - Stops watching posts that grow positively (+3, +5 or +10).
 - Ignore manually approved posts.
 - Stop tracking posts that are already removed, filtered, spammed, deleted, or unavailable.
@@ -35,6 +37,7 @@ Downvote Delete will not:
 
 ## Patch Notes
 
+- 2.4.1 - The app can now leave a comment on removed posts. Added subreddit controls for DMs and Comments. Devvit 0.14.5
 - 2.3.1 - Proper use of DMs for removals. Deleted posts are also locked. Clearer app settings options.
 - 2.2.1 - Properly integrated Firebase for upvote_ratio tracking. Bug fixes on upvote_ratio below 0.24. Devvit 0.14.2
 - 2.1.2 - Republished with authorized Official API Workaround. Devvit 0.14.1
