@@ -37,7 +37,7 @@ Downvote Delete will not:
 
 ## Patch Notes
 
-- 2.4.1 - The app can now leave a comment on removed posts. Added subreddit controls for DMs and Comments. Devvit 0.14.6
+- 2.4.1 - The app now leaves a comment on removed posts. Added subreddit controls for DMs and Comments. Devvit 0.14.6
 - 2.3.1 - Proper use of DMs for removals. Deleted posts are also locked. Clearer app settings options.
 - 2.2.1 - Properly integrated Firebase for upvote_ratio tracking. Bug fixes on upvote_ratio below 0.24. Devvit 0.14.2
 - 2.1.2 - Republished with authorized Official API Workaround. Devvit 0.14.1
