@@ -25,6 +25,25 @@ Filter uses Devvit's hidden-while-queued mode. Report leaves the post visible.
 Once a moderation API call begins, an ambiguous result is recorded for
 moderator review instead of automatically repeating the action.
 
+## Stored Data and Recovery
+
+Active tracking state is kept in the installation's Redis storage. Completed
+audit records expire after 30 days; aggregate counters are retained as a
+bounded summary.
+
+Older app versions created per-post audit keys without an expiration. Devvit
+does not provide applications with a way to enumerate those legacy keys, so an
+upgrade cannot retroactively expire all of them. Communities that need a full
+legacy-data cleanup must uninstall and reinstall the app (or request a Redis
+namespace reset from Devvit support). A reset also removes active tracking,
+statistics, and stored app data, so it should be scheduled and settings should
+be checked afterward.
+
+Removal recovery resumes work that had not started. Public comments can be
+reconciled against an existing app-account comment. A direct-message attempt
+whose result is ambiguous is not repeated, preventing duplicate private
+messages.
+
 ## What the app does NOT do:
 
 Downvote Delete will not:

@@ -27,6 +27,8 @@ export type ModerationActionResult = {
   actionErrorMessage?: string;
   postLockStatus: 'not_applicable' | 'locked' | 'failed';
   postLockErrorMessage?: string;
+  postUnlockStatus?: 'not_applicable' | 'unlocked' | 'failed';
+  postUnlockErrorMessage?: string;
   removalNoteStatus: 'not_applicable' | 'added' | 'failed';
   removalNoteErrorMessage?: string;
   privateMessageStatus: 'not_applicable' | 'sent' | 'skipped' | 'failed';
@@ -174,7 +176,32 @@ export async function applyModerationAction(
       postLockErrorMessage = err instanceof Error ? err.message : String(err);
     }
 
-    await args.post.remove(false);
+    try {
+      await args.post.remove(false);
+    } catch (err: unknown) {
+      const result: ModerationActionResult = {
+        actionStatus: 'failed',
+        actionErrorMessage: err instanceof Error ? err.message : String(err),
+        postLockStatus,
+        removalNoteStatus: 'not_applicable',
+        privateMessageStatus: 'not_applicable',
+        removalCommentStatus: 'not_applicable',
+        removalCommentStyleStatus: 'not_applicable',
+      };
+      if (postLockStatus === 'locked') {
+        try {
+          await args.post.unlock();
+          result.postUnlockStatus = 'unlocked';
+        } catch (unlockError: unknown) {
+          result.postUnlockStatus = 'failed';
+          result.postUnlockErrorMessage =
+            unlockError instanceof Error
+              ? unlockError.message
+              : String(unlockError);
+        }
+      }
+      return result;
+    }
     let removalNoteStatus: ModerationActionResult['removalNoteStatus'] =
       'added';
     let removalNoteErrorMessage: string | undefined;

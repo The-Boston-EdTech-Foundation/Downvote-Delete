@@ -17,6 +17,12 @@ import {
 } from '../src/core/decision';
 import { formatLogContext } from '../src/core/logging';
 import {
+  compensateUnremovedPost,
+  executeRemovalWorkflow,
+  recoverConfirmedRemoval,
+} from '../src/core/removalWorkflow';
+import {
+  AUDIT_RETENTION_SECONDS,
   finalizationClaimKey,
   finalizeTrackedPost,
 } from '../src/core/finalization';
@@ -58,6 +64,8 @@ import {
   parseTrackedPostResult,
   refreshTrackedPostActionSettings,
   serializeTrackedPost,
+  auditKey,
+  createAuditRecord,
   type TrackedPost,
 } from '../src/core/tracking';
 
@@ -85,6 +93,8 @@ function mockPost(
     comments: unknown[];
     removeCalls: boolean[];
     failLock: boolean;
+    failRemove: boolean;
+    failUnlock: boolean;
     failRemovalNote: boolean;
     failComment: boolean;
     failCommentStyle: boolean;
@@ -104,6 +114,8 @@ function mockPost(
   const comments = overrides.comments ?? [];
   const removeCalls = overrides.removeCalls ?? [];
   const failLock = overrides.failLock ?? false;
+  const failRemove = overrides.failRemove ?? false;
+  const failUnlock = overrides.failUnlock ?? false;
   const failRemovalNote = overrides.failRemovalNote ?? false;
   const failComment = overrides.failComment ?? false;
   const failCommentStyle = overrides.failCommentStyle ?? false;
@@ -129,6 +141,15 @@ function mockPost(
     async remove(isSpam: boolean): Promise<void> {
       actionCalls.push('remove');
       removeCalls.push(isSpam);
+      if (failRemove) {
+        throw new Error('post removal unavailable');
+      }
+    },
+    async unlock(): Promise<void> {
+      actionCalls.push('unlock');
+      if (failUnlock) {
+        throw new Error('post unlock unavailable');
+      }
     },
     async addRemovalNote(note: unknown): Promise<void> {
       removalNotes.push(note);
@@ -1010,12 +1031,14 @@ describe('tracked-post scheduling', () => {
 describe('idempotent terminal finalization', () => {
   function finalizationRedis(options: { throwAfterCommit?: boolean } = {}) {
     const values = new Map<string, string>();
+    const expirations = new Map<string, number>();
     const increments: string[] = [];
     let execCount = 0;
     type FinalizationTransaction = {
       multi(): Promise<void>;
       set(key: string, value: string): Promise<FinalizationTransaction>;
       hIncrBy(key: string, field: string): Promise<FinalizationTransaction>;
+      expire(key: string, seconds: number): Promise<FinalizationTransaction>;
       del(...keys: string[]): Promise<FinalizationTransaction>;
       exec(): Promise<unknown[]>;
     };
@@ -1027,6 +1050,10 @@ describe('idempotent terminal finalization', () => {
       },
       async hIncrBy(_key: string, field: string): Promise<typeof transaction> {
         increments.push(field);
+        return transaction;
+      },
+      async expire(key: string, seconds: number): Promise<typeof transaction> {
+        expirations.set(key, seconds);
         return transaction;
       },
       async del(...keys: string[]): Promise<typeof transaction> {
@@ -1061,7 +1088,13 @@ describe('idempotent terminal finalization', () => {
         return transaction;
       },
     };
-    return { values, increments, redisClient, getExecCount: () => execCount };
+    return {
+      values,
+      expirations,
+      increments,
+      redisClient,
+      getExecCount: () => execCount,
+    };
   }
 
   test('writes audit and counters only once across duplicate finalizers', async () => {
@@ -1087,6 +1120,9 @@ describe('idempotent terminal finalization', () => {
     });
     expect(state.getExecCount()).toBe(1);
     expect(state.increments).toEqual(['actioned', 'action_filter']);
+    expect(state.expirations.get(auditKey('t3_post'))).toBe(
+      AUDIT_RETENTION_SECONDS
+    );
     expect(state.values.has(finalizationClaimKey('t3_post'))).toBe(false);
   });
 
@@ -1727,6 +1763,30 @@ describe('vote ratio confidence model', () => {
 });
 
 describe('tracked post decisions', () => {
+  test('applies current notification defaults to legacy records', () => {
+    const legacy = trackedPost();
+    delete legacy.sendRemovalDirectMessage;
+    delete legacy.leaveRemovalComment;
+
+    expect(parseTrackedPost(JSON.stringify(legacy))).toMatchObject({
+      sendRemovalDirectMessage: true,
+      leaveRemovalComment: true,
+    });
+  });
+
+  test('omits user identifiers from terminal audit records', () => {
+    expect(createAuditRecord(trackedPost(), now)).toMatchObject({
+      postId: 't3_post',
+      auditedAt: now,
+    });
+    expect(createAuditRecord(trackedPost(), now)).not.toHaveProperty(
+      'authorName'
+    );
+    expect(createAuditRecord(trackedPost(), now)).not.toHaveProperty(
+      'authorId'
+    );
+  });
+
   test('validates and persists post lock audit fields', () => {
     const serialized = serializeTrackedPost(
       trackedPost({
@@ -2515,6 +2575,30 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     });
   });
 
+  test('unlocks a post when the remove call fails', async () => {
+    const redditClient = mockRedditClient();
+    const post = mockPost({ failRemove: true });
+
+    const result = await applyModerationAction({
+      redditClient,
+      post,
+      action: ACTION_REMOVE,
+      threshold: -3,
+      authorName: 'someUser',
+      subredditName: 'mySubreddit',
+      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
+    });
+
+    expect(post.actionCalls).toEqual(['lock', 'remove', 'unlock']);
+    expect(redditClient.privateMessages).toEqual([]);
+    expect(result).toMatchObject({
+      actionStatus: 'failed',
+      actionErrorMessage: 'post removal unavailable',
+      postLockStatus: 'locked',
+      postUnlockStatus: 'unlocked',
+    });
+  });
+
   test('uses default private message wording for ratio removal reasons', async () => {
     const redditClient = mockRedditClient();
     const post = mockPost();
@@ -2761,6 +2845,337 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     expect(result.actionStatus).toBe('succeeded');
     expect(result.removalNoteStatus).toBe('failed');
     expect(result.removalNoteErrorMessage).toBe('removal note unavailable');
+  });
+});
+
+describe('recoverable removal workflow', () => {
+  function workflowHarness(
+    options: {
+      failRemove?: boolean;
+      failUnlock?: boolean;
+      failRemovalNote?: boolean;
+      failComment?: boolean;
+      failCommentStyle?: boolean;
+      failDirectMessage?: boolean;
+      existingComment?: boolean;
+    } = {}
+  ) {
+    const calls: string[] = [];
+    const messages: unknown[] = [];
+    const persisted: TrackedPost[] = [];
+    const commentBody = buildRemovedForDownvotesCommentBody({
+      subredditName: 'test',
+    });
+    const comment = {
+      id: 't1_notice',
+      authorName: 'downvote-delete-app',
+      body: commentBody,
+      createdAt: new Date(now - 1_000),
+      async distinguish(sticky?: boolean): Promise<void> {
+        calls.push(`distinguish:${String(sticky)}`);
+        if (options.failCommentStyle) throw new Error('style unavailable');
+      },
+    };
+    const post = {
+      comments: {
+        async get(): Promise<unknown[]> {
+          calls.push('list-comments');
+          return options.existingComment ? [comment] : [];
+        },
+      },
+      async lock(): Promise<void> {
+        calls.push('lock');
+      },
+      async unlock(): Promise<void> {
+        calls.push('unlock');
+        if (options.failUnlock) throw new Error('unlock unavailable');
+      },
+      async remove(): Promise<void> {
+        calls.push('remove');
+        if (options.failRemove) throw new Error('remove unavailable');
+      },
+      async addRemovalNote(): Promise<void> {
+        calls.push('note');
+        if (options.failRemovalNote) throw new Error('note unavailable');
+      },
+      async addComment(): Promise<typeof comment> {
+        calls.push('comment');
+        if (options.failComment) throw new Error('comment unavailable');
+        return comment;
+      },
+    };
+    const redditClient = {
+      async getCurrentUsername(): Promise<string> {
+        return 'Downvote-Delete-App';
+      },
+      async getCommentById(): Promise<typeof comment> {
+        return comment;
+      },
+      async sendPrivateMessage(message: unknown): Promise<void> {
+        calls.push('dm');
+        messages.push(message);
+        if (options.failDirectMessage) throw new Error('dm unavailable');
+      },
+    };
+    const persist = async (record: TrackedPost): Promise<void> => {
+      persisted.push({ ...record });
+    };
+    return {
+      calls,
+      messages,
+      persisted,
+      post: post as never,
+      redditClient: redditClient as never,
+      persist,
+    };
+  }
+
+  test('persists removal stages and completes both notifications', async () => {
+    const harness = workflowHarness();
+    const result = await executeRemovalWorkflow({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: trackedPost({
+        status: 'actioning',
+        attemptedAction: 'remove',
+        actionReason: 'Removed for testing',
+        sendRemovalDirectMessage: true,
+        leaveRemovalComment: true,
+      }),
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls).toEqual([
+      'lock',
+      'remove',
+      'note',
+      'comment',
+      'distinguish:true',
+      'dm',
+    ]);
+    expect(result.record).toMatchObject({
+      actionOutcome: 'succeeded',
+      actionPhase: 'notifications_complete',
+      removalNoteStatus: 'added',
+      removalCommentStatus: 'added',
+      removalCommentStyleStatus: 'styled',
+      privateMessageStatus: 'sent',
+    });
+    expect(harness.persisted.map((record) => record.actionPhase)).toContain(
+      'removal_attempted'
+    );
+  });
+
+  test('unlocks a post when removal fails', async () => {
+    const harness = workflowHarness({ failRemove: true });
+    const result = await executeRemovalWorkflow({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: trackedPost({
+        status: 'actioning',
+        attemptedAction: 'remove',
+      }),
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls).toEqual(['lock', 'remove', 'unlock']);
+    expect(result).toMatchObject({
+      actionStatus: 'failed',
+      actionErrorMessage: 'remove unavailable',
+      record: { postUnlockStatus: 'unlocked' },
+    });
+  });
+
+  test('audits notification failures without changing removal success', async () => {
+    const harness = workflowHarness({
+      failRemovalNote: true,
+      failComment: true,
+      failDirectMessage: true,
+    });
+    const result = await executeRemovalWorkflow({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: trackedPost({
+        status: 'actioning',
+        attemptedAction: 'remove',
+        sendRemovalDirectMessage: true,
+        leaveRemovalComment: true,
+      }),
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(result.actionStatus).toBe('succeeded');
+    expect(result.record).toMatchObject({
+      removalNoteStatus: 'failed',
+      removalNoteErrorMessage: 'note unavailable',
+      removalCommentStatus: 'failed',
+      removalCommentErrorMessage: 'comment unavailable',
+      privateMessageStatus: 'failed',
+      privateMessageErrorMessage: 'dm unavailable',
+    });
+  });
+
+  test('keeps a created comment and DM when comment styling fails', async () => {
+    const harness = workflowHarness({ failCommentStyle: true });
+    const result = await executeRemovalWorkflow({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: trackedPost({
+        status: 'actioning',
+        attemptedAction: 'remove',
+        sendRemovalDirectMessage: true,
+        leaveRemovalComment: true,
+      }),
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(result.record).toMatchObject({
+      removalCommentStatus: 'added',
+      removalCommentStyleStatus: 'failed',
+      privateMessageStatus: 'sent',
+    });
+  });
+
+  test('records a compensating unlock failure independently', async () => {
+    const harness = workflowHarness({ failUnlock: true });
+    const record = await compensateUnremovedPost({
+      post: harness.post,
+      record: trackedPost({ postLockStatus: 'locked' }),
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(record).toMatchObject({
+      postUnlockStatus: 'failed',
+      postUnlockErrorMessage: 'unlock unavailable',
+    });
+  });
+
+  test('resumes pending notifications without repeating removal', async () => {
+    const harness = workflowHarness();
+    const record = await recoverConfirmedRemoval({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: trackedPost({
+        status: 'actioning',
+        attemptedAction: 'remove',
+        actionOutcome: 'unknown',
+        removalNoteStatus: 'pending',
+        removalCommentStatus: 'pending',
+        privateMessageStatus: 'pending',
+        sendRemovalDirectMessage: true,
+        leaveRemovalComment: true,
+      }),
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls).not.toContain('remove');
+    expect(harness.calls).toContain('comment');
+    expect(harness.calls).toContain('dm');
+    expect(record.actionPhase).toBe('notifications_complete');
+  });
+
+  test('does not resend an ambiguously attempted direct message', async () => {
+    const harness = workflowHarness();
+    const record = await recoverConfirmedRemoval({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: trackedPost({
+        status: 'actioning',
+        attemptedAction: 'remove',
+        actionOutcome: 'succeeded',
+        removalNoteStatus: 'added',
+        removalCommentStatus: 'skipped',
+        privateMessageStatus: 'attempting',
+        sendRemovalDirectMessage: true,
+        leaveRemovalComment: false,
+      }),
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls).not.toContain('dm');
+    expect(record.privateMessageStatus).toBe('delivery_unknown');
+  });
+
+  test('reconciles an existing app comment after an interrupted attempt', async () => {
+    const harness = workflowHarness({ existingComment: true });
+    const record = await recoverConfirmedRemoval({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: trackedPost({
+        status: 'actioning',
+        attemptedAction: 'remove',
+        actionOutcome: 'succeeded',
+        removalNoteStatus: 'added',
+        removalCommentStatus: 'attempting',
+        privateMessageStatus: 'skipped',
+        sendRemovalDirectMessage: false,
+        leaveRemovalComment: true,
+      }),
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls).toContain('list-comments');
+    expect(harness.calls).not.toContain('comment');
+    expect(record).toMatchObject({
+      removalCommentStatus: 'reconciled',
+      removalCommentId: 't1_notice',
+      removalCommentStyleStatus: 'styled',
+    });
+  });
+
+  test('reconciles when comment creation succeeds before Redis persistence', async () => {
+    const harness = workflowHarness({ existingComment: true });
+    let failAddedPersistence = true;
+    await expect(
+      executeRemovalWorkflow({
+        post: harness.post,
+        redditClient: harness.redditClient,
+        postLink: 'https://reddit.com/r/test/comments/post',
+        record: trackedPost({
+          status: 'actioning',
+          attemptedAction: 'remove',
+          sendRemovalDirectMessage: false,
+          leaveRemovalComment: true,
+        }),
+        persist: async (record) => {
+          if (failAddedPersistence && record.removalCommentStatus === 'added') {
+            failAddedPersistence = false;
+            throw new Error('redis reply unavailable');
+          }
+          await harness.persist(record);
+        },
+        now: () => now,
+      })
+    ).rejects.toThrow('redis reply unavailable');
+
+    const interruptedRecord = harness.persisted.at(-1);
+    expect(interruptedRecord?.removalCommentStatus).toBe('attempting');
+    const recovered = await recoverConfirmedRemoval({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: interruptedRecord as TrackedPost,
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls.filter((call) => call === 'comment')).toHaveLength(1);
+    expect(recovered.removalCommentStatus).toBe('reconciled');
   });
 });
 

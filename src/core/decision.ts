@@ -1,7 +1,4 @@
-import {
-  MODERATOR_ACTION_ALL,
-  type DownvoteDeleteSettings,
-} from './settings';
+import { MODERATOR_ACTION_ALL, type DownvoteDeleteSettings } from './settings';
 import type {
   NegativeDecisionSource,
   TrackedPost,
@@ -35,6 +32,7 @@ export type PostSnapshot = {
   spam: boolean;
   deleted: boolean;
   unavailable: boolean;
+  locked?: boolean;
 };
 
 export type NegativeDecisionScore = {

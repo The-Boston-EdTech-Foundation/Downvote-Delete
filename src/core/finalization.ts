@@ -9,6 +9,8 @@ import {
   watchKey,
 } from './tracking';
 
+export const AUDIT_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+
 export type FinalizationResult =
   | { status: 'committed' }
   | { status: 'already_finalized' }
@@ -86,6 +88,10 @@ export async function finalizeTrackedPost(args: {
         auditKey(args.record.postId),
         JSON.stringify(createAuditRecord(stoppedRecord, now))
       );
+      await transaction.expire(
+        auditKey(args.record.postId),
+        AUDIT_RETENTION_SECONDS
+      );
       await transaction.hIncrBy(
         statsKey(args.record.subredditId),
         args.status,
@@ -98,10 +104,7 @@ export async function finalizeTrackedPost(args: {
           1
         );
       }
-      await transaction.del(
-        watchKey(args.record.postId),
-        actionLockKey(args.record.postId)
-      );
+      await transaction.del(watchKey(args.record.postId));
       const replies = await transaction.exec();
       if (replies.length > 0) {
         return { status: 'committed' };

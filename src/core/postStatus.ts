@@ -12,5 +12,6 @@ export function postToSnapshot(post: Post): PostSnapshot {
     // A failed fetch is handled by the scheduler as retryable; this flag is
     // reserved for a confirmed unavailable state if Devvit exposes one.
     unavailable: false,
+    locked: post.locked,
   };
 }

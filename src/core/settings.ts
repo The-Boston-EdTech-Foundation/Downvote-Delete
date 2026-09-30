@@ -38,6 +38,12 @@ export const defaultSettings: DownvoteDeleteSettings = {
   moderatorPostHandling: MODERATOR_IGNORE,
 };
 
+// Keep action/recovery fallbacks aligned with the installation defaults.
+export const DEFAULT_SEND_REMOVAL_DIRECT_MESSAGE =
+  defaultSettings.sendRemovalDirectMessage;
+export const DEFAULT_LEAVE_REMOVAL_COMMENT =
+  defaultSettings.leaveRemovalComment;
+
 const validTrackingDurations = [1, 2, 3, 4, 6] as const;
 const validNegativeThresholds = [-1, -2, -3, -4, -5] as const;
 const validPositiveThresholds = [3, 5, 10] as const;

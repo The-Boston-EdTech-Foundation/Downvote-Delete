@@ -1,7 +1,9 @@
-import type {
-  DownvoteDeleteAction,
-  DownvoteDeleteSettings,
-  ModeratorPostHandling,
+import {
+  DEFAULT_LEAVE_REMOVAL_COMMENT,
+  DEFAULT_SEND_REMOVAL_DIRECT_MESSAGE,
+  type DownvoteDeleteAction,
+  type DownvoteDeleteSettings,
+  type ModeratorPostHandling,
 } from './settings';
 import type { RatioDecisionReason, VoteState } from './voteRatioModel';
 
@@ -22,6 +24,32 @@ export type TrackingStatus =
 export type NegativeDecisionSource = 'reddit_score' | 'calculated_votes';
 
 export type TrackingMode = 'normal' | 'advanced';
+
+export type ActionPhase =
+  | 'action_pending'
+  | 'lock_attempted'
+  | 'removal_attempted'
+  | 'removal_confirmed'
+  | 'notifications_pending'
+  | 'notifications_complete';
+
+export type PrivateMessageStatus =
+  | 'not_applicable'
+  | 'pending'
+  | 'attempting'
+  | 'sent'
+  | 'skipped'
+  | 'failed'
+  | 'delivery_unknown';
+
+export type RemovalCommentStatus =
+  | 'not_applicable'
+  | 'pending'
+  | 'attempting'
+  | 'added'
+  | 'reconciled'
+  | 'skipped'
+  | 'failed';
 
 export type TrackedPost = {
   subredditId: string;
@@ -79,6 +107,8 @@ export type TrackedPost = {
   scheduledRunToken?: string;
   updatedAt: number;
   actionAttemptId?: string;
+  actionPhase?: ActionPhase;
+  actionReason?: string;
   actionStartedAt?: number;
   actionCompletedAt?: number;
   actionRecoveryJobId?: string;
@@ -88,20 +118,35 @@ export type TrackedPost = {
   actionErrorMessage?: string;
   postLockStatus?: 'not_applicable' | 'locked' | 'failed';
   postLockErrorMessage?: string;
-  removalNoteStatus?: 'not_applicable' | 'added' | 'failed';
+  postUnlockStatus?: 'not_applicable' | 'unlocked' | 'failed';
+  postUnlockAttemptedAt?: number;
+  postUnlockErrorMessage?: string;
+  removalConfirmedAt?: number;
+  removalNoteStatus?:
+    | 'not_applicable'
+    | 'pending'
+    | 'attempting'
+    | 'added'
+    | 'failed'
+    | 'delivery_unknown';
   removalNoteErrorMessage?: string;
   actionedAt?: number;
-  privateMessageStatus?: 'not_applicable' | 'sent' | 'skipped' | 'failed';
+  privateMessageStatus?: PrivateMessageStatus;
+  privateMessageAttemptedAt?: number;
   privateMessageSentAt?: number;
   privateMessageSkippedReason?: string;
   privateMessageErrorMessage?: string;
-  removalCommentStatus?: 'not_applicable' | 'added' | 'skipped' | 'failed';
+  removalCommentStatus?: RemovalCommentStatus;
+  removalCommentAttemptedAt?: number;
   removalCommentAddedAt?: number;
   removalCommentId?: string;
   removalCommentSkippedReason?: string;
   removalCommentErrorMessage?: string;
   removalCommentStyleStatus?: 'not_applicable' | 'styled' | 'failed';
   removalCommentStyleErrorMessage?: string;
+  notificationCompletedAt?: number;
+  recoveryAttemptedAt?: number;
+  recoveryReason?: string;
   // Legacy fields remain readable for audit records written before DM delivery.
   modmailStatus?: 'not_applicable' | 'sent' | 'skipped' | 'failed';
   modmailSentAt?: number;
@@ -242,10 +287,12 @@ function validateTrackedPost(raw: unknown): string | undefined {
       'lastJobId',
       'scheduledRunToken',
       'actionAttemptId',
+      'actionReason',
       'actionRecoveryJobId',
       'actionRecoveryRunToken',
       'actionErrorMessage',
       'postLockErrorMessage',
+      'postUnlockErrorMessage',
       'removalNoteErrorMessage',
       'lastAuthenticatedRatioError',
       'lastAuthenticatedRatioRawName',
@@ -259,6 +306,7 @@ function validateTrackedPost(raw: unknown): string | undefined {
       'removalCommentSkippedReason',
       'removalCommentErrorMessage',
       'removalCommentStyleErrorMessage',
+      'recoveryReason',
       'modmailSkippedReason',
       'modmailErrorMessage',
     ],
@@ -295,6 +343,12 @@ function validateTrackedPost(raw: unknown): string | undefined {
       'modmailSentAt',
       'actionStartedAt',
       'actionCompletedAt',
+      'postUnlockAttemptedAt',
+      'removalConfirmedAt',
+      'privateMessageAttemptedAt',
+      'removalCommentAttemptedAt',
+      'notificationCompletedAt',
+      'recoveryAttemptedAt',
     ],
     isFiniteNumber
   );
@@ -360,12 +414,56 @@ function validateTrackedPost(raw: unknown): string | undefined {
       ],
     ],
     ['negativeDecisionSource', ['reddit_score', 'calculated_votes']],
-    ['privateMessageStatus', ['not_applicable', 'sent', 'skipped', 'failed']],
-    ['removalCommentStatus', ['not_applicable', 'added', 'skipped', 'failed']],
+    [
+      'privateMessageStatus',
+      [
+        'not_applicable',
+        'pending',
+        'attempting',
+        'sent',
+        'skipped',
+        'failed',
+        'delivery_unknown',
+      ],
+    ],
+    [
+      'removalCommentStatus',
+      [
+        'not_applicable',
+        'pending',
+        'attempting',
+        'added',
+        'reconciled',
+        'skipped',
+        'failed',
+      ],
+    ],
     ['removalCommentStyleStatus', ['not_applicable', 'styled', 'failed']],
     ['modmailStatus', ['not_applicable', 'sent', 'skipped', 'failed']],
     ['postLockStatus', ['not_applicable', 'locked', 'failed']],
-    ['removalNoteStatus', ['not_applicable', 'added', 'failed']],
+    ['postUnlockStatus', ['not_applicable', 'unlocked', 'failed']],
+    [
+      'removalNoteStatus',
+      [
+        'not_applicable',
+        'pending',
+        'attempting',
+        'added',
+        'failed',
+        'delivery_unknown',
+      ],
+    ],
+    [
+      'actionPhase',
+      [
+        'action_pending',
+        'lock_attempted',
+        'removal_attempted',
+        'removal_confirmed',
+        'notifications_pending',
+        'notifications_complete',
+      ],
+    ],
     ['attemptedAction', actionValues],
     ['actionOutcome', ['succeeded', 'failed', 'unknown']],
   ];
@@ -393,9 +491,20 @@ export function parseTrackedPostResult(
   }
 
   const error = validateTrackedPost(raw);
-  return error
-    ? { ok: false, error }
-    : { ok: true, record: raw as TrackedPost };
+  if (error) {
+    return { ok: false, error };
+  }
+  const record = raw as TrackedPost;
+  return {
+    ok: true,
+    record: {
+      ...record,
+      sendRemovalDirectMessage:
+        record.sendRemovalDirectMessage ?? DEFAULT_SEND_REMOVAL_DIRECT_MESSAGE,
+      leaveRemovalComment:
+        record.leaveRemovalComment ?? DEFAULT_LEAVE_REMOVAL_COMMENT,
+    },
+  };
 }
 
 export function parseTrackedPost(
@@ -409,10 +518,14 @@ export function createAuditRecord(
   record: TrackedPost,
   now: number
 ): AuditRecord {
-  return {
+  const auditRecord: AuditRecord = {
     ...record,
     auditedAt: now,
   };
+  // Terminal records no longer need user identifiers for operation or dedupe.
+  delete auditRecord.authorId;
+  delete auditRecord.authorName;
+  return auditRecord;
 }
 
 export function refreshTrackedPostActionSettings(

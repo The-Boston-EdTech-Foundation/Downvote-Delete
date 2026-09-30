@@ -55,7 +55,9 @@ async function isModeratorPost(args: {
     .all();
 
   const moderatorPost = moderators.some(
-    (moderator) => moderator.username === args.authorName
+    (moderator) =>
+      moderator.username.toLocaleLowerCase() ===
+      args.authorName?.toLocaleLowerCase()
   );
 
   logInfo('Moderator detection complete.', {
@@ -118,8 +120,6 @@ triggers.post('/on-post-submit', async (c) => {
       return c.json<TriggerResponse>({}, 200);
     }
 
-    const moderatorPost = await isModeratorPost({ authorName, subredditName });
-
     if (!currentSettings.isActive) {
       logInfo('Skipping post because Downvote Delete is inactive.', {
         postId,
@@ -129,6 +129,8 @@ triggers.post('/on-post-submit', async (c) => {
       });
       return c.json<TriggerResponse>({}, 200);
     }
+
+    const moderatorPost = await isModeratorPost({ authorName, subredditName });
 
     if (
       !shouldTrackNewPost({

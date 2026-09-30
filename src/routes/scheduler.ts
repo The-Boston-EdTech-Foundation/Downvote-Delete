@@ -32,6 +32,11 @@ import {
 } from '../core/firebaseRatioRouter';
 import { postToSnapshot } from '../core/postStatus';
 import {
+  compensateUnremovedPost,
+  executeRemovalWorkflow,
+  recoverConfirmedRemoval,
+} from '../core/removalWorkflow';
+import {
   actionLockKey,
   finalizeTrackedPost,
   type FinalizationResult,
@@ -44,6 +49,9 @@ import {
   schedulePostCheck,
 } from '../core/scheduling';
 import {
+  DEFAULT_LEAVE_REMOVAL_COMMENT,
+  DEFAULT_SEND_REMOVAL_DIRECT_MESSAGE,
+  MODERATOR_IGNORE,
   normalizeSettings,
   summarizeSubredditSettingsShapes,
 } from '../core/settings';
@@ -161,12 +169,13 @@ async function releaseActionLock(
   postId: string,
   reason: string
 ): Promise<void> {
-  logInfo('Releasing Redis action lock.', {
+  // Devvit Redis does not expose an atomic compare-and-delete primitive. Let
+  // token-valued locks expire so an old worker can never delete a newer lock.
+  logInfo('Leaving Redis action lock to expire safely.', {
     postId,
     actionLockKey: actionLockKey(postId),
     reason,
   });
-  await redis.del(actionLockKey(postId));
 }
 
 async function stopTracking(
@@ -490,9 +499,10 @@ function mergeFreshActionFields(
     recordForAction.positiveScoreStopThreshold;
   actionRecord.actionToTake = recordForAction.actionToTake;
   actionRecord.sendRemovalDirectMessage =
-    recordForAction.sendRemovalDirectMessage ?? true;
+    recordForAction.sendRemovalDirectMessage ??
+    DEFAULT_SEND_REMOVAL_DIRECT_MESSAGE;
   actionRecord.leaveRemovalComment =
-    recordForAction.leaveRemovalComment ?? false;
+    recordForAction.leaveRemovalComment ?? DEFAULT_LEAVE_REMOVAL_COMMENT;
   actionRecord.moderatorPostHandling = recordForAction.moderatorPostHandling;
 
   if (typeof recordForAction.lastKnownScore === 'number') {
@@ -704,18 +714,15 @@ async function scheduleRetryAfterActionLock(
   now: number,
   reason: string
 ): Promise<void> {
-  if (now >= record.trackingExpiresAt) {
-    logWarn('Retry was not scheduled because tracking window is expired.', {
-      postId: record.postId,
-      reason,
-    });
-    return;
-  }
-
   const nextCheckCount = record.checkCount + 1;
   const cadence = record.trackingMode === 'advanced' ? 'advanced' : 'normal';
-  const nextRunAt = getNextCheckRunAt(nextCheckCount, now, cadence);
-  const nextDelayMinutes = getNextCheckDelayMinutes(nextCheckCount, cadence);
+  const trackingExpired = now >= record.trackingExpiresAt;
+  const nextRunAt = trackingExpired
+    ? new Date(now + 5 * 60 * 1000)
+    : getNextCheckRunAt(nextCheckCount, now, cadence);
+  const nextDelayMinutes = trackingExpired
+    ? 5
+    : getNextCheckDelayMinutes(nextCheckCount, cadence);
   const updatedRecord = await schedulePostCheck({
     record,
     checkCount: nextCheckCount,
@@ -731,6 +738,7 @@ async function scheduleRetryAfterActionLock(
     nextRunAt,
     jobId: updatedRecord.lastJobId,
     runToken: updatedRecord.scheduledRunToken,
+    trackingExpired,
   });
 }
 
@@ -808,21 +816,43 @@ async function recoverActionAttempt(
     return;
   }
 
+  let recoveryFetched: FetchedPostSnapshot | null | undefined;
   let recoverySnapshot: PostSnapshot | undefined;
   if (
-    record.actionOutcome !== 'failed' &&
-    record.actionOutcome !== 'succeeded' &&
-    (record.attemptedAction === 'remove' || record.attemptedAction === 'filter')
+    record.attemptedAction === 'remove' ||
+    record.attemptedAction === 'filter'
   ) {
-    const fetched = await fetchPostSnapshot(record.postId);
-    recoverySnapshot = fetched?.snapshot;
+    recoveryFetched = await fetchPostSnapshot(record.postId);
+    recoverySnapshot = recoveryFetched?.snapshot;
+  }
+
+  if (
+    record.attemptedAction === 'remove' &&
+    !recoveryFetched &&
+    (record.actionPhase !== 'notifications_complete' ||
+      (record.actionOutcome !== 'succeeded' &&
+        record.postLockStatus === 'locked'))
+  ) {
+    throw new Error(
+      'Removal recovery requires a current post snapshot before it can finalize.'
+    );
+  }
+  if (
+    record.attemptedAction === 'filter' &&
+    !recoveryFetched &&
+    record.actionOutcome !== 'succeeded' &&
+    record.actionOutcome !== 'failed'
+  ) {
+    throw new Error(
+      'Filter recovery requires a current post snapshot before it can finalize.'
+    );
   }
 
   const recovery = resolveActionRecovery(record, recoverySnapshot);
   const knownFailure = recovery.status === 'action_failed';
   const confirmedApplied = recovery.confirmedApplied;
   const completedAt = Date.now();
-  const recoveredRecord: TrackedPost = {
+  let recoveredRecord: TrackedPost = {
     ...record,
     status: recovery.status,
     actionOutcome: recovery.outcome,
@@ -832,6 +862,47 @@ async function recoverActionAttempt(
   if (!knownFailure && !confirmedApplied) {
     recoveredRecord.actionErrorMessage =
       'Recovery could not confirm whether the moderation action completed.';
+  }
+
+  if (record.attemptedAction === 'remove' && recoveryFetched) {
+    const persist = async (updatedRecord: TrackedPost): Promise<void> => {
+      await redis.set(
+        watchKey(updatedRecord.postId),
+        serializeTrackedPost(updatedRecord)
+      );
+    };
+    if (confirmedApplied) {
+      recoveredRecord = await recoverConfirmedRemoval({
+        post: recoveryFetched.post,
+        redditClient: reddit,
+        postLink: buildPostLink({
+          postId: record.postId,
+          subredditName: record.subredditName,
+          permalink: recoveryFetched.post.permalink,
+        }),
+        record: recoveredRecord,
+        persist,
+      });
+      logInfo('Recovered follow-up work for a confirmed removal.', {
+        postId: record.postId,
+        actionAttemptId,
+        removalNoteStatus: recoveredRecord.removalNoteStatus,
+        removalCommentStatus: recoveredRecord.removalCommentStatus,
+        removalCommentStyleStatus: recoveredRecord.removalCommentStyleStatus,
+        privateMessageStatus: recoveredRecord.privateMessageStatus,
+        actionPhase: recoveredRecord.actionPhase,
+      });
+    } else if (
+      record.postLockStatus === 'locked' &&
+      !recoverySnapshot?.removed &&
+      !recoverySnapshot?.spam
+    ) {
+      recoveredRecord = await compensateUnremovedPost({
+        post: recoveryFetched.post,
+        record: recoveredRecord,
+        persist,
+      });
+    }
   }
 
   logWarn('Recovering an unfinished moderation action without repeating it.', {
@@ -856,6 +927,25 @@ async function recoverActionAttempt(
   }
 }
 
+async function isCurrentModeratorAuthor(record: TrackedPost): Promise<boolean> {
+  if (!record.authorName) {
+    throw new Error('author_identity_unresolved');
+  }
+  const moderators = await reddit
+    .getModerators({
+      subredditName: record.subredditName,
+      username: record.authorName,
+      limit: 1,
+      pageSize: 1,
+    })
+    .all();
+  return moderators.some(
+    (moderator) =>
+      moderator.username.toLocaleLowerCase() ===
+      record.authorName?.toLocaleLowerCase()
+  );
+}
+
 async function actionTrackedPost(args: {
   postId: string;
   fetched: FetchedPostSnapshot;
@@ -871,10 +961,15 @@ async function actionTrackedPost(args: {
     actionLockKey: actionLockKey(args.postId),
   });
 
-  const actionLockWasSet = await redis.set(actionLockKey(args.postId), '1', {
-    nx: true,
-    expiration: new Date(args.now + 60 * 60 * 1000),
-  });
+  const actionLockToken = randomUUID();
+  const actionLockWasSet = await redis.set(
+    actionLockKey(args.postId),
+    actionLockToken,
+    {
+      nx: true,
+      expiration: new Date(args.now + 10 * 60 * 1000),
+    }
+  );
 
   if (actionLockWasSet !== 'OK') {
     logWarn(
@@ -898,6 +993,7 @@ async function actionTrackedPost(args: {
   logInfo('Redis action lock acquired.', {
     postId: args.postId,
     actionLockResult: actionLockWasSet,
+    actionLockToken,
   });
 
   const latestRecord = await loadTrackedPost(args.postId);
@@ -918,6 +1014,31 @@ async function actionTrackedPost(args: {
     latestRecord,
     args.recordForAction
   );
+  const fetchedAuthorName = args.fetched.post.authorName;
+  if (
+    !actionRecord.authorName &&
+    fetchedAuthorName &&
+    fetchedAuthorName !== '[deleted]'
+  ) {
+    actionRecord.authorName = fetchedAuthorName;
+  }
+
+  if (actionRecord.moderatorPostHandling === MODERATOR_IGNORE) {
+    if (await isCurrentModeratorAuthor(actionRecord)) {
+      const result = await stopTracking(
+        actionRecord,
+        'stopped_invalid',
+        Date.now(),
+        'moderator_author_ignored'
+      );
+      if (result.status === 'retry_required') {
+        throw new FinalizationRetryError(
+          'Moderator exclusion finalization requires retry.'
+        );
+      }
+      return;
+    }
+  }
   const actionAttemptId = randomUUID();
   const actionStartedAt = Date.now();
   const actioningRecord: TrackedPost = {
@@ -929,6 +1050,8 @@ async function actionTrackedPost(args: {
     status: 'actioning',
     attemptedAction: actionRecord.actionToTake,
     actionAttemptId,
+    actionReason: args.actionReason,
+    actionPhase: 'action_pending',
     actionStartedAt,
     updatedAt: actionStartedAt,
   };
@@ -987,8 +1110,11 @@ async function actionTrackedPost(args: {
       subredditName: actionRecord.subredditName,
       postLink,
       reason: args.actionReason,
-      sendRemovalDirectMessage: actionRecord.sendRemovalDirectMessage ?? true,
-      leaveRemovalComment: actionRecord.leaveRemovalComment ?? false,
+      sendRemovalDirectMessage:
+        actionRecord.sendRemovalDirectMessage ??
+        DEFAULT_SEND_REMOVAL_DIRECT_MESSAGE,
+      leaveRemovalComment:
+        actionRecord.leaveRemovalComment ?? DEFAULT_LEAVE_REMOVAL_COMMENT,
     };
 
     if (actionRecord.authorName) {
@@ -1007,13 +1133,79 @@ async function actionTrackedPost(args: {
       });
     }
 
-    moderationActionResult = await applyModerationAction(moderationActionArgs);
+    if (actionRecord.actionToTake === 'remove') {
+      const workflow = await executeRemovalWorkflow({
+        post: args.fetched.post,
+        redditClient: reddit,
+        postLink,
+        record: preparedRecord,
+        persist: async (record) => {
+          await redis.set(
+            watchKey(record.postId),
+            serializeTrackedPost(record)
+          );
+        },
+      });
+      preparedRecord = workflow.record;
+      moderationActionResult = {
+        actionStatus: workflow.actionStatus,
+        ...(workflow.actionErrorMessage
+          ? { actionErrorMessage: workflow.actionErrorMessage }
+          : {}),
+        postLockStatus: workflow.record.postLockStatus ?? 'not_applicable',
+        ...(workflow.record.postLockErrorMessage
+          ? { postLockErrorMessage: workflow.record.postLockErrorMessage }
+          : {}),
+        removalNoteStatus:
+          workflow.record.removalNoteStatus === 'added'
+            ? 'added'
+            : workflow.record.removalNoteStatus === 'failed'
+              ? 'failed'
+              : 'not_applicable',
+        ...(workflow.record.removalNoteErrorMessage
+          ? { removalNoteErrorMessage: workflow.record.removalNoteErrorMessage }
+          : {}),
+        privateMessageStatus:
+          workflow.record.privateMessageStatus === 'sent' ||
+          workflow.record.privateMessageStatus === 'skipped' ||
+          workflow.record.privateMessageStatus === 'failed'
+            ? workflow.record.privateMessageStatus
+            : 'not_applicable',
+        removalCommentStatus:
+          workflow.record.removalCommentStatus === 'added' ||
+          workflow.record.removalCommentStatus === 'skipped' ||
+          workflow.record.removalCommentStatus === 'failed'
+            ? workflow.record.removalCommentStatus
+            : workflow.record.removalCommentStatus === 'reconciled'
+              ? 'added'
+              : 'not_applicable',
+        removalCommentStyleStatus:
+          workflow.record.removalCommentStyleStatus ?? 'not_applicable',
+      };
+    } else {
+      moderationActionResult =
+        await applyModerationAction(moderationActionArgs);
+    }
   } catch (err: unknown) {
     const completedAt = Date.now();
+    let persistedAttempt: TrackedPost | null = null;
+    try {
+      persistedAttempt = await loadTrackedPost(args.postId);
+    } catch (readErr: unknown) {
+      logError(
+        'Could not reload the interrupted action state; recovery record remains authoritative.',
+        { postId: args.postId, actionAttemptId },
+        readErr
+      );
+    }
+    const recoveryBase =
+      persistedAttempt?.actionAttemptId === actionAttemptId
+        ? persistedAttempt
+        : preparedRecord;
     const unknownRecord: TrackedPost = {
-      ...preparedRecord,
+      ...recoveryBase,
       status: 'actioning',
-      actionOutcome: 'unknown',
+      actionOutcome: recoveryBase.actionOutcome ?? 'unknown',
       actionCompletedAt: completedAt,
       actionErrorMessage: err instanceof Error ? err.message : String(err),
       updatedAt: completedAt,
@@ -1166,14 +1358,16 @@ async function actionTrackedPost(args: {
     updatedAt: completedAt,
   };
 
-  actionedRecord.postLockStatus = moderationActionResult.postLockStatus;
-  actionedRecord.removalNoteStatus = moderationActionResult.removalNoteStatus;
-  actionedRecord.privateMessageStatus =
-    moderationActionResult.privateMessageStatus;
-  actionedRecord.removalCommentStatus =
-    moderationActionResult.removalCommentStatus;
-  actionedRecord.removalCommentStyleStatus =
-    moderationActionResult.removalCommentStyleStatus;
+  if (actionRecord.actionToTake !== 'remove') {
+    actionedRecord.postLockStatus = moderationActionResult.postLockStatus;
+    actionedRecord.removalNoteStatus = moderationActionResult.removalNoteStatus;
+    actionedRecord.privateMessageStatus =
+      moderationActionResult.privateMessageStatus;
+    actionedRecord.removalCommentStatus =
+      moderationActionResult.removalCommentStatus;
+    actionedRecord.removalCommentStyleStatus =
+      moderationActionResult.removalCommentStyleStatus;
+  }
 
   if (typeof moderationActionResult.postLockErrorMessage === 'string') {
     actionedRecord.postLockErrorMessage =
@@ -1339,10 +1533,15 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     task.data?.runToken ??
     `legacy-${isRecoveryTask ? 'recovery' : initialRecord.checkCount}`;
   const executionLock = checkExecutionLockKey(postId, executionToken);
-  const executionLockWasSet = await redis.set(executionLock, '1', {
-    nx: true,
-    expiration: new Date(Date.now() + 5 * 60 * 1000),
-  });
+  const executionLockOwner = randomUUID();
+  const executionLockWasSet = await redis.set(
+    executionLock,
+    executionLockOwner,
+    {
+      nx: true,
+      expiration: new Date(Date.now() + 5 * 60 * 1000),
+    }
+  );
   if (executionLockWasSet !== 'OK') {
     logInfo('Duplicate scheduled check delivery was ignored.', {
       postId,
@@ -1350,7 +1549,7 @@ scheduledJobs.post('/check-watched-post', async (c) => {
       executionLock,
       reason: 'execution_lock_busy',
     });
-    return c.json<TaskResponse>({}, 200);
+    return c.json<TaskResponse>({}, 503);
   }
 
   try {
@@ -1431,6 +1630,18 @@ scheduledJobs.post('/check-watched-post', async (c) => {
           now
         );
         return c.json<TaskResponse>({}, 200);
+      }
+
+      if (
+        !activeRecord.authorName &&
+        fetched.post.authorName &&
+        fetched.post.authorName !== '[deleted]'
+      ) {
+        activeRecord = {
+          ...activeRecord,
+          authorName: fetched.post.authorName,
+          updatedAt: Date.now(),
+        };
       }
 
       const currentSnapshot = fetched ? fetched.snapshot : null;
@@ -1647,15 +1858,11 @@ scheduledJobs.post('/check-watched-post', async (c) => {
 
     return c.json<TaskResponse>({}, 200);
   } finally {
-    try {
-      await redis.del(executionLock);
-    } catch (err: unknown) {
-      logWarn('Execution lock cleanup failed; expiration will release it.', {
-        postId,
-        runToken: executionToken,
-        executionLock,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    logInfo('Execution lock retained until expiration for ownership safety.', {
+      postId,
+      runToken: executionToken,
+      executionLock,
+      executionLockOwner,
+    });
   }
 });
