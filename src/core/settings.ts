@@ -34,7 +34,7 @@ export const defaultSettings: DownvoteDeleteSettings = {
   positiveScoreStopThreshold: 5,
   actionToTake: ACTION_REMOVE,
   sendRemovalDirectMessage: true,
-  leaveRemovalComment: false,
+  leaveRemovalComment: true,
   moderatorPostHandling: MODERATOR_IGNORE,
 };
 

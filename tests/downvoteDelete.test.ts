@@ -70,7 +70,7 @@ const activeSettings: DownvoteDeleteSettings = {
   positiveScoreStopThreshold: 5,
   actionToTake: ACTION_REMOVE,
   sendRemovalDirectMessage: true,
-  leaveRemovalComment: false,
+  leaveRemovalComment: true,
   moderatorPostHandling: MODERATOR_IGNORE,
 };
 
@@ -295,7 +295,7 @@ describe('settings normalization', () => {
     });
     expect(subredditSettings.leaveRemovalComment).toMatchObject({
       label: 'Should we leave a comment on the post when it is removed?',
-      defaultValue: 'no',
+      defaultValue: 'yes',
       options: [
         {
           label: 'No, do not leave a comment on the removed post',
@@ -316,10 +316,10 @@ describe('settings normalization', () => {
     expect(normalizeSettings({}).trackingDurationHours).toBe(4);
   });
 
-  test('defaults to direct messages without removal comments', () => {
+  test('defaults to direct messages and removal comments', () => {
     expect(normalizeSettings({})).toMatchObject({
       sendRemovalDirectMessage: true,
-      leaveRemovalComment: false,
+      leaveRemovalComment: true,
     });
   });
 
@@ -359,7 +359,7 @@ describe('settings normalization', () => {
       })
     ).toMatchObject({
       sendRemovalDirectMessage: true,
-      leaveRemovalComment: false,
+      leaveRemovalComment: true,
     });
   });
 
@@ -2074,7 +2074,7 @@ describe('tracked post decisions', () => {
     ).toMatchObject({
       negativeScoreThreshold: -1,
       sendRemovalDirectMessage: true,
-      leaveRemovalComment: false,
+      leaveRemovalComment: true,
       trackingExpiresAt: staleRecord.trackingExpiresAt,
     });
   });

@@ -98,7 +98,7 @@
             "value": "yes"
           }
         ],
-        "defaultValue": "no"
+        "defaultValue": "yes"
       },
       "moderatorPostHandling": {
         "type": "select",
