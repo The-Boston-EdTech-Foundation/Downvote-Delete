@@ -1,7 +1,6 @@
 import type { Post, reddit } from '@devvit/web/server';
 import {
   ACTION_FILTER,
-  ACTION_REMOVE,
   ACTION_REPORT,
   type DownvoteDeleteAction,
 } from './settings';
@@ -50,7 +49,7 @@ export type ModerationActionResult = {
 export type ModerationActionArgs = {
   redditClient: RedditClient;
   post: Post;
-  action: DownvoteDeleteAction;
+  action: Exclude<DownvoteDeleteAction, 'remove'>;
   threshold: number;
   reason?: string;
   removalExplanation?: string;
@@ -164,160 +163,6 @@ export async function applyModerationAction(
       removalCommentStatus: 'not_applicable',
       removalCommentStyleStatus: 'not_applicable',
     };
-  }
-
-  if (args.action === ACTION_REMOVE) {
-    let postLockStatus: ModerationActionResult['postLockStatus'] = 'locked';
-    let postLockErrorMessage: string | undefined;
-    try {
-      await args.post.lock();
-    } catch (err: unknown) {
-      postLockStatus = 'failed';
-      postLockErrorMessage = err instanceof Error ? err.message : String(err);
-    }
-
-    try {
-      await args.post.remove(false);
-    } catch (err: unknown) {
-      const result: ModerationActionResult = {
-        actionStatus: 'failed',
-        actionErrorMessage: err instanceof Error ? err.message : String(err),
-        postLockStatus,
-        removalNoteStatus: 'not_applicable',
-        privateMessageStatus: 'not_applicable',
-        removalCommentStatus: 'not_applicable',
-        removalCommentStyleStatus: 'not_applicable',
-      };
-      if (postLockStatus === 'locked') {
-        try {
-          await args.post.unlock();
-          result.postUnlockStatus = 'unlocked';
-        } catch (unlockError: unknown) {
-          result.postUnlockStatus = 'failed';
-          result.postUnlockErrorMessage =
-            unlockError instanceof Error
-              ? unlockError.message
-              : String(unlockError);
-        }
-      }
-      return result;
-    }
-    let removalNoteStatus: ModerationActionResult['removalNoteStatus'] =
-      'added';
-    let removalNoteErrorMessage: string | undefined;
-    try {
-      await args.post.addRemovalNote({ reasonId: '', modNote: reason });
-    } catch (err: unknown) {
-      removalNoteStatus = 'failed';
-      removalNoteErrorMessage =
-        err instanceof Error ? err.message : String(err);
-    }
-
-    const result: ModerationActionResult = {
-      actionStatus: 'succeeded',
-      postLockStatus,
-      removalNoteStatus,
-      privateMessageStatus: 'not_applicable',
-      removalCommentStatus: 'not_applicable',
-      removalCommentStyleStatus: 'not_applicable',
-    };
-    if (postLockErrorMessage) {
-      result.postLockErrorMessage = postLockErrorMessage;
-    }
-    if (removalNoteErrorMessage) {
-      result.removalNoteErrorMessage = removalNoteErrorMessage;
-    }
-
-    if (args.leaveRemovalComment ?? false) {
-      if (!args.subredditName) {
-        result.removalCommentStatus = 'skipped';
-        result.removalCommentSkippedReason = 'missing_subreddit_name';
-      } else {
-        try {
-          const comment = await args.post.addComment({
-            text: buildRemovedForDownvotesCommentBody({
-              subredditName: args.subredditName,
-              ...(args.removalExplanation
-                ? { explanation: args.removalExplanation }
-                : {}),
-            }),
-            runAs: 'APP',
-          });
-          result.removalCommentStatus = 'added';
-          result.removalCommentAddedAt = Date.now();
-          result.removalCommentId = String(comment.id);
-
-          try {
-            await comment.distinguish(true);
-            result.removalCommentStyleStatus = 'styled';
-          } catch (err: unknown) {
-            result.removalCommentStyleStatus = 'failed';
-            result.removalCommentStyleErrorMessage =
-              err instanceof Error ? err.message : String(err);
-            result.removalCommentStyleError = err;
-          }
-        } catch (err: unknown) {
-          result.removalCommentStatus = 'failed';
-          result.removalCommentErrorMessage =
-            err instanceof Error ? err.message : String(err);
-          result.removalCommentError = err;
-        }
-      }
-    } else {
-      result.removalCommentStatus = 'skipped';
-      result.removalCommentSkippedReason = 'disabled_by_settings';
-    }
-
-    if (!(args.sendRemovalDirectMessage ?? true)) {
-      result.privateMessageStatus = 'skipped';
-      result.privateMessageSkippedReason = 'disabled_by_settings';
-      return result;
-    }
-
-    if (!args.authorName) {
-      result.privateMessageStatus = 'skipped';
-      result.privateMessageSkippedReason = 'missing_author_name';
-      return result;
-    }
-
-    if (!args.subredditName) {
-      result.privateMessageStatus = 'skipped';
-      result.privateMessageSkippedReason = 'missing_subreddit_name';
-      return result;
-    }
-
-    if (!args.postLink) {
-      result.privateMessageStatus = 'skipped';
-      result.privateMessageSkippedReason = 'missing_post_link';
-      return result;
-    }
-
-    try {
-      const privateMessageArgs: Parameters<
-        typeof sendRemovalPrivateMessage
-      >[0] = {
-        redditClient: args.redditClient,
-        username: args.authorName,
-        subredditName: args.subredditName,
-        postLink: args.postLink,
-      };
-
-      if (args.removalExplanation) {
-        privateMessageArgs.explanation = args.removalExplanation;
-      }
-
-      await sendRemovalPrivateMessage(privateMessageArgs);
-
-      result.privateMessageStatus = 'sent';
-      result.privateMessageSentAt = Date.now();
-      return result;
-    } catch (err: unknown) {
-      result.privateMessageStatus = 'failed';
-      result.privateMessageErrorMessage =
-        err instanceof Error ? err.message : String(err);
-      result.privateMessageError = err;
-      return result;
-    }
   }
 
   return {

@@ -5,7 +5,12 @@ import type {
   TaskRequest,
   TaskResponse,
 } from '@devvit/web/server';
-import { reddit, redis, settings as devvitSettings } from '@devvit/web/server';
+import {
+  reddit,
+  redis,
+  scheduler,
+  settings as devvitSettings,
+} from '@devvit/web/server';
 import type { T3 } from '@devvit/shared-types/tid.js';
 import {
   applyModerationAction,
@@ -43,6 +48,7 @@ import {
 } from '../core/finalization';
 import {
   cancelScheduledJobSafely,
+  CHECK_WATCHED_POST_TASK,
   type CheckWatchedPostData,
   isCurrentCheckDelivery,
   scheduleActionRecovery,
@@ -80,6 +86,63 @@ export const scheduledJobs = new Hono();
 
 const checkExecutionLockKey = (postId: string, runToken: string): string =>
   `downvote-delete:check-lock:${postId}:${runToken}`;
+const executionSuccessorKey = (executionLock: string): string =>
+  `${executionLock}:successor`;
+const executionSuccessorClaimKey = (executionLock: string): string =>
+  `${executionLock}:successor-claim`;
+const EXECUTION_LOCK_TTL_MS = 5 * 60 * 1000;
+const EXECUTION_SUCCESSOR_DELAY_MS = EXECUTION_LOCK_TTL_MS + 5_000;
+
+async function ensureExecutionSuccessor(args: {
+  executionLock: string;
+  data: CheckWatchedPostData;
+}): Promise<boolean> {
+  const markerKey = executionSuccessorKey(args.executionLock);
+  if (await redis.get(markerKey)) {
+    return true;
+  }
+
+  const claimKey = executionSuccessorClaimKey(args.executionLock);
+  const claimToken = randomUUID();
+  const now = Date.now();
+  const claimed = await redis.set(claimKey, claimToken, {
+    nx: true,
+    expiration: new Date(now + 60_000),
+  });
+  if (claimed !== 'OK') {
+    return Boolean(await redis.get(markerKey));
+  }
+
+  try {
+    const jobId = await scheduler.runJob({
+      name: CHECK_WATCHED_POST_TASK,
+      data: args.data,
+      runAt: new Date(now + EXECUTION_SUCCESSOR_DELAY_MS),
+    });
+    await redis.set(markerKey, jobId, {
+      expiration: new Date(now + 15 * 60 * 1000),
+    });
+    return true;
+  } catch (err: unknown) {
+    logError(
+      'Could not schedule a durable successor after execution-lock contention.',
+      { executionLock: args.executionLock },
+      err
+    );
+    return false;
+  } finally {
+    try {
+      if ((await redis.get(claimKey)) === claimToken) {
+        await redis.del(claimKey);
+      }
+    } catch (err: unknown) {
+      logWarn('Execution successor claim cleanup failed.', {
+        executionLock: args.executionLock,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
 
 class FinalizationRetryError extends Error {}
 
@@ -854,14 +917,33 @@ async function recoverActionAttempt(
   const completedAt = Date.now();
   let recoveredRecord: TrackedPost = {
     ...record,
-    status: recovery.status,
+    // The watch record remains recoverable until terminal audit finalization
+    // commits. Persisting a terminal status here would make a retry stale.
+    status: 'actioning',
     actionOutcome: recovery.outcome,
     actionCompletedAt: completedAt,
+    recoveryAttemptedAt: completedAt,
+    recoveryReason: confirmedApplied
+      ? record.attemptedAction === 'remove'
+        ? 'confirmed_removed'
+        : 'confirmed_applied'
+      : knownFailure
+        ? 'confirmed_failed'
+        : 'confirmed_unremoved',
     updatedAt: completedAt,
   };
   if (!knownFailure && !confirmedApplied) {
-    recoveredRecord.actionErrorMessage =
+    recoveredRecord.actionErrorMessage ??=
       'Recovery could not confirm whether the moderation action completed.';
+  }
+  if (record.attemptedAction === 'remove' && !confirmedApplied) {
+    recoveredRecord = {
+      ...recoveredRecord,
+      removalNoteStatus: 'not_applicable',
+      removalCommentStatus: 'not_applicable',
+      removalCommentStyleStatus: 'not_applicable',
+      privateMessageStatus: 'not_applicable',
+    };
   }
 
   if (record.attemptedAction === 'remove' && recoveryFetched) {
@@ -892,15 +974,12 @@ async function recoverActionAttempt(
         privateMessageStatus: recoveredRecord.privateMessageStatus,
         actionPhase: recoveredRecord.actionPhase,
       });
-    } else if (
-      record.postLockStatus === 'locked' &&
-      !recoverySnapshot?.removed &&
-      !recoverySnapshot?.spam
-    ) {
+    } else if (!recoverySnapshot?.removed && !recoverySnapshot?.spam) {
       recoveredRecord = await compensateUnremovedPost({
         post: recoveryFetched.post,
         record: recoveredRecord,
         persist,
+        postIsCurrentlyLocked: recoverySnapshot?.locked === true,
       });
     }
   }
@@ -911,6 +990,24 @@ async function recoverActionAttempt(
     attemptedAction: record.attemptedAction,
     knownFailure,
     confirmedApplied,
+    recoveryStatus: recovery.status,
+    recoveryReason: recoveredRecord.recoveryReason,
+    postLockStatus: recoveredRecord.postLockStatus,
+    postWasLockedBeforeAction: recoveredRecord.postWasLockedBeforeAction,
+    postUnlockStatus: recoveredRecord.postUnlockStatus,
+    postUnlockErrorMessage: recoveredRecord.postUnlockErrorMessage,
+    removalNoteStatus: recoveredRecord.removalNoteStatus,
+    removalNoteErrorMessage: recoveredRecord.removalNoteErrorMessage,
+    privateMessageStatus: recoveredRecord.privateMessageStatus,
+    privateMessageSentAt: recoveredRecord.privateMessageSentAt,
+    privateMessageErrorMessage: recoveredRecord.privateMessageErrorMessage,
+    removalCommentStatus: recoveredRecord.removalCommentStatus,
+    removalCommentId: recoveredRecord.removalCommentId,
+    removalCommentAddedAt: recoveredRecord.removalCommentAddedAt,
+    removalCommentErrorMessage: recoveredRecord.removalCommentErrorMessage,
+    removalCommentStyleStatus: recoveredRecord.removalCommentStyleStatus,
+    removalCommentStyleErrorMessage:
+      recoveredRecord.removalCommentStyleErrorMessage,
   });
   const finalized = await finalizeActionAttempt(
     recoveredRecord,
@@ -1095,6 +1192,7 @@ async function actionTrackedPost(args: {
     removalCommentStatus: 'not_applicable',
     removalCommentStyleStatus: 'not_applicable',
   };
+  let removalRecord: TrackedPost | undefined;
 
   try {
     const postLink = buildPostLink({
@@ -1102,25 +1200,6 @@ async function actionTrackedPost(args: {
       subredditName: actionRecord.subredditName,
       permalink: args.fetched.post.permalink,
     });
-    const moderationActionArgs: ModerationActionArgs = {
-      redditClient: reddit,
-      post: args.fetched.post,
-      action: actionRecord.actionToTake,
-      threshold: actionRecord.negativeScoreThreshold,
-      subredditName: actionRecord.subredditName,
-      postLink,
-      reason: args.actionReason,
-      sendRemovalDirectMessage:
-        actionRecord.sendRemovalDirectMessage ??
-        DEFAULT_SEND_REMOVAL_DIRECT_MESSAGE,
-      leaveRemovalComment:
-        actionRecord.leaveRemovalComment ?? DEFAULT_LEAVE_REMOVAL_COMMENT,
-    };
-
-    if (actionRecord.authorName) {
-      moderationActionArgs.authorName = actionRecord.authorName;
-    }
-
     if (actionRecord.actionToTake === 'remove') {
       logInfo('Preparing configured removal notifications.', {
         postId: args.postId,
@@ -1128,8 +1207,11 @@ async function actionTrackedPost(args: {
         subredditName: actionRecord.subredditName,
         postLink,
         subject: REMOVAL_PRIVATE_MESSAGE_SUBJECT,
-        sendRemovalDirectMessage: moderationActionArgs.sendRemovalDirectMessage,
-        leaveRemovalComment: moderationActionArgs.leaveRemovalComment,
+        sendRemovalDirectMessage:
+          actionRecord.sendRemovalDirectMessage ??
+          DEFAULT_SEND_REMOVAL_DIRECT_MESSAGE,
+        leaveRemovalComment:
+          actionRecord.leaveRemovalComment ?? DEFAULT_LEAVE_REMOVAL_COMMENT,
       });
     }
 
@@ -1147,42 +1229,31 @@ async function actionTrackedPost(args: {
         },
       });
       preparedRecord = workflow.record;
-      moderationActionResult = {
-        actionStatus: workflow.actionStatus,
-        ...(workflow.actionErrorMessage
-          ? { actionErrorMessage: workflow.actionErrorMessage }
-          : {}),
-        postLockStatus: workflow.record.postLockStatus ?? 'not_applicable',
-        ...(workflow.record.postLockErrorMessage
-          ? { postLockErrorMessage: workflow.record.postLockErrorMessage }
-          : {}),
-        removalNoteStatus:
-          workflow.record.removalNoteStatus === 'added'
-            ? 'added'
-            : workflow.record.removalNoteStatus === 'failed'
-              ? 'failed'
-              : 'not_applicable',
-        ...(workflow.record.removalNoteErrorMessage
-          ? { removalNoteErrorMessage: workflow.record.removalNoteErrorMessage }
-          : {}),
-        privateMessageStatus:
-          workflow.record.privateMessageStatus === 'sent' ||
-          workflow.record.privateMessageStatus === 'skipped' ||
-          workflow.record.privateMessageStatus === 'failed'
-            ? workflow.record.privateMessageStatus
-            : 'not_applicable',
-        removalCommentStatus:
-          workflow.record.removalCommentStatus === 'added' ||
-          workflow.record.removalCommentStatus === 'skipped' ||
-          workflow.record.removalCommentStatus === 'failed'
-            ? workflow.record.removalCommentStatus
-            : workflow.record.removalCommentStatus === 'reconciled'
-              ? 'added'
-              : 'not_applicable',
-        removalCommentStyleStatus:
-          workflow.record.removalCommentStyleStatus ?? 'not_applicable',
-      };
+      removalRecord = workflow.record;
+      if (workflow.actionStatus === 'unknown') {
+        logWarn(
+          'Removal response was ambiguous; recovery will verify Reddit.',
+          {
+            postId: args.postId,
+            actionAttemptId,
+            actionPhase: workflow.record.actionPhase,
+            actionErrorMessage: workflow.actionErrorMessage,
+            postLockStatus: workflow.record.postLockStatus,
+            postWasLockedBeforeAction:
+              workflow.record.postWasLockedBeforeAction,
+          }
+        );
+        return;
+      }
+      moderationActionResult.actionStatus = 'succeeded';
     } else {
+      const moderationActionArgs: ModerationActionArgs = {
+        redditClient: reddit,
+        post: args.fetched.post,
+        action: actionRecord.actionToTake,
+        threshold: actionRecord.negativeScoreThreshold,
+        reason: args.actionReason,
+      };
       moderationActionResult =
         await applyModerationAction(moderationActionArgs);
     }
@@ -1268,83 +1339,117 @@ async function actionTrackedPost(args: {
     return;
   }
 
-  if (moderationActionResult.privateMessageStatus === 'sent') {
+  const loggedOutcome = removalRecord ?? moderationActionResult;
+
+  if (removalRecord) {
+    logInfo('Removal workflow completed.', {
+      postId: args.postId,
+      actionAttemptId,
+      actionPhase: removalRecord.actionPhase,
+      actionOutcome: removalRecord.actionOutcome,
+      postLockStatus: removalRecord.postLockStatus,
+      postWasLockedBeforeAction: removalRecord.postWasLockedBeforeAction,
+      postLockErrorMessage: removalRecord.postLockErrorMessage,
+      postUnlockStatus: removalRecord.postUnlockStatus,
+      postUnlockAttemptedAt: removalRecord.postUnlockAttemptedAt,
+      postUnlockErrorMessage: removalRecord.postUnlockErrorMessage,
+      removalNoteStatus: removalRecord.removalNoteStatus,
+      removalNoteErrorMessage: removalRecord.removalNoteErrorMessage,
+      privateMessageStatus: removalRecord.privateMessageStatus,
+      privateMessageAttemptedAt: removalRecord.privateMessageAttemptedAt,
+      privateMessageSentAt: removalRecord.privateMessageSentAt,
+      privateMessageSkippedReason: removalRecord.privateMessageSkippedReason,
+      privateMessageErrorMessage: removalRecord.privateMessageErrorMessage,
+      removalCommentStatus: removalRecord.removalCommentStatus,
+      removalCommentAttemptedAt: removalRecord.removalCommentAttemptedAt,
+      removalCommentId: removalRecord.removalCommentId,
+      removalCommentAddedAt: removalRecord.removalCommentAddedAt,
+      removalCommentSkippedReason: removalRecord.removalCommentSkippedReason,
+      removalCommentErrorMessage: removalRecord.removalCommentErrorMessage,
+      removalCommentStyleStatus: removalRecord.removalCommentStyleStatus,
+      removalCommentStyleErrorMessage:
+        removalRecord.removalCommentStyleErrorMessage,
+      recoveryReason: removalRecord.recoveryReason,
+    });
+  }
+
+  if (loggedOutcome.privateMessageStatus === 'sent') {
     logInfo('Removal direct message notification sent.', {
       postId: args.postId,
       authorName: actionRecord.authorName,
       subredditName: actionRecord.subredditName,
-      privateMessageSentAt: moderationActionResult.privateMessageSentAt,
+      privateMessageSentAt: loggedOutcome.privateMessageSentAt,
     });
-  } else if (moderationActionResult.privateMessageStatus === 'failed') {
+  } else if (loggedOutcome.privateMessageStatus === 'failed') {
     logError(
       'Removal direct message notification failed.',
       {
         postId: args.postId,
         authorName: actionRecord.authorName,
         subredditName: actionRecord.subredditName,
-        privateMessageErrorMessage:
-          moderationActionResult.privateMessageErrorMessage,
+        privateMessageErrorMessage: loggedOutcome.privateMessageErrorMessage,
       },
-      moderationActionResult.privateMessageError
+      undefined
     );
-  } else if (moderationActionResult.privateMessageStatus === 'skipped') {
+  } else if (loggedOutcome.privateMessageStatus === 'skipped') {
     logWarn('Removal direct message notification skipped.', {
       postId: args.postId,
       authorName: actionRecord.authorName,
       subredditName: actionRecord.subredditName,
-      reason: moderationActionResult.privateMessageSkippedReason,
+      reason: loggedOutcome.privateMessageSkippedReason,
     });
   }
 
-  if (moderationActionResult.removalCommentStatus === 'added') {
+  if (
+    loggedOutcome.removalCommentStatus === 'added' ||
+    loggedOutcome.removalCommentStatus === 'reconciled'
+  ) {
     logInfo('Removal comment notification added.', {
       postId: args.postId,
       subredditName: actionRecord.subredditName,
-      removalCommentId: moderationActionResult.removalCommentId,
-      removalCommentAddedAt: moderationActionResult.removalCommentAddedAt,
-      removalCommentStyleStatus:
-        moderationActionResult.removalCommentStyleStatus,
+      removalCommentId: loggedOutcome.removalCommentId,
+      removalCommentAddedAt: loggedOutcome.removalCommentAddedAt,
+      removalCommentStyleStatus: loggedOutcome.removalCommentStyleStatus,
     });
-  } else if (moderationActionResult.removalCommentStatus === 'failed') {
+  } else if (loggedOutcome.removalCommentStatus === 'failed') {
     logError(
       'Removal comment notification failed.',
       {
         postId: args.postId,
         subredditName: actionRecord.subredditName,
-        removalCommentErrorMessage:
-          moderationActionResult.removalCommentErrorMessage,
+        removalCommentErrorMessage: loggedOutcome.removalCommentErrorMessage,
       },
-      moderationActionResult.removalCommentError
+      undefined
     );
-  } else if (moderationActionResult.removalCommentStatus === 'skipped') {
+  } else if (loggedOutcome.removalCommentStatus === 'skipped') {
     logInfo('Removal comment notification skipped.', {
       postId: args.postId,
       subredditName: actionRecord.subredditName,
-      reason: moderationActionResult.removalCommentSkippedReason,
+      reason: loggedOutcome.removalCommentSkippedReason,
     });
   }
 
-  if (moderationActionResult.removalCommentStyleStatus === 'failed') {
+  if (loggedOutcome.removalCommentStyleStatus === 'failed') {
     logWarn('Removal comment was added but could not be styled.', {
       postId: args.postId,
-      removalCommentId: moderationActionResult.removalCommentId,
-      error: moderationActionResult.removalCommentStyleErrorMessage,
+      removalCommentId: loggedOutcome.removalCommentId,
+      error: loggedOutcome.removalCommentStyleErrorMessage,
     });
   }
 
-  if (moderationActionResult.postLockStatus === 'failed') {
+  if (loggedOutcome.postLockStatus === 'failed') {
     logWarn('Post lock failed; removal still succeeded.', {
       postId: args.postId,
       actionAttemptId,
-      error: moderationActionResult.postLockErrorMessage,
+      error: loggedOutcome.postLockErrorMessage,
     });
   }
 
-  if (moderationActionResult.removalNoteStatus === 'failed') {
+  if (loggedOutcome.removalNoteStatus === 'failed') {
     logWarn('Removal note failed after the moderation action succeeded.', {
       postId: args.postId,
       actionAttemptId,
-      error: moderationActionResult.removalNoteErrorMessage,
+      error: loggedOutcome.removalNoteErrorMessage,
     });
   }
 
@@ -1539,17 +1644,22 @@ scheduledJobs.post('/check-watched-post', async (c) => {
     executionLockOwner,
     {
       nx: true,
-      expiration: new Date(Date.now() + 5 * 60 * 1000),
+      expiration: new Date(Date.now() + EXECUTION_LOCK_TTL_MS),
     }
   );
   if (executionLockWasSet !== 'OK') {
-    logInfo('Duplicate scheduled check delivery was ignored.', {
+    const successorKnown = await ensureExecutionSuccessor({
+      executionLock,
+      data: task.data ?? { postId },
+    });
+    logInfo('Duplicate scheduled check delivery deferred to a successor.', {
       postId,
       runToken: executionToken,
       executionLock,
       reason: 'execution_lock_busy',
+      successorKnown,
     });
-    return c.json<TaskResponse>({}, 503);
+    return c.json<TaskResponse>({}, successorKnown ? 200 : 503);
   }
 
   try {

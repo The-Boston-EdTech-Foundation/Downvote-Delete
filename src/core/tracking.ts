@@ -116,7 +116,8 @@ export type TrackedPost = {
   attemptedAction?: DownvoteDeleteAction;
   actionOutcome?: 'succeeded' | 'failed' | 'unknown';
   actionErrorMessage?: string;
-  postLockStatus?: 'not_applicable' | 'locked' | 'failed';
+  postLockStatus?: 'not_applicable' | 'attempting' | 'locked' | 'failed';
+  postWasLockedBeforeAction?: boolean;
   postLockErrorMessage?: string;
   postUnlockStatus?: 'not_applicable' | 'unlocked' | 'failed';
   postUnlockAttemptedAt?: number;
@@ -363,6 +364,7 @@ function validateTrackedPost(raw: unknown): string | undefined {
       'lastAuthenticatedRatioHideScore',
       'sendRemovalDirectMessage',
       'leaveRemovalComment',
+      'postWasLockedBeforeAction',
     ],
     (value) => typeof value === 'boolean'
   );
@@ -440,7 +442,7 @@ function validateTrackedPost(raw: unknown): string | undefined {
     ],
     ['removalCommentStyleStatus', ['not_applicable', 'styled', 'failed']],
     ['modmailStatus', ['not_applicable', 'sent', 'skipped', 'failed']],
-    ['postLockStatus', ['not_applicable', 'locked', 'failed']],
+    ['postLockStatus', ['not_applicable', 'attempting', 'locked', 'failed']],
     ['postUnlockStatus', ['not_applicable', 'unlocked', 'failed']],
     [
       'removalNoteStatus',

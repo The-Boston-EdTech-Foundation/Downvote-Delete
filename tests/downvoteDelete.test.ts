@@ -5,6 +5,7 @@ import {
   buildRemovedForDownvotesCommentBody,
   buildRemovedForDownvotesPrivateMessageBody,
   REMOVAL_PRIVATE_MESSAGE_SUBJECT,
+  sendRemovalPrivateMessage,
 } from '../src/core/actions';
 import { resolveActionRecovery } from '../src/core/actionLifecycle';
 import { getNextCheckDelayMinutes } from '../src/core/backoff';
@@ -1198,6 +1199,23 @@ describe('at-most-once action recovery', () => {
     ).toMatchObject({ status: 'actioned', confirmedApplied: true });
   });
 
+  test('promotes a legacy failed removal attempt when Reddit confirms removal', () => {
+    expect(
+      resolveActionRecovery(
+        trackedPost({
+          attemptedAction: 'remove',
+          actionOutcome: 'failed',
+          actionPhase: 'removal_attempted',
+        }),
+        { removed: true }
+      )
+    ).toEqual({
+      status: 'actioned',
+      outcome: 'succeeded',
+      confirmedApplied: true,
+    });
+  });
+
   test('leaves unconfirmed and report attempts unknown for moderator review', () => {
     expect(
       resolveActionRecovery(trackedPost({ attemptedAction: 'remove' }), {})
@@ -1790,13 +1808,15 @@ describe('tracked post decisions', () => {
   test('validates and persists post lock audit fields', () => {
     const serialized = serializeTrackedPost(
       trackedPost({
-        postLockStatus: 'failed',
+        postLockStatus: 'attempting',
+        postWasLockedBeforeAction: false,
         postLockErrorMessage: 'post lock unavailable',
       })
     );
 
     expect(parseTrackedPost(serialized)).toMatchObject({
-      postLockStatus: 'failed',
+      postLockStatus: 'attempting',
+      postWasLockedBeforeAction: false,
       postLockErrorMessage: 'post lock unavailable',
     });
     expect(
@@ -2317,26 +2337,15 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
     expect(body).not.toContain('Removed post:');
   });
 
-  test('sends a direct message after a successful remove action', async () => {
+  test('sends removal DMs through Reddit sendPrivateMessage', async () => {
     const redditClient = mockRedditClient();
-    const post = mockPost();
-
-    const result = await applyModerationAction({
+    await sendRemovalPrivateMessage({
       redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      authorName: 'someUser',
+      username: 'someUser',
       subredditName: 'mySubreddit',
       postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
     });
 
-    expect(post.removeCalls).toEqual([false]);
-    expect(post.lockCalls).toBe(1);
-    expect(post.actionCalls).toEqual(['lock', 'remove']);
-    expect(post.removalNotes).toEqual([
-      { reasonId: '', modNote: 'Removed for -3 Downvote Karma' },
-    ]);
     expect(redditClient.privateMessages).toEqual([
       {
         to: 'someUser',
@@ -2348,290 +2357,6 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
         }),
       },
     ]);
-    expect(redditClient.modmailConversations).toEqual([]);
-    expect(result.privateMessageSentAt).toEqual(expect.any(Number));
-    expect(result.actionStatus).toBe('succeeded');
-    expect(result.postLockStatus).toBe('locked');
-    expect(result.removalNoteStatus).toBe('added');
-    expect(result.privateMessageStatus).toBe('sent');
-    expect(result.privateMessageErrorMessage).toBeUndefined();
-  });
-
-  test('sends a direct message to a moderator author', async () => {
-    const redditClient = mockRedditClient();
-
-    const result = await applyModerationAction({
-      redditClient,
-      post: mockPost(),
-      action: ACTION_REMOVE,
-      threshold: -3,
-      authorName: 'moderatorUser',
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(redditClient.privateMessages).toEqual([
-      expect.objectContaining({ to: 'moderatorUser' }),
-    ]);
-    expect(redditClient.modmailConversations).toEqual([]);
-    expect(result.privateMessageStatus).toBe('sent');
-  });
-
-  test('adds, distinguishes, and stickies a configured removal comment', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost();
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      sendRemovalDirectMessage: false,
-      leaveRemovalComment: true,
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.actionCalls).toEqual([
-      'lock',
-      'remove',
-      'comment',
-      'distinguish:true',
-    ]);
-    expect(post.comments).toEqual([
-      {
-        text: buildRemovedForDownvotesCommentBody({
-          subredditName: 'mySubreddit',
-        }),
-        runAs: 'APP',
-      },
-    ]);
-    expect(redditClient.privateMessages).toEqual([]);
-    expect(result).toMatchObject({
-      actionStatus: 'succeeded',
-      privateMessageStatus: 'skipped',
-      privateMessageSkippedReason: 'disabled_by_settings',
-      removalCommentStatus: 'added',
-      removalCommentId: 't1_removal_comment',
-      removalCommentAddedAt: expect.any(Number),
-      removalCommentStyleStatus: 'styled',
-    });
-  });
-
-  test('can send both configured removal notifications', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost();
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      sendRemovalDirectMessage: true,
-      leaveRemovalComment: true,
-      authorName: 'someUser',
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.comments).toHaveLength(1);
-    expect(redditClient.privateMessages).toHaveLength(1);
-    expect(result).toMatchObject({
-      privateMessageStatus: 'sent',
-      removalCommentStatus: 'added',
-      removalCommentStyleStatus: 'styled',
-    });
-  });
-
-  test('can disable both removal notifications', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost();
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      sendRemovalDirectMessage: false,
-      leaveRemovalComment: false,
-      authorName: 'someUser',
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.comments).toEqual([]);
-    expect(redditClient.privateMessages).toEqual([]);
-    expect(result).toMatchObject({
-      privateMessageStatus: 'skipped',
-      privateMessageSkippedReason: 'disabled_by_settings',
-      removalCommentStatus: 'skipped',
-      removalCommentSkippedReason: 'disabled_by_settings',
-      removalCommentStyleStatus: 'not_applicable',
-    });
-  });
-
-  test('missing author skips only the direct message', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost();
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      leaveRemovalComment: true,
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.comments).toHaveLength(1);
-    expect(redditClient.privateMessages).toEqual([]);
-    expect(result).toMatchObject({
-      privateMessageStatus: 'skipped',
-      privateMessageSkippedReason: 'missing_author_name',
-      removalCommentStatus: 'added',
-      removalCommentStyleStatus: 'styled',
-    });
-  });
-
-  test('comment creation failure does not block the direct message or removal', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost({ failComment: true });
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      leaveRemovalComment: true,
-      authorName: 'someUser',
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.removeCalls).toEqual([false]);
-    expect(redditClient.privateMessages).toHaveLength(1);
-    expect(result).toMatchObject({
-      actionStatus: 'succeeded',
-      privateMessageStatus: 'sent',
-      removalCommentStatus: 'failed',
-      removalCommentErrorMessage: 'comment unavailable',
-      removalCommentStyleStatus: 'not_applicable',
-    });
-    expect(result.removalCommentError).toBeInstanceOf(Error);
-  });
-
-  test('comment styling failure preserves the added comment and direct message', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost({ failCommentStyle: true });
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      leaveRemovalComment: true,
-      authorName: 'someUser',
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.comments).toHaveLength(1);
-    expect(redditClient.privateMessages).toHaveLength(1);
-    expect(result).toMatchObject({
-      actionStatus: 'succeeded',
-      privateMessageStatus: 'sent',
-      removalCommentStatus: 'added',
-      removalCommentStyleStatus: 'failed',
-      removalCommentStyleErrorMessage: 'comment styling unavailable',
-    });
-    expect(result.removalCommentStyleError).toBeInstanceOf(Error);
-  });
-
-  test('removes and notifies when locking the post fails', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost({ failLock: true });
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      authorName: 'someUser',
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.actionCalls).toEqual(['lock', 'remove']);
-    expect(post.removeCalls).toEqual([false]);
-    expect(post.removalNotes).toHaveLength(1);
-    expect(redditClient.privateMessages).toHaveLength(1);
-    expect(result).toMatchObject({
-      actionStatus: 'succeeded',
-      postLockStatus: 'failed',
-      postLockErrorMessage: 'post lock unavailable',
-      removalNoteStatus: 'added',
-      privateMessageStatus: 'sent',
-    });
-  });
-
-  test('unlocks a post when the remove call fails', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost({ failRemove: true });
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      authorName: 'someUser',
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.actionCalls).toEqual(['lock', 'remove', 'unlock']);
-    expect(redditClient.privateMessages).toEqual([]);
-    expect(result).toMatchObject({
-      actionStatus: 'failed',
-      actionErrorMessage: 'post removal unavailable',
-      postLockStatus: 'locked',
-      postUnlockStatus: 'unlocked',
-    });
-  });
-
-  test('uses default private message wording for ratio removal reasons', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost();
-
-    await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      reason: 'Removed for downvote ratio threshold',
-      authorName: 'someUser',
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.removalNotes).toEqual([
-      { reasonId: '', modNote: 'Removed for downvote ratio threshold' },
-    ]);
-    expect(redditClient.privateMessages[0]).toMatchObject({
-      text: expect.stringContaining(
-        'Your post was removed because it received too much negative community feedback.'
-      ),
-    });
-    expect(redditClient.privateMessages[0]).not.toEqual(
-      expect.objectContaining({
-        text: expect.stringContaining('reported upvote ratio'),
-      })
-    );
-    expect(redditClient.privateMessages[0]).not.toEqual(
-      expect.objectContaining({
-        text: expect.stringContaining('estimated minimum vote spread'),
-      })
-    );
   });
 
   test('does not send a direct message for report or filter actions', async () => {
@@ -2716,148 +2441,20 @@ Please review the [community rules](https://reddit.com/r/mySubreddit/about/rules
       removalCommentStyleStatus: 'not_applicable',
     });
   });
-
-  test('missing username skips direct message without failing removal', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost();
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.removeCalls).toEqual([false]);
-    expect(redditClient.privateMessages).toEqual([]);
-    expect(result).toEqual({
-      actionStatus: 'succeeded',
-      postLockStatus: 'locked',
-      removalNoteStatus: 'added',
-      privateMessageStatus: 'skipped',
-      privateMessageSkippedReason: 'missing_author_name',
-      removalCommentStatus: 'skipped',
-      removalCommentSkippedReason: 'disabled_by_settings',
-      removalCommentStyleStatus: 'not_applicable',
-    });
-  });
-
-  test('missing subreddit skips direct message without failing removal', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost();
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      authorName: 'someUser',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.removeCalls).toEqual([false]);
-    expect(redditClient.privateMessages).toEqual([]);
-    expect(result).toEqual({
-      actionStatus: 'succeeded',
-      postLockStatus: 'locked',
-      removalNoteStatus: 'added',
-      privateMessageStatus: 'skipped',
-      privateMessageSkippedReason: 'missing_subreddit_name',
-      removalCommentStatus: 'skipped',
-      removalCommentSkippedReason: 'disabled_by_settings',
-      removalCommentStyleStatus: 'not_applicable',
-    });
-  });
-
-  test('missing post link skips direct message without failing removal', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost();
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      authorName: 'someUser',
-      subredditName: 'mySubreddit',
-    });
-
-    expect(post.removeCalls).toEqual([false]);
-    expect(redditClient.privateMessages).toEqual([]);
-    expect(result).toEqual({
-      actionStatus: 'succeeded',
-      postLockStatus: 'locked',
-      removalNoteStatus: 'added',
-      privateMessageStatus: 'skipped',
-      privateMessageSkippedReason: 'missing_post_link',
-      removalCommentStatus: 'skipped',
-      removalCommentSkippedReason: 'disabled_by_settings',
-      removalCommentStyleStatus: 'not_applicable',
-    });
-  });
-
-  test('direct message failure does not fail the remove action', async () => {
-    const redditClient = mockRedditClient({ failPrivateMessage: true });
-    const post = mockPost();
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      authorName: 'someUser',
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.removeCalls).toEqual([false]);
-    expect(post.removalNotes).toEqual([
-      { reasonId: '', modNote: 'Removed for -3 Downvote Karma' },
-    ]);
-    expect(redditClient.privateMessages).toHaveLength(1);
-    expect(redditClient.modmailConversations).toEqual([]);
-    expect(result.privateMessageStatus).toBe('failed');
-    expect(result.privateMessageErrorMessage).toBe(
-      'private message unavailable'
-    );
-    expect(result.privateMessageError).toBeInstanceOf(Error);
-    expect(result.actionStatus).toBe('succeeded');
-  });
-
-  test('removal-note failure does not fail or repeat the remove action', async () => {
-    const redditClient = mockRedditClient();
-    const post = mockPost({ failRemovalNote: true });
-
-    const result = await applyModerationAction({
-      redditClient,
-      post,
-      action: ACTION_REMOVE,
-      threshold: -3,
-      authorName: 'someUser',
-      subredditName: 'mySubreddit',
-      postLink: 'https://reddit.com/r/mySubreddit/comments/abc123',
-    });
-
-    expect(post.removeCalls).toEqual([false]);
-    expect(post.removalNotes).toHaveLength(1);
-    expect(result.actionStatus).toBe('succeeded');
-    expect(result.removalNoteStatus).toBe('failed');
-    expect(result.removalNoteErrorMessage).toBe('removal note unavailable');
-  });
 });
 
 describe('recoverable removal workflow', () => {
   function workflowHarness(
     options: {
       failRemove?: boolean;
+      failLock?: boolean;
       failUnlock?: boolean;
       failRemovalNote?: boolean;
       failComment?: boolean;
       failCommentStyle?: boolean;
       failDirectMessage?: boolean;
       existingComment?: boolean;
+      initiallyLocked?: boolean;
     } = {}
   ) {
     const calls: string[] = [];
@@ -2876,19 +2473,21 @@ describe('recoverable removal workflow', () => {
         if (options.failCommentStyle) throw new Error('style unavailable');
       },
     };
+    let locked = options.initiallyLocked ?? false;
     const post = {
-      comments: {
-        async get(): Promise<unknown[]> {
-          calls.push('list-comments');
-          return options.existingComment ? [comment] : [];
-        },
+      id: 't3_post',
+      get locked(): boolean {
+        return locked;
       },
       async lock(): Promise<void> {
         calls.push('lock');
+        if (options.failLock) throw new Error('lock unavailable');
+        locked = true;
       },
       async unlock(): Promise<void> {
         calls.push('unlock');
         if (options.failUnlock) throw new Error('unlock unavailable');
+        locked = false;
       },
       async remove(): Promise<void> {
         calls.push('remove');
@@ -2910,6 +2509,14 @@ describe('recoverable removal workflow', () => {
       },
       async getCommentById(): Promise<typeof comment> {
         return comment;
+      },
+      getComments(optionsArg: unknown): { all(): Promise<(typeof comment)[]> } {
+        calls.push(`list-comments:${JSON.stringify(optionsArg)}`);
+        return {
+          async all(): Promise<(typeof comment)[]> {
+            return options.existingComment ? [comment] : [];
+          },
+        };
       },
       async sendPrivateMessage(message: unknown): Promise<void> {
         calls.push('dm');
@@ -2968,7 +2575,7 @@ describe('recoverable removal workflow', () => {
     );
   });
 
-  test('unlocks a post when removal fails', async () => {
+  test('keeps a thrown removal ambiguous until recovery checks Reddit', async () => {
     const harness = workflowHarness({ failRemove: true });
     const result = await executeRemovalWorkflow({
       post: harness.post,
@@ -2982,11 +2589,114 @@ describe('recoverable removal workflow', () => {
       now: () => now,
     });
 
-    expect(harness.calls).toEqual(['lock', 'remove', 'unlock']);
+    expect(harness.calls).toEqual(['lock', 'remove']);
     expect(result).toMatchObject({
-      actionStatus: 'failed',
+      actionStatus: 'unknown',
       actionErrorMessage: 'remove unavailable',
-      record: { postUnlockStatus: 'unlocked' },
+      record: {
+        actionOutcome: 'unknown',
+        postLockStatus: 'locked',
+        postWasLockedBeforeAction: false,
+      },
+    });
+  });
+
+  test('supports DM-only removal notifications', async () => {
+    const harness = workflowHarness();
+    const result = await executeRemovalWorkflow({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: trackedPost({
+        status: 'actioning',
+        attemptedAction: 'remove',
+        sendRemovalDirectMessage: true,
+        leaveRemovalComment: false,
+      }),
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls).toContain('dm');
+    expect(harness.calls).not.toContain('comment');
+    expect(result.record).toMatchObject({
+      privateMessageStatus: 'sent',
+      removalCommentStatus: 'skipped',
+      removalCommentSkippedReason: 'disabled_by_settings',
+    });
+  });
+
+  test('supports comment-only removal notifications when the author is unavailable', async () => {
+    const harness = workflowHarness();
+    const record = trackedPost({
+      status: 'actioning',
+      attemptedAction: 'remove',
+      sendRemovalDirectMessage: true,
+      leaveRemovalComment: true,
+    });
+    delete record.authorName;
+    const result = await executeRemovalWorkflow({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record,
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls).toContain('comment');
+    expect(harness.calls).not.toContain('dm');
+    expect(result.record).toMatchObject({
+      privateMessageStatus: 'skipped',
+      privateMessageSkippedReason: 'missing_author_name',
+      removalCommentStatus: 'added',
+    });
+  });
+
+  test('supports disabling both removal notifications', async () => {
+    const harness = workflowHarness();
+    const result = await executeRemovalWorkflow({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: trackedPost({
+        status: 'actioning',
+        attemptedAction: 'remove',
+        sendRemovalDirectMessage: false,
+        leaveRemovalComment: false,
+      }),
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls).not.toContain('comment');
+    expect(harness.calls).not.toContain('dm');
+    expect(result.record).toMatchObject({
+      privateMessageStatus: 'skipped',
+      privateMessageSkippedReason: 'disabled_by_settings',
+      removalCommentStatus: 'skipped',
+      removalCommentSkippedReason: 'disabled_by_settings',
+    });
+  });
+
+  test('continues removal when locking fails', async () => {
+    const harness = workflowHarness({ failLock: true });
+    const result = await executeRemovalWorkflow({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: trackedPost({ status: 'actioning', attemptedAction: 'remove' }),
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls.slice(0, 2)).toEqual(['lock', 'remove']);
+    expect(result).toMatchObject({
+      actionStatus: 'succeeded',
+      record: {
+        postLockStatus: 'failed',
+        postLockErrorMessage: 'lock unavailable',
+      },
     });
   });
 
@@ -3042,13 +2752,28 @@ describe('recoverable removal workflow', () => {
       removalCommentStyleStatus: 'failed',
       privateMessageStatus: 'sent',
     });
+
+    await recoverConfirmedRemoval({
+      post: harness.post,
+      redditClient: harness.redditClient,
+      postLink: 'https://reddit.com/r/test/comments/post',
+      record: result.record,
+      persist: harness.persist,
+      now: () => now,
+    });
+    expect(
+      harness.calls.filter((call) => call === 'distinguish:true')
+    ).toHaveLength(1);
   });
 
   test('records a compensating unlock failure independently', async () => {
     const harness = workflowHarness({ failUnlock: true });
     const record = await compensateUnremovedPost({
       post: harness.post,
-      record: trackedPost({ postLockStatus: 'locked' }),
+      record: trackedPost({
+        postLockStatus: 'locked',
+        postWasLockedBeforeAction: false,
+      }),
       persist: harness.persist,
       now: () => now,
     });
@@ -3057,6 +2782,66 @@ describe('recoverable removal workflow', () => {
       postUnlockStatus: 'failed',
       postUnlockErrorMessage: 'unlock unavailable',
     });
+  });
+
+  test('unlocks an originally unlocked post after interrupted lock persistence', async () => {
+    const harness = workflowHarness();
+    const record = await compensateUnremovedPost({
+      post: harness.post,
+      record: trackedPost({
+        postLockStatus: 'attempting',
+        postWasLockedBeforeAction: false,
+      }),
+      postIsCurrentlyLocked: true,
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls).toEqual(['unlock']);
+    expect(record.postUnlockStatus).toBe('unlocked');
+  });
+
+  test('never compensates a lock that existed before the app acted', async () => {
+    const harness = workflowHarness({ initiallyLocked: true });
+    const record = await compensateUnremovedPost({
+      post: harness.post,
+      record: trackedPost({
+        postLockStatus: 'locked',
+        postWasLockedBeforeAction: true,
+      }),
+      postIsCurrentlyLocked: true,
+      persist: harness.persist,
+      now: () => now,
+    });
+
+    expect(harness.calls).not.toContain('unlock');
+    expect(record.postUnlockStatus).toBeUndefined();
+  });
+
+  test('persists lock intent before invoking Reddit', async () => {
+    const harness = workflowHarness();
+    await expect(
+      executeRemovalWorkflow({
+        post: harness.post,
+        redditClient: harness.redditClient,
+        postLink: 'https://reddit.com/r/test/comments/post',
+        record: trackedPost({ status: 'actioning', attemptedAction: 'remove' }),
+        persist: async (record) => {
+          await harness.persist(record);
+          if (record.postLockStatus === 'locked') {
+            throw new Error('crash after lock');
+          }
+        },
+        now: () => now,
+      })
+    ).rejects.toThrow('crash after lock');
+
+    expect(harness.persisted).toContainEqual(
+      expect.objectContaining({
+        postLockStatus: 'attempting',
+        postWasLockedBeforeAction: false,
+      })
+    );
   });
 
   test('resumes pending notifications without repeating removal', async () => {
@@ -3129,7 +2914,12 @@ describe('recoverable removal workflow', () => {
       now: () => now,
     });
 
-    expect(harness.calls).toContain('list-comments');
+    expect(
+      harness.calls.some((call) => call.startsWith('list-comments:'))
+    ).toBe(true);
+    expect(harness.calls).toContain(
+      'list-comments:{"postId":"t3_post","sort":"new","limit":1000,"pageSize":100}'
+    );
     expect(harness.calls).not.toContain('comment');
     expect(record).toMatchObject({
       removalCommentStatus: 'reconciled',

@@ -1,5 +1,5 @@
 import type { Post, reddit } from '@devvit/web/server';
-import type { T1 } from '@devvit/shared-types/tid.js';
+import type { T1, T3 } from '@devvit/shared-types/tid.js';
 import {
   buildRemovedForDownvotesCommentBody,
   sendRemovalPrivateMessage,
@@ -12,7 +12,7 @@ export type PersistRemovalRecord = (record: TrackedPost) => Promise<void>;
 
 export type RemovalWorkflowResult = {
   record: TrackedPost;
-  actionStatus: 'succeeded' | 'failed';
+  actionStatus: 'succeeded' | 'unknown';
   actionErrorMessage?: string;
 };
 
@@ -35,8 +35,14 @@ async function compensateUnlock(args: {
   record: TrackedPost;
   persist: PersistRemovalRecord;
   now: () => number;
+  postIsCurrentlyLocked?: boolean;
 }): Promise<TrackedPost> {
-  if (args.record.postLockStatus !== 'locked') {
+  const appMayHaveAddedLock =
+    args.record.postWasLockedBeforeAction === false &&
+    (args.record.postLockStatus === 'locked' ||
+      (args.postIsCurrentlyLocked === true &&
+        args.record.postLockStatus !== 'not_applicable'));
+  if (!appMayHaveAddedLock) {
     return args.record;
   }
 
@@ -110,12 +116,19 @@ async function findExistingRemovalComment(args: {
   post: Post;
   redditClient: RedditClient;
   body: string;
-}): Promise<Awaited<ReturnType<Post['comments']['all']>>[number] | undefined> {
+}) {
   const appUsername = await args.redditClient.getCurrentUsername();
   if (!appUsername) {
     throw new Error('App username unavailable during comment reconciliation.');
   }
-  const comments = await args.post.comments.get(100);
+  const comments = await args.redditClient
+    .getComments({
+      postId: args.post.id as T3,
+      sort: 'new',
+      limit: 1000,
+      pageSize: 100,
+    })
+    .all();
   return comments.find(
     (comment) =>
       comment.authorName.toLocaleLowerCase() ===
@@ -131,7 +144,10 @@ async function styleRemovalComment(args: {
   persist: PersistRemovalRecord;
   now: () => number;
 }): Promise<TrackedPost> {
-  if (args.record.removalCommentStyleStatus === 'styled') {
+  if (
+    args.record.removalCommentStyleStatus === 'styled' ||
+    args.record.removalCommentStyleStatus === 'failed'
+  ) {
     return args.record;
   }
   let record = args.record;
@@ -415,6 +431,15 @@ export async function executeRemovalWorkflow(args: {
   }
   record = await persistStage(record, args.persist, now);
 
+  record = await persistStage(
+    {
+      ...record,
+      postLockStatus: 'attempting',
+      postWasLockedBeforeAction: Boolean(args.post.locked),
+    },
+    args.persist,
+    now
+  );
   try {
     await args.post.lock();
     record = { ...record, postLockStatus: 'locked' };
@@ -439,23 +464,18 @@ export async function executeRemovalWorkflow(args: {
   try {
     await args.post.remove(false);
   } catch (error: unknown) {
-    record = await compensateUnlock({
-      post: args.post,
-      record: {
+    record = await persistStage(
+      {
         ...record,
-        actionOutcome: 'failed',
+        actionOutcome: 'unknown',
         actionErrorMessage: errorMessage(error),
-        removalNoteStatus: 'not_applicable',
-        removalCommentStatus: 'not_applicable',
-        removalCommentStyleStatus: 'not_applicable',
-        privateMessageStatus: 'not_applicable',
       },
-      persist: args.persist,
-      now,
-    });
+      args.persist,
+      now
+    );
     return {
       record,
-      actionStatus: 'failed',
+      actionStatus: 'unknown',
       actionErrorMessage: errorMessage(error),
     };
   }
@@ -487,6 +507,7 @@ export async function recoverConfirmedRemoval(args: {
   record: TrackedPost;
   persist: PersistRemovalRecord;
   now?: () => number;
+  postIsCurrentlyLocked?: boolean;
 }): Promise<TrackedPost> {
   const now = args.now ?? Date.now;
   let record = await persistStage(
@@ -515,6 +536,7 @@ export async function compensateUnremovedPost(args: {
   record: TrackedPost;
   persist: PersistRemovalRecord;
   now?: () => number;
+  postIsCurrentlyLocked?: boolean;
 }): Promise<TrackedPost> {
   return compensateUnlock({ ...args, now: args.now ?? Date.now });
 }

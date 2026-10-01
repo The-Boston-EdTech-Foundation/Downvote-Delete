@@ -11,7 +11,21 @@ export function resolveActionRecovery(
   record: TrackedPost,
   snapshot?: Partial<Pick<PostSnapshot, 'removed' | 'filtered' | 'spam'>>
 ): ActionRecoveryResolution {
-  if (record.actionOutcome === 'failed') {
+  const snapshotConfirmsApplied =
+    (record.attemptedAction === 'remove' &&
+      Boolean(snapshot?.removed || snapshot?.spam)) ||
+    (record.attemptedAction === 'filter' &&
+      Boolean(snapshot?.filtered || snapshot?.removed));
+
+  // Older in-flight removals persisted thrown API calls as failures. A fresh
+  // Reddit snapshot is authoritative because the response may have been lost
+  // after the removal was applied.
+  const compatibleFailedRemoval =
+    record.actionOutcome === 'failed' &&
+    record.attemptedAction === 'remove' &&
+    record.actionPhase === 'removal_attempted' &&
+    snapshotConfirmsApplied;
+  if (record.actionOutcome === 'failed' && !compatibleFailedRemoval) {
     return {
       status: 'action_failed',
       outcome: 'failed',
@@ -20,11 +34,7 @@ export function resolveActionRecovery(
   }
 
   const confirmedApplied =
-    record.actionOutcome === 'succeeded' ||
-    (record.attemptedAction === 'remove' &&
-      Boolean(snapshot?.removed || snapshot?.spam)) ||
-    (record.attemptedAction === 'filter' &&
-      Boolean(snapshot?.filtered || snapshot?.removed));
+    record.actionOutcome === 'succeeded' || snapshotConfirmsApplied;
 
   return confirmedApplied
     ? {
